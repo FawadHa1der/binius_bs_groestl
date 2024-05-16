@@ -5,12 +5,13 @@ use super::{
 	arch::Groestl256,
 };
 use binius_field::{BinaryField8b, ExtensionField, PackedBinaryField32x8b, PackedExtensionField};
-use bytemuck::{must_cast_slice, must_cast_slice_mut};
+use bytemuck::{must_cast_slice, must_cast_slice_mut, AnyBitPattern};
 use digest::Digest;
 use p3_symmetric::{CompressionFunction, PseudoCompressionFunction};
 use std::{marker::PhantomData, slice};
-
+//use log;
 pub type GroestlDigest = PackedBinaryField32x8b;
+use bytemuck::Pod;
 
 #[derive(Debug, Default, Clone)]
 pub struct GroestlHasher<T> {
@@ -37,8 +38,14 @@ where
 			.update(must_cast_slice(P::cast_to_bases(data.as_ref())))
 	}
 
-	fn chain_update(self, data: impl AsRef<[P]>) -> Self {
+	fn chain_update(self, data: impl AsRef<[P]>) -> Self
+	{
 		let Self { inner, _t_marker } = self;
+		// log::debug!("{:?}", data.as_ref());
+
+		// let cast_data: &[P] = PackedBinaryField32x8b::
+		// log::debug!("{:?}", must_cast_slice::<P, BinaryField8b>(P::cast_to_bases(data.as_ref())));
+		
 		Self {
 			inner: inner.chain_update(must_cast_slice(P::cast_to_bases(data.as_ref()))),
 			_t_marker,

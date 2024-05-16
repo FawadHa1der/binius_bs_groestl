@@ -3,9 +3,10 @@
 use p3_challenger::{CanObserve, CanSample, CanSampleBits};
 use p3_matrix::{dense::RowMajorMatrix, MatrixRowSlices};
 use p3_util::{log2_ceil_usize, log2_strict_usize};
-use rayon::prelude::*;
+use rayon::{collections::linked_list, prelude::*};
 use std::{iter::repeat_with, marker::PhantomData, mem};
 use tracing::instrument;
+use std::fmt::Debug;
 
 use super::error::{Error, VerificationError};
 use crate::{
@@ -24,6 +25,48 @@ use binius_field::{
 	BinaryField, BinaryField8b, ExtensionField, Field, PackedExtensionField, PackedField,
 };
 use binius_hash::{hash, GroestlDigest, GroestlDigestCompression, GroestlHasher, Hasher};
+#[repr(C)]
+#[derive(PartialEq)]
+struct PackedPrimitiveType {
+    value: M128,
+}
+
+#[repr(C)]
+#[derive(PartialEq)]
+struct M128 {
+    high: u64,
+    low: u64,
+}
+
+#[repr(C)]
+
+struct ScaledPackedField<PT, const N: usize> {
+    elements: [PT; N], // Fixed-size array of PT
+}
+
+impl<PT: PartialEq, const N: usize> PartialEq for ScaledPackedField<PT, N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.elements == other.elements
+    }
+}
+
+// impl PartialEq for ScaledPackedField<PackedPrimitiveType, 2> {
+// 	fn eq(&self, other: &Self) -> bool {
+//         self.elements == other.elements
+// 	}
+// }
+
+
+
+//#[link(name = "testrustinput", kind = "static")]
+extern "C" {
+    // fn doubler(x: f32) -> f32;
+	// int crypto_hash(unsigned char *out, const unsigned char *in, unsigned long long inlen);
+    fn binius_groestl_bs_hash(array: *mut ScaledPackedField<PackedPrimitiveType, 2>, array: *mut PackedPrimitiveType, total_length: usize, chunk_size: usize);
+	fn populate_scaled_packed_fields(array: *mut ScaledPackedField<PackedPrimitiveType, 2>, length: usize);
+
+}
+
 
 /// Creates a new multilinear from a batch of multilinears and a mixing challenge
 ///
@@ -165,6 +208,20 @@ where
 	}
 }
 
+fn compare_vectors<PT: PartialEq, const N: usize>(vec1: &[ScaledPackedField<PT, N>], vec2: &[ScaledPackedField<PT, N>]) -> bool {
+    if vec1.len() != vec2.len() {
+        return false;
+    }
+
+    for i in 0..vec1.len() {
+        if vec1[i] != vec2[i] {
+            return false;
+        }
+    }
+
+    true
+}
+
 impl<F, P, FA, PA, FI, PI, FE, PE, LC, H, VCS> PolyCommitScheme<P, FE>
 	for TensorPCS<P, PA, PI, PE, LC, H, VCS>
 where
@@ -193,6 +250,7 @@ where
 		self.log_rows() + self.log_cols()
 	}
 
+	
 	#[instrument(skip_all, name = "tensor_pcs::commit")]
 	fn commit(
 		&self,
@@ -235,11 +293,78 @@ where
 				.map_err(|err| Error::EncodeError(Box::new(err)))?;
 
 			let mut digests = vec![H::Digest::default(); n_cols_enc];
+
 			encoded
-				.par_chunks_exact(n_rows / PI::WIDTH)
+				.par_chunks_exact(n_rows / PI::WIDTH) // comes out to 16 in this instance
 				.map(hash::<_, H>)
 				.collect_into_vec(&mut digests);
-			all_digests.push(digests);
+
+			for (index, element) in encoded.iter().enumerate() {
+				// let casted = PI::cast_to_bases(element);
+				// let casted: u128 = element as u128;
+
+				// Example: Just using index 1 for demonstration
+				println!("{:?}", element.get_checked(0));
+				// if let Some(value) = element.get_checked(1) {
+				// 	println!("Value at element {} index 1: {}", index, value);
+				// } else {
+				// 	println!("No value at element {} index 1", index);
+				// }
+			}
+			// for value in &encoded {
+			// 	println!("{:?}", value.get(0));
+			// }
+
+			let mut c_vec: Vec<ScaledPackedField<PackedPrimitiveType, 2>> = Vec::with_capacity(encoded.len() * 16); // multiply by 16 cuz they are using M128 is the base type
+			let mut testdigests = vec![H::Digest::default(); n_cols_enc];
+			let length = c_vec.capacity();  // We use the capacity as that's the maximum safe limit
+			let size_of_m128 = 16;
+			unsafe {
+				// populate_scaled_packed_fields(testdigests.as_mut_ptr() as *mut ScaledPackedField<PackedPrimitiveType, 2>, n_cols_enc);
+				binius_groestl_bs_hash(testdigests.as_mut_ptr() as *mut ScaledPackedField<PackedPrimitiveType, 2>, encoded.as_mut_ptr() as *mut PackedPrimitiveType, encoded.len() * size_of_m128, (n_rows / PI::WIDTH)  * size_of_m128);
+				testdigests.set_len(n_cols_enc);  // This is safe because the C function knows about the actual capacity
+				let casted_digests_bitsliced = testdigests.as_ptr() as *const ScaledPackedField<PackedPrimitiveType, 2>;
+				let casted_digests_original = digests.as_ptr() as *const ScaledPackedField<PackedPrimitiveType, 2>;
+		
+
+				let num_elements = n_cols_enc * 2; // Assuming each element is 2 packed primitive types
+				let mut elements_equal = true;
+				for i in 0..num_elements {
+					let element_bitsliced = &*casted_digests_bitsliced.add(i); // Borrow the element
+					let element_original = &*casted_digests_original.add(i); // Borrow the element
+					if element_bitsliced != element_original {
+						elements_equal = false;
+						break;
+					}
+				}
+				if elements_equal {
+					println!("vec1 and vec2 have the same elements in the same order.");
+				} else {
+					println!("vec1 and vec2 do not have the same elements in the same order.");
+				}
+				// c_vec.set_len(length);
+				// if compare_vectors(casted_digests_original, casted_digests_bitsliced) {
+				// 	println!("vec1 and vec2 have the same elements in the same order.");
+				// } else {
+				// 	println!("vec1 and vec2 do not have the same elements in the same order.");
+				// }
+			}
+			// Compare values of digests and testdigests
+			for (digest, testdigest) in digests.iter().zip(testdigests.iter()) {
+
+				// if *digest != *testdigest {
+				// 	return Err(Error::DigestMismatch);
+				// }
+			}
+		
+			// if compare_vectors(&vec1, &vec3) {
+			// 	println!("vec1 and vec3 have the same elements in the same order.");
+			// } else {
+			// 	println!("vec1 and vec3 do not have the same elements in the same order.");
+			// }
+				
+			
+			all_digests.push(digests.clone());
 
 			let encoded_mat = RowMajorMatrix::new(encoded, n_rows / PI::WIDTH);
 			encoded_mats.push(encoded_mat);

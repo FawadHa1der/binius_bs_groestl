@@ -12,6 +12,7 @@ cfg-if.workspace = true
 digest.workspace = true
 groestl_crypto.workspace = true
 p3-symmetric.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
