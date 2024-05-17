@@ -1,20 +1,25 @@
 #[repr(C)]
 #[derive(PartialEq)]
+// #[derive(Clone)]
+// #[derive(Copy)]
 pub struct PackedPrimitiveType {
-    value: M128,
+    pub value: M128,
 }
 
 #[repr(C)]
 #[derive(PartialEq)]
+// #[derive(Clone)]
+// #[derive(Copy)]
 pub struct M128 {
-    high: u64,
-    low: u64,
+    pub high: u64,
+    pub low: u64,
 }
 
 #[repr(C)]
-
+// #[derive(Clone)]
+// #[derive(Copy)]
 pub struct ScaledPackedField<PT, const N: usize> {
-    elements: [PT; N], // Fixed-size array of PT
+    pub elements: [PT; N], // Fixed-size array of PT
 }
 
 impl<PT: PartialEq, const N: usize> PartialEq for ScaledPackedField<PT, N> {
@@ -31,11 +36,11 @@ impl<PT: PartialEq, const N: usize> PartialEq for ScaledPackedField<PT, N> {
 
 
 
-//#[link(name = "testrustinput", kind = "static")]
 extern "C" {
-    // fn doubler(x: f32) -> f32;
-	// int crypto_hash(unsigned char *out, const unsigned char *in, unsigned long long inlen);
+    // total_length is the length of the input in bytes
+    // chunk_size is the chunk size in bytes
     pub fn binius_groestl_bs_hash(array: *mut ScaledPackedField<PackedPrimitiveType, 2>, array: *mut PackedPrimitiveType, total_length: usize, chunk_size: usize);
-	// pub fn populate_scaled_packed_fields(array: *mut ScaledPackedField<PackedPrimitiveType, 2>, length: usize);
 
 }
+
+

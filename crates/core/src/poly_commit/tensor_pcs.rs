@@ -275,9 +275,9 @@ where
 			// 	println!("{:?}", value.get(0));
 			// }
 
-			let mut c_vec: Vec<ScaledPackedField<PackedPrimitiveType, 2>> = Vec::with_capacity(encoded.len() * 16); // multiply by 16 cuz they are using M128 is the base type
+			// let mut c_vec: Vec<ScaledPackedField<PackedPrimitiveType, 2>> = Vec::with_capacity(encoded.len() * 16); // multiply by 16 cuz they are using M128 is the base type
 			let mut testdigests = vec![H::Digest::default(); n_cols_enc];
-			let length = c_vec.capacity();  // We use the capacity as that's the maximum safe limit
+			// let length = c_vec.capacity();  // We use the capacity as that's the maximum safe limit
 			let size_of_m128 = 16;
 			unsafe {
 				// populate_scaled_packed_fields(testdigests.as_mut_ptr() as *mut ScaledPackedField<PackedPrimitiveType, 2>, n_cols_enc);
