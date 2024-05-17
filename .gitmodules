@@ -1,0 +1,3 @@
+[submodule "crates/hash/src/groestl/custom_groestl"]
+	path = crates/hash/src/groestl/custom_groestl
+	url = git@github.com:FawadHa1der/custom_groestl.git
