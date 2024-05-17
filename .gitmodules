@@ -1,3 +1,0 @@
-[submodule "crates/core/src/custom_groestl"]
-	path = crates/core/src/custom_groestl
-	url = git@github.com:FawadHa1der/custom_groestl.git

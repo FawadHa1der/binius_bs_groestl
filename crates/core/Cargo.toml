@@ -3,7 +3,7 @@ name = "binius_core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-build = "build.rs"
+# build = "build.rs"
 
 [dependencies]
 assert_matches.workspace = true

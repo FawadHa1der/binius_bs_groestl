@@ -7,6 +7,7 @@ use rayon::{collections::linked_list, prelude::*};
 use std::{iter::repeat_with, marker::PhantomData, mem};
 use tracing::instrument;
 use std::fmt::Debug;
+use binius_hash::bs_groestl::{ScaledPackedField, binius_groestl_bs_hash, PackedPrimitiveType};
 
 use super::error::{Error, VerificationError};
 use crate::{
@@ -25,47 +26,6 @@ use binius_field::{
 	BinaryField, BinaryField8b, ExtensionField, Field, PackedExtensionField, PackedField,
 };
 use binius_hash::{hash, GroestlDigest, GroestlDigestCompression, GroestlHasher, Hasher};
-#[repr(C)]
-#[derive(PartialEq)]
-struct PackedPrimitiveType {
-    value: M128,
-}
-
-#[repr(C)]
-#[derive(PartialEq)]
-struct M128 {
-    high: u64,
-    low: u64,
-}
-
-#[repr(C)]
-
-struct ScaledPackedField<PT, const N: usize> {
-    elements: [PT; N], // Fixed-size array of PT
-}
-
-impl<PT: PartialEq, const N: usize> PartialEq for ScaledPackedField<PT, N> {
-    fn eq(&self, other: &Self) -> bool {
-        self.elements == other.elements
-    }
-}
-
-// impl PartialEq for ScaledPackedField<PackedPrimitiveType, 2> {
-// 	fn eq(&self, other: &Self) -> bool {
-//         self.elements == other.elements
-// 	}
-// }
-
-
-
-//#[link(name = "testrustinput", kind = "static")]
-extern "C" {
-    // fn doubler(x: f32) -> f32;
-	// int crypto_hash(unsigned char *out, const unsigned char *in, unsigned long long inlen);
-    fn binius_groestl_bs_hash(array: *mut ScaledPackedField<PackedPrimitiveType, 2>, array: *mut PackedPrimitiveType, total_length: usize, chunk_size: usize);
-	fn populate_scaled_packed_fields(array: *mut ScaledPackedField<PackedPrimitiveType, 2>, length: usize);
-
-}
 
 
 /// Creates a new multilinear from a batch of multilinears and a mixing challenge
@@ -304,7 +264,7 @@ where
 				// let casted: u128 = element as u128;
 
 				// Example: Just using index 1 for demonstration
-				println!("{:?}", element.get_checked(0));
+				//println!("{:?}", element.get_checked(0));
 				// if let Some(value) = element.get_checked(1) {
 				// 	println!("Value at element {} index 1: {}", index, value);
 				// } else {
@@ -326,7 +286,6 @@ where
 				let casted_digests_bitsliced = testdigests.as_ptr() as *const ScaledPackedField<PackedPrimitiveType, 2>;
 				let casted_digests_original = digests.as_ptr() as *const ScaledPackedField<PackedPrimitiveType, 2>;
 		
-
 				let num_elements = n_cols_enc * 2; // Assuming each element is 2 packed primitive types
 				let mut elements_equal = true;
 				for i in 0..num_elements {

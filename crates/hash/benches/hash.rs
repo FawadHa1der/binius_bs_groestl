@@ -47,6 +47,24 @@ fn bench_groestl(c: &mut Criterion) {
 	group.finish()
 }
 
+
+fn bench_groestl_bitsliced(c: &mut Criterion) {
+	let mut group = c.benchmark_group("groestl");
+
+	let mut rng = thread_rng();
+
+	const N: usize = 8192;
+	let mut data = [0u8; N];
+	rng.fill_bytes(&mut data);
+
+	group.throughput(Throughput::Bytes(N as u64));
+	group.bench_function("Groestl256-RustCrypto", |bench| {
+		bench.iter(|| GenericGroestl256::digest(data));
+	});
+
+	group.finish()
+}
+
 fn bench_groestl_avx512(c: &mut Criterion) {
 	bench_groestl_avx512_inner(c);
 }
