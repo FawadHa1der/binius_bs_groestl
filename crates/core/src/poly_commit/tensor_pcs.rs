@@ -8,6 +8,7 @@ use std::{iter::repeat_with, marker::PhantomData, mem};
 use tracing::instrument;
 use std::fmt::Debug;
 use binius_hash::bs_groestl::{ScaledPackedField, binius_groestl_bs_hash, PackedPrimitiveType};
+use std::time::Instant;
 
 use super::error::{Error, VerificationError};
 use crate::{
@@ -253,12 +254,15 @@ where
 				.map_err(|err| Error::EncodeError(Box::new(err)))?;
 
 			let mut digests = vec![H::Digest::default(); n_cols_enc];
+			let start = Instant::now();
 
 			encoded
 				.par_chunks_exact(n_rows / PI::WIDTH) // comes out to 16 in this instance
 				.map(hash::<_, H>)
 				.collect_into_vec(&mut digests);
-
+			let duration = start.elapsed();
+			println!("Time taken to execute original hashing : {:?}", duration);
+		
 			for (index, element) in encoded.iter().enumerate() {
 				// let casted = PI::cast_to_bases(element);
 				// let casted: u128 = element as u128;
@@ -281,7 +285,12 @@ where
 			let size_of_m128 = 16;
 			unsafe {
 				// populate_scaled_packed_fields(testdigests.as_mut_ptr() as *mut ScaledPackedField<PackedPrimitiveType, 2>, n_cols_enc);
+				let start = Instant::now();
+
 				binius_groestl_bs_hash(testdigests.as_mut_ptr() as *mut ScaledPackedField<PackedPrimitiveType, 2>, encoded.as_mut_ptr() as *mut PackedPrimitiveType, encoded.len() * size_of_m128, (n_rows / PI::WIDTH)  * size_of_m128);
+				let duration = start.elapsed();
+				println!("Time taken to execute binius_groestl_bs_hash: {:?}", duration);
+			
 				testdigests.set_len(n_cols_enc);  // This is safe because the C function knows about the actual capacity
 				let casted_digests_bitsliced = testdigests.as_ptr() as *const ScaledPackedField<PackedPrimitiveType, 2>;
 				let casted_digests_original = digests.as_ptr() as *const ScaledPackedField<PackedPrimitiveType, 2>;
