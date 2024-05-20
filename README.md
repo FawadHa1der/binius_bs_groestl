@@ -1,3 +1,11 @@
+THIS REPO (cloned from [gitlab](https://gitlab.com/IrreducibleOSS/binius) ) INTEGRATES MY BITSLICED IMPLEMENTATION OF GROESTL. git@github.com:FawadHa1der/custom_groestl.git is added as submodule to the hash crate.
+The [tensor_pcs](https://github.com/FawadHa1der/binius_bs_groestl/blob/main/crates/core/src/poly_commit/tensor_pcs.rs) has been been updated to use the new bitsliced groestl.
+Running the [keccak](https://github.com/FawadHa1der/binius_bs_groestl/blob/main/examples/keccakf.rs) will print/compare the time taken by each variant of the hash(bitsliced 
+vs the original)
+
+Benchmarks WIP. 
+
+
 ![Binius logo](doc/Logo.png "Binius logo")
 
 # Binius
