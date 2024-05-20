@@ -1,23 +1,26 @@
 #[repr(C)]
 #[derive(PartialEq)]
-// #[derive(Clone)]
-// #[derive(Copy)]
+#[derive(Clone)]
+#[derive(Copy)]
+#[derive(Debug)]
 pub struct PackedPrimitiveType {
     pub value: M128,
 }
 
 #[repr(C)]
 #[derive(PartialEq)]
-// #[derive(Clone)]
-// #[derive(Copy)]
+#[derive(Clone)]
+#[derive(Copy)]
+#[derive(Debug)]
 pub struct M128 {
     pub high: u64,
     pub low: u64,
 }
 
 #[repr(C)]
-// #[derive(Clone)]
-// #[derive(Copy)]
+#[derive(Clone)]
+#[derive(Copy)]
+#[derive(Debug)]
 pub struct ScaledPackedField<PT, const N: usize> {
     pub elements: [PT; N], // Fixed-size array of PT
 }

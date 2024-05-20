@@ -286,12 +286,13 @@ where
 				let casted_digests_bitsliced = testdigests.as_ptr() as *const ScaledPackedField<PackedPrimitiveType, 2>;
 				let casted_digests_original = digests.as_ptr() as *const ScaledPackedField<PackedPrimitiveType, 2>;
 		
-				let num_elements = n_cols_enc * 2; // Assuming each element is 2 packed primitive types
+				let num_elements = n_cols_enc; // Assuming each element is 2 packed primitive types
 				let mut elements_equal = true;
 				for i in 0..num_elements {
 					let element_bitsliced = &*casted_digests_bitsliced.add(i); // Borrow the element
 					let element_original = &*casted_digests_original.add(i); // Borrow the element
 					if element_bitsliced != element_original {
+						println!("Element {} is not equal: {:?} != {:?}", i, element_bitsliced, element_original);
 						elements_equal = false;
 						break;
 					}
@@ -323,7 +324,7 @@ where
 			// }
 				
 			
-			all_digests.push(digests.clone());
+			all_digests.push(testdigests.clone());
 
 			let encoded_mat = RowMajorMatrix::new(encoded, n_rows / PI::WIDTH);
 			encoded_mats.push(encoded_mat);
