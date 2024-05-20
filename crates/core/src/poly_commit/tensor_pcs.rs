@@ -263,23 +263,6 @@ where
 			let duration = start.elapsed();
 			println!("Time taken to execute original hashing : {:?}", duration);
 		
-			for (index, element) in encoded.iter().enumerate() {
-				// let casted = PI::cast_to_bases(element);
-				// let casted: u128 = element as u128;
-
-				// Example: Just using index 1 for demonstration
-				//println!("{:?}", element.get_checked(0));
-				// if let Some(value) = element.get_checked(1) {
-				// 	println!("Value at element {} index 1: {}", index, value);
-				// } else {
-				// 	println!("No value at element {} index 1", index);
-				// }
-			}
-			// for value in &encoded {
-			// 	println!("{:?}", value.get(0));
-			// }
-
-			// let mut c_vec: Vec<ScaledPackedField<PackedPrimitiveType, 2>> = Vec::with_capacity(encoded.len() * 16); // multiply by 16 cuz they are using M128 is the base type
 			let mut testdigests = vec![H::Digest::default(); n_cols_enc];
 			// let length = c_vec.capacity();  // We use the capacity as that's the maximum safe limit
 			let size_of_m128 = 16;
@@ -311,27 +294,7 @@ where
 				} else {
 					println!("vec1 and vec2 do not have the same elements in the same order.");
 				}
-				// c_vec.set_len(length);
-				// if compare_vectors(casted_digests_original, casted_digests_bitsliced) {
-				// 	println!("vec1 and vec2 have the same elements in the same order.");
-				// } else {
-				// 	println!("vec1 and vec2 do not have the same elements in the same order.");
-				// }
 			}
-			// Compare values of digests and testdigests
-			for (digest, testdigest) in digests.iter().zip(testdigests.iter()) {
-
-				// if *digest != *testdigest {
-				// 	return Err(Error::DigestMismatch);
-				// }
-			}
-		
-			// if compare_vectors(&vec1, &vec3) {
-			// 	println!("vec1 and vec3 have the same elements in the same order.");
-			// } else {
-			// 	println!("vec1 and vec3 do not have the same elements in the same order.");
-			// }
-				
 			
 			all_digests.push(testdigests.clone());
 
