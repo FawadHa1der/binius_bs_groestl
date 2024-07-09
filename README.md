@@ -1,5 +1,4 @@
-This repo is cloned from [gitlab](https://gitlab.com/IrreducibleOSS/binius) This integrates bitsliced groestl. 
-git@github.com:FawadHa1der/custom_groestl.git is added as submodule to the hash crate.
+This repo is cloned from [binius gitlab repo by Irreducible](https://gitlab.com/IrreducibleOSS/binius) This integrates [bitsliced groestl](https://github.com/FawadHa1der/custom_groestl). Which is added as submodule to the hash crate.
 The [tensor_pcs](https://github.com/FawadHa1der/binius_bs_groestl/blob/main/crates/core/src/poly_commit/tensor_pcs.rs) has been been updated to use the new bitsliced groestl.
 Running the [keccak](https://github.com/FawadHa1der/binius_bs_groestl/blob/main/examples/keccakf.rs) will print/compare the time taken by each variant of the hash(bitsliced 
 vs the original)
