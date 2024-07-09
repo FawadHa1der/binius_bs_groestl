@@ -1,4 +1,4 @@
-use seq_macro::seq;
+// Copyright 2024 Ulvetanna Inc.
 
 use super::m128::M128;
 use crate::{
@@ -11,10 +11,10 @@ use crate::{
 	arithmetic_traits::{
 		MulAlpha, Square, TaggedInvertOrZero, TaggedMul, TaggedMulAlpha, TaggedSquare,
 	},
-	underlier::UnderlierType,
-	BinaryField, PackedField, TowerField,
+	underlier::{UnderlierWithBitOps, WithUnderlier},
+	BinaryField, TowerField,
 };
-
+use seq_macro::seq;
 use std::arch::aarch64::*;
 
 #[inline]
@@ -24,8 +24,7 @@ pub fn packed_tower_16x8b_multiply(a: M128, b: M128) -> M128 {
 	let logc = unsafe {
 		let sum = vaddq_u8(loga, logb);
 		let overflow = vcgtq_u8(loga, sum);
-		let gt254 = vcgtq_u8(sum, vdupq_n_u8(254));
-		vsubq_u8(sum, vorrq_u8(overflow, gt254))
+		vsubq_u8(sum, overflow)
 	};
 	let c = lookup_16x8b(TOWER_EXP_LOOKUP_TABLE, logc.into()).into();
 	unsafe {
@@ -254,7 +253,7 @@ pub const TOWER_EXP_LOOKUP_TABLE: [u8; 256] = [
 	0x6B, 0x70, 0xB7, 0x35, 0xBC, 0x83, 0x9A, 0x7C, 0x7F, 0x4D, 0x8F, 0x52, 0x04, 0x4C, 0x9C, 0x11,
 	0x62, 0xE7, 0x10, 0x71, 0xA4, 0x76, 0xDA, 0x28, 0x16, 0x1C, 0xB9, 0xDC, 0x45, 0x0B, 0xB6, 0x26,
 	0xFF, 0xE5, 0x31, 0xF0, 0x1F, 0x8B, 0x1E, 0x98, 0x5D, 0xFE, 0xF6, 0x72, 0x96, 0xB4, 0x07, 0x7E,
-	0x5E, 0xCC, 0x34, 0xAF, 0xC0, 0xFC, 0xD7, 0xF3, 0x2D, 0x49, 0xC3, 0xCE, 0x15, 0x2E, 0x7B, 0x00,
+	0x5E, 0xCC, 0x34, 0xAF, 0xC0, 0xFC, 0xD7, 0xF3, 0x2D, 0x49, 0xC3, 0xCE, 0x15, 0x2E, 0x7B, 0x01,
 ];
 
 pub const TOWER_LOG_LOOKUP_TABLE: [u8; 256] = [
@@ -287,14 +286,17 @@ where
 		let odd_mask = M128::INTERLEAVE_ODD_MASK[PT::DirectSubfield::TOWER_LEVEL];
 		let a = self.as_packed_subfield();
 		let b = rhs.as_packed_subfield();
-		let p1 = (a * b).into();
-		let (lo, hi) = M128::interleave(a.into(), b.into(), PT::DirectSubfield::TOWER_LEVEL);
+		let p1 = (a * b).to_underlier();
+		let (lo, hi) =
+			M128::interleave(a.to_underlier(), b.to_underlier(), PT::DirectSubfield::TOWER_LEVEL);
 		let (lhs, rhs) =
 			M128::interleave(lo ^ hi, alphas ^ (p1 & odd_mask), PT::DirectSubfield::TOWER_LEVEL);
-		let p2 = (PT::PackedDirectSubfield::from(lhs) * PT::PackedDirectSubfield::from(rhs)).into();
+		let p2 = (PT::PackedDirectSubfield::from_underlier(lhs)
+			* PT::PackedDirectSubfield::from_underlier(rhs))
+		.to_underlier();
 		let q1 = p1 ^ flip_even_odd::<PT::DirectSubfield>(p1);
 		let q2 = p2 ^ shift_left::<PT::DirectSubfield>(p2);
-		(q1 ^ (q2 & odd_mask)).into()
+		Self::from_underlier(q1 ^ (q2 & odd_mask))
 	}
 }
 
@@ -306,9 +308,9 @@ where
 	#[inline]
 	fn mul_alpha(self) -> Self {
 		let a0_a1 = self.as_packed_subfield();
-		let a0alpha_a1alpha: M128 = a0_a1.mul_alpha().into();
-		let a1_a0 = flip_even_odd::<PT::DirectSubfield>(a0_a1.into());
-		blend_odd_even::<PT::DirectSubfield>(a1_a0 ^ a0alpha_a1alpha, a1_a0).into()
+		let a0alpha_a1alpha: M128 = a0_a1.mul_alpha().to_underlier();
+		let a1_a0 = flip_even_odd::<PT::DirectSubfield>(a0_a1.to_underlier());
+		Self::from_underlier(blend_odd_even::<PT::DirectSubfield>(a1_a0 ^ a0alpha_a1alpha, a1_a0))
 	}
 }
 
@@ -321,10 +323,13 @@ where
 	fn square(self) -> Self {
 		let a0_a1 = self.as_packed_subfield();
 		let a0sq_a1sq = Square::square(a0_a1);
-		let a1sq_a0sq = flip_even_odd::<PT::DirectSubfield>(a0sq_a1sq.into());
-		let a0sq_plus_a1sq = a0sq_a1sq.into() ^ a1sq_a0sq;
+		let a1sq_a0sq = flip_even_odd::<PT::DirectSubfield>(a0sq_a1sq.to_underlier());
+		let a0sq_plus_a1sq = a0sq_a1sq.to_underlier() ^ a1sq_a0sq;
 		let a1_mul_alpha = a0sq_a1sq.mul_alpha();
-		blend_odd_even::<PT::DirectSubfield>(a1_mul_alpha.into(), a0sq_plus_a1sq).into()
+		Self::from_underlier(blend_odd_even::<PT::DirectSubfield>(
+			a1_mul_alpha.to_underlier(),
+			a0sq_plus_a1sq,
+		))
 	}
 }
 
@@ -336,18 +341,17 @@ where
 	#[inline]
 	fn invert_or_zero(self) -> Self {
 		let a0_a1 = self.as_packed_subfield();
-		let a1_a0: PT::PackedDirectSubfield =
-			flip_even_odd::<PT::DirectSubfield>(a0_a1.into()).into();
+		let a1_a0 = a0_a1.mutate_underlier(flip_even_odd::<PT::DirectSubfield>);
 		let a1alpha = a1_a0.mul_alpha();
 		let a0_plus_a1alpha = a0_a1 + a1alpha;
 		let a1sq_a0sq = Square::square(a1_a0);
 		let delta = a1sq_a0sq + (a0_plus_a1alpha * a0_a1);
 		let deltainv = delta.invert_or_zero();
-		let deltainv_deltainv: PT::PackedDirectSubfield =
-			duplicate_odd::<PT::DirectSubfield>(deltainv.into()).into();
-		let delta_multiplier: PT::PackedDirectSubfield =
-			blend_odd_even::<PT::DirectSubfield>(a0_a1.into(), a0_plus_a1alpha.into()).into();
-		(deltainv_deltainv * delta_multiplier).into().into()
+		let deltainv_deltainv = deltainv.mutate_underlier(duplicate_odd::<PT::DirectSubfield>);
+		let delta_multiplier = a0_a1.mutate_underlier(|a0_a1| {
+			blend_odd_even::<PT::DirectSubfield>(a0_a1, a0_plus_a1alpha.to_underlier())
+		});
+		PT::from_packed_subfield(deltainv_deltainv * delta_multiplier)
 	}
 }
 
@@ -398,7 +402,7 @@ fn shift_left<F: TowerField>(x: M128) -> M128 {
 		}
 	});
 	if tower_level == 6 {
-		return unsafe { vcombine_u64(std::mem::transmute(0u64), vget_low_u64(x.into())).into() };
+		return unsafe { vcombine_u64(vcreate_u64(0), vget_low_u64(x.into())).into() };
 	}
 	panic!("Unsupported tower level {tower_level}");
 }
@@ -412,7 +416,7 @@ fn shift_right<F: TowerField>(x: M128) -> M128 {
 		}
 	});
 	if tower_level == 6 {
-		return unsafe { vcombine_u64(vget_high_u64(x.into()), std::mem::transmute(0u64)).into() };
+		return unsafe { vcombine_u64(vget_high_u64(x.into()), vcreate_u64(0)).into() };
 	}
 	panic!("Unsupported tower level {tower_level}");
 }

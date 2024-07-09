@@ -8,7 +8,6 @@
 mod batch;
 mod error;
 mod prove;
-pub mod prove_general;
 #[allow(clippy::module_inception)]
 mod sumcheck;
 #[cfg(test)]
@@ -19,7 +18,7 @@ pub use batch::*;
 pub use error::*;
 pub use prove::*;
 pub use sumcheck::{
-	SumcheckClaim, SumcheckProof, SumcheckProveOutput, SumcheckRound, SumcheckRoundClaim,
-	SumcheckWitness,
+	validate_witness, SumcheckClaim, SumcheckProof, SumcheckProveOutput, SumcheckRound,
+	SumcheckRoundClaim, SumcheckWitness,
 };
 pub use verify::*;

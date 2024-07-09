@@ -3,19 +3,19 @@
 #[cfg(target_feature = "gfni")]
 mod gfni;
 #[cfg(target_feature = "sse2")]
-mod m128;
+pub(super) mod m128;
 #[cfg(target_feature = "avx2")]
-mod m256;
+pub(super) mod m256;
 #[cfg(target_feature = "avx512f")]
-mod m512;
+pub(super) mod m512;
 
 use cfg_if::cfg_if;
 
 cfg_if! {
 	if #[cfg(all(target_feature = "pclmulqdq", target_feature = "sse2"))] {
-		pub mod polyval;
+		pub mod packed_polyval_128;
 	} else {
-		pub use super::portable::polyval;
+		pub use super::portable::packed_polyval_128;
 	}
 }
 

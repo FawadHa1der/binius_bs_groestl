@@ -15,8 +15,9 @@ use crate::{
 	oracle::{MultilinearOracleSet, MultilinearPolyOracle, ProjectionVariant},
 	witness::MultilinearWitnessIndex,
 };
-use binius_field::{PackedField, TowerField};
+use binius_field::{PackedField, PackedFieldIndexable, TowerField};
 use getset::{Getters, MutGetters};
+use std::mem;
 use tracing::instrument;
 
 /// A mutable prover state.
@@ -29,8 +30,7 @@ pub struct EvalcheckProver<'a, 'b, F: TowerField, PW: PackedField> {
 	pub(crate) oracles: &'a mut MultilinearOracleSet<F>,
 	pub(crate) witness_index: &'a mut MultilinearWitnessIndex<'b, PW>,
 
-	#[get = "pub"]
-	#[get_mut = "pub"]
+	#[getset(get = "pub", get_mut = "pub")]
 	pub(crate) batch_committed_eval_claims: BatchCommittedEvalClaims<F>,
 
 	#[get = "pub"]
@@ -41,7 +41,7 @@ pub struct EvalcheckProver<'a, 'b, F: TowerField, PW: PackedField> {
 impl<'a, 'b, F, PW> EvalcheckProver<'a, 'b, F, PW>
 where
 	F: TowerField + From<PW::Scalar>,
-	PW: PackedField,
+	PW: PackedFieldIndexable,
 	PW::Scalar: TowerField + From<F>,
 {
 	/// Create a new prover state by tying together the mutable references to the oracle set and
@@ -67,7 +67,7 @@ where
 
 	/// A helper method to move out the set of reduced sumcheck instances
 	pub fn take_new_sumchecks(&mut self) -> Vec<BivariateSumcheck<'b, F, PW>> {
-		std::mem::take(&mut self.new_sumchecks)
+		mem::take(&mut self.new_sumchecks)
 	}
 
 	/// Prove an evalcheck claim.
@@ -113,24 +113,7 @@ where
 
 		let subproofs = multilin_oracles
 			.map(|suboracle| {
-				let eval_query = self.memoized_queries.full_query(&wf_eval_point)?;
-
-				let witness_poly = self
-					.witness_index
-					.get(suboracle.id())
-					.ok_or(Error::InvalidWitness(suboracle.id()))?;
-
-				let eval = witness_poly.evaluate(eval_query)?.into();
-
-				let subclaim = EvalcheckMultilinearClaim {
-					poly: suboracle,
-					eval_point: eval_point.clone(),
-					eval,
-					is_random_point,
-				};
-
-				let proof = self.prove_multilinear(subclaim)?;
-				Ok((eval, proof))
+				self.eval_and_proof(suboracle, &eval_point, &wf_eval_point, is_random_point)
 			})
 			.collect::<Result<_, Error>>()?;
 
@@ -185,8 +168,57 @@ where
 				EvalcheckProof::Repeating(Box::new(subproof))
 			}
 
-			Merged(..) => todo!(),
-			Interleaved(..) => todo!(),
+			Merged(_id, poly1, poly2) => {
+				let n_vars = poly1.n_vars();
+				assert_eq!(poly1.n_vars(), poly2.n_vars());
+				let inner_eval_point = &eval_point[..n_vars];
+				let wf_inner_eval_point = &wf_eval_point[0..n_vars];
+
+				let (eval1, subproof1) = self.eval_and_proof(
+					*poly1,
+					inner_eval_point,
+					wf_inner_eval_point,
+					is_random_point,
+				)?;
+				let (eval2, subproof2) = self.eval_and_proof(
+					*poly2,
+					inner_eval_point,
+					wf_inner_eval_point,
+					is_random_point,
+				)?;
+
+				EvalcheckProof::Merged {
+					eval1,
+					eval2,
+					subproof1: Box::new(subproof1),
+					subproof2: Box::new(subproof2),
+				}
+			}
+			Interleaved(_id, poly1, poly2) => {
+				assert_eq!(poly1.n_vars(), poly2.n_vars());
+				let inner_eval_point = &eval_point[1..];
+				let wf_inner_eval_point = &wf_eval_point[1..];
+
+				let (eval1, subproof1) = self.eval_and_proof(
+					*poly1,
+					inner_eval_point,
+					wf_inner_eval_point,
+					is_random_point,
+				)?;
+				let (eval2, subproof2) = self.eval_and_proof(
+					*poly2,
+					inner_eval_point,
+					wf_inner_eval_point,
+					is_random_point,
+				)?;
+
+				EvalcheckProof::Interleaved {
+					eval1,
+					eval2,
+					subproof1: Box::new(subproof1),
+					subproof2: Box::new(subproof2),
+				}
+			}
 
 			Shifted(_id, shifted) => {
 				let meta = shifted_sumcheck_meta(self.oracles, &shifted, eval_point.as_slice())?;
@@ -248,5 +280,28 @@ where
 		};
 
 		Ok(proof)
+	}
+
+	fn eval_and_proof(
+		&mut self,
+		poly: MultilinearPolyOracle<F>,
+		eval_point: &[F],
+		wf_eval_point: &[PW::Scalar],
+		is_random_point: bool,
+	) -> Result<(F, EvalcheckProof<F>), Error> {
+		let eval_query = self.memoized_queries.full_query(wf_eval_point)?;
+		let witness_poly = self
+			.witness_index
+			.get(poly.id())
+			.ok_or(Error::InvalidWitness(poly.id()))?;
+		let eval = witness_poly.evaluate(eval_query)?.into();
+		let subclaim = EvalcheckMultilinearClaim {
+			poly,
+			eval_point: eval_point.to_vec(),
+			eval,
+			is_random_point,
+		};
+		let subproof = self.prove_multilinear(subclaim)?;
+		Ok((eval, subproof))
 	}
 }

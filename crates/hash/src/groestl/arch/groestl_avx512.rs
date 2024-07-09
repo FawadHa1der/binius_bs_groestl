@@ -1,20 +1,10 @@
 // Copyright 2024 Ulvetanna Inc.
 
-use digest::{
-	block_buffer::Eager,
-	core_api::{
-		AlgorithmName, Block, BlockSizeUser, Buffer, BufferKindUser, CoreWrapper,
-		CtVariableCoreWrapper, TruncSide, UpdateCore, VariableOutputCore,
-	},
-	typenum::{Unsigned, U32, U64},
-	HashMarker, InvalidOutputSize, Output, OutputSizeUser,
+use binius_field::{
+	underlier::WithUnderlier, AESTowerField8b, ExtensionField, PackedAESBinaryField64x8b,
+	PackedExtension, PackedField, PackedFieldIndexable,
 };
-use std::{arch::x86_64::*, fmt, mem::transmute_copy};
-
-pub type GroestlShortCore<OutSize> = CtVariableCoreWrapper<Groestl256AVX512, OutSize>;
-
-/// Groestl-256 hasher state.
-pub type Groestl256 = CoreWrapper<GroestlShortCore<U32>>;
+use std::{arch::x86_64::*, convert::TryInto, mem::transmute_copy};
 
 const HASH_SIZE: usize = 256 / 8;
 
@@ -22,6 +12,12 @@ const ROUND_SIZE: usize = 10;
 
 #[repr(align(64))]
 struct AlignedArray([u8; 64]);
+
+impl Default for AlignedArray {
+	fn default() -> Self {
+		AlignedArray([0; 64])
+	}
+}
 
 impl From<__m512i> for AlignedArray {
 	fn from(value: __m512i) -> Self {
@@ -62,6 +58,27 @@ fn xor_blocks(a: __m512i, b: __m512i) -> __m512i {
 	unsafe { _mm512_xor_si512(a, b) }
 }
 
+#[inline]
+fn to_u8_slice<
+	PT: PackedField<Scalar: ExtensionField<AESTowerField8b>>
+		+ PackedExtension<AESTowerField8b, PackedSubfield: PackedFieldIndexable>,
+>(
+	slice: &[PT],
+) -> &[u8] {
+	let packed_subfields = PT::cast_bases(slice);
+	let scalars = PT::PackedSubfield::unpack_scalars(packed_subfields);
+	AESTowerField8b::to_underliers_ref(scalars)
+}
+
+#[inline]
+fn from_u8_slice(slice: &[u8; 64]) -> PackedAESBinaryField64x8b {
+	let aes_arr = AESTowerField8b::from_underliers_ref(slice);
+	let mut p = [PackedAESBinaryField64x8b::zero()];
+	let p_slice = PackedAESBinaryField64x8b::unpack_scalars_mut(&mut p);
+	p_slice.copy_from_slice(aes_arr);
+	p[0]
+}
+
 const INDEX: AlignedArray = AlignedArray([
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -69,13 +86,10 @@ const INDEX: AlignedArray = AlignedArray([
 	0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ]);
 
-#[derive(Clone)]
-pub struct Groestl256AVX512 {
-	blocks_len: u64,
-	state: __m512i,
-}
+#[derive(Clone, Default)]
+pub struct Groestl256Core;
 
-impl Groestl256AVX512 {
+impl Groestl256Core {
 	#[inline]
 	fn mix_bytes(&self, block: __m512i) -> __m512i {
 		let b_adj_1: __m512i = unsafe { _mm512_ror_epi64(block, 8) };
@@ -147,7 +161,7 @@ impl Groestl256AVX512 {
 		xor_blocks(res, block)
 	}
 
-	pub fn perm_func_p(&self, block: __m512i) -> __m512i {
+	fn perm_p_m512i(&self, block: __m512i) -> __m512i {
 		let mut block = block;
 		for r in 0..ROUND_SIZE {
 			block = self.add_round_constants_p(block, r as u8);
@@ -158,7 +172,7 @@ impl Groestl256AVX512 {
 		block
 	}
 
-	fn combined_perm(&self, p_block: __m512i, q_block: __m512i) -> __m512i {
+	fn combined_perm_m512i(&self, p_block: __m512i, q_block: __m512i) -> (__m512i, __m512i) {
 		let mut p_block = p_block;
 		let mut q_block = q_block;
 		for r in 0..ROUND_SIZE {
@@ -172,85 +186,36 @@ impl Groestl256AVX512 {
 			q_block = self.mix_bytes(q_block);
 		}
 
-		xor_blocks(q_block, p_block)
+		(q_block, p_block)
 	}
 
 	#[inline]
-	pub fn compression_func(&self, h: __m512i, m: __m512i) -> __m512i {
-		xor_blocks(self.combined_perm(xor_blocks(h, m), m), h)
-	}
-}
+	pub fn permutation_p(&self, p: PackedAESBinaryField64x8b) -> PackedAESBinaryField64x8b {
+		let p = [p];
+		let p_slice = to_u8_slice(&p);
+		let input = AlignedArray(p_slice.try_into().unwrap());
+		let out: AlignedArray = self.perm_p_m512i(input.into()).into();
 
-impl HashMarker for Groestl256AVX512 {}
-
-impl BlockSizeUser for Groestl256AVX512 {
-	type BlockSize = U64;
-}
-
-impl BufferKindUser for Groestl256AVX512 {
-	type BufferKind = Eager;
-}
-
-impl OutputSizeUser for Groestl256AVX512 {
-	type OutputSize = U32;
-}
-
-impl UpdateCore for Groestl256AVX512 {
-	#[inline]
-	fn update_blocks(&mut self, blocks: &[Block<Self>]) {
-		self.blocks_len += blocks.len() as u64;
-		for block in blocks {
-			let block: &[u8; 64] = block.as_ref();
-			let block = unsafe { _mm512_loadu_epi8(transmute_copy(&block.as_ptr())) };
-			self.state = self.compression_func(self.state, block);
-		}
-	}
-}
-
-impl VariableOutputCore for Groestl256AVX512 {
-	const TRUNC_SIDE: TruncSide = TruncSide::Right;
-
-	#[inline]
-	fn new(output_size: usize) -> Result<Self, InvalidOutputSize> {
-		if output_size > Self::OutputSize::USIZE {
-			return Err(InvalidOutputSize);
-		}
-		let mut state = AlignedArray([0; 64]);
-		let iv: u64 = 8 * output_size as u64;
-		state.0[56..64].copy_from_slice(&iv.to_be_bytes());
-		let blocks_len = 0;
-		Ok(Self {
-			state: state.into(),
-			blocks_len,
-		})
+		from_u8_slice(&out.0)
 	}
 
 	#[inline]
-	fn finalize_variable_core(&mut self, buffer: &mut Buffer<Self>, out: &mut Output<Self>) {
-		let blocks_len = if buffer.remaining() <= 8 {
-			self.blocks_len + 2
-		} else {
-			self.blocks_len + 1
-		};
-		buffer.len64_padding_be(blocks_len, |block| {
-			let block: &[u8; 64] = block.as_ref();
-			let block = unsafe { _mm512_loadu_epi8(transmute_copy(&block.as_ptr())) };
-			self.state = self.compression_func(self.state, block)
-		});
-		let new_state = self.perm_func_p(self.state);
-		let res: AlignedArray = xor_blocks(new_state, self.state).into();
-		out.copy_from_slice(&res.0[HASH_SIZE..64]);
-	}
-}
-impl AlgorithmName for Groestl256AVX512 {
-	#[inline]
-	fn write_alg_name(f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str("Groestl256AVX512")
-	}
-}
+	pub fn permutation_pq(
+		&self,
+		p: PackedAESBinaryField64x8b,
+		q: PackedAESBinaryField64x8b,
+	) -> (PackedAESBinaryField64x8b, PackedAESBinaryField64x8b) {
+		let p = [p];
+		let q = [q];
+		let p_slice = to_u8_slice(&p);
+		let q_slice = to_u8_slice(&q);
+		let p_align = AlignedArray(p_slice.try_into().unwrap());
+		let q_align = AlignedArray(q_slice.try_into().unwrap());
 
-impl fmt::Debug for Groestl256AVX512 {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str("Groestl256AVX512 { ... }")
+		let (p_out_arr, q_out_arr) = self.combined_perm_m512i(p_align.into(), q_align.into());
+		let p_out_arr: AlignedArray = p_out_arr.into();
+		let q_out_arr: AlignedArray = q_out_arr.into();
+
+		(from_u8_slice(&p_out_arr.0), from_u8_slice(&q_out_arr.0))
 	}
 }

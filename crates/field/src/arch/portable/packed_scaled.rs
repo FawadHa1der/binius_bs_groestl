@@ -5,10 +5,14 @@ use crate::{
 		FieldAffineTransformation, PackedTransformationFactory, Transformation,
 	},
 	arithmetic_traits::MulAlpha,
+	as_packed_field::PackScalar,
 	packed::PackedBinaryField,
-	Error, PackedField,
+	underlier::{ScaledUnderlier, UnderlierType, WithUnderlier},
+	Field, PackedField,
 };
-use bytemuck::{Pod, Zeroable};
+use binius_utils::checked_arithmetics::checked_log_2;
+use bytemuck::{Pod, TransparentWrapper, Zeroable};
+use rand::RngCore;
 use std::{
 	array,
 	iter::{Product, Sum},
@@ -19,13 +23,15 @@ use subtle::ConstantTimeEq;
 /// Packed field that just stores smaller packed field N times and performs all operations
 /// one by one.
 /// This makes sense for creating portable implementations for 256 and 512 packed sizes.
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, bytemuck::TransparentWrapper)]
+#[repr(transparent)]
 pub struct ScaledPackedField<PT, const N: usize>(pub(super) [PT; N]);
 
 impl<PT, const N: usize> ScaledPackedField<PT, N> {
 	pub const WIDTH_IN_PT: usize = N;
 
-	pub fn from_fn(f: impl FnMut(usize) -> PT) -> Self {
+	/// In general case PT != Self::Scalar, so this function has a different name from `PackedField::from_fn`
+	pub fn from_direct_packed_fn(f: impl FnMut(usize) -> PT) -> Self {
 		Self(std::array::from_fn(f))
 	}
 }
@@ -48,9 +54,12 @@ where
 	}
 }
 
-impl<PT, const N: usize> From<ScaledPackedField<PT, N>> for [PT; N] {
+impl<U, PT, const N: usize> From<ScaledPackedField<PT, N>> for [U; N]
+where
+	U: From<PT>,
+{
 	fn from(value: ScaledPackedField<PT, N>) -> Self {
-		value.0
+		value.0.map(Into::into)
 	}
 }
 
@@ -71,7 +80,7 @@ where
 	type Output = Self;
 
 	fn add(self, rhs: Self) -> Self {
-		Self::from_fn(|i| self.0[i] + rhs.0[i])
+		Self::from_direct_packed_fn(|i| self.0[i] + rhs.0[i])
 	}
 }
 
@@ -93,7 +102,7 @@ where
 	type Output = Self;
 
 	fn sub(self, rhs: Self) -> Self {
-		Self::from_fn(|i| self.0[i] - rhs.0[i])
+		Self::from_direct_packed_fn(|i| self.0[i] - rhs.0[i])
 	}
 }
 
@@ -115,7 +124,7 @@ where
 	type Output = Self;
 
 	fn mul(self, rhs: Self) -> Self {
-		Self::from_fn(|i| self.0[i] * rhs.0[i])
+		Self::from_direct_packed_fn(|i| self.0[i] * rhs.0[i])
 	}
 }
 
@@ -178,33 +187,30 @@ where
 {
 	type Scalar = PT::Scalar;
 
-	const LOG_WIDTH: usize = { PT::LOG_WIDTH + N.ilog2() as usize };
+	const LOG_WIDTH: usize = PT::LOG_WIDTH + checked_log_2(N);
 
-	fn get_checked(&self, i: usize) -> Result<Self::Scalar, Error> {
+	#[inline]
+	unsafe fn get_unchecked(&self, i: usize) -> Self::Scalar {
+		let outer_i = i / PT::WIDTH;
+		let inner_i = i % PT::WIDTH;
+		self.0.get_unchecked(outer_i).get_unchecked(inner_i)
+	}
+
+	#[inline]
+	unsafe fn set_unchecked(&mut self, i: usize, scalar: Self::Scalar) {
 		let outer_i = i / PT::WIDTH;
 		let inner_i = i % PT::WIDTH;
 		self.0
-			.get(outer_i)
-			.ok_or(Error::IndexOutOfRange {
-				index: i,
-				max: Self::WIDTH,
-			})
-			.and_then(|inner| inner.get_checked(inner_i))
+			.get_unchecked_mut(outer_i)
+			.set_unchecked(inner_i, scalar);
 	}
 
-	fn set_checked(&mut self, i: usize, scalar: Self::Scalar) -> Result<(), Error> {
-		let outer_i = i / PT::WIDTH;
-		let inner_i = i % PT::WIDTH;
-		self.0
-			.get_mut(outer_i)
-			.ok_or(Error::IndexOutOfRange {
-				index: i,
-				max: Self::WIDTH,
-			})
-			.and_then(|inner| inner.set_checked(inner_i, scalar))
+	#[inline]
+	fn zero() -> Self {
+		Self(array::from_fn(|_| PT::zero()))
 	}
 
-	fn random(mut rng: impl rand::prelude::RngCore) -> Self {
+	fn random(mut rng: impl RngCore) -> Self {
 		Self(array::from_fn(|_| PT::random(&mut rng)))
 	}
 
@@ -248,7 +254,7 @@ where
 	}
 
 	fn from_fn(mut f: impl FnMut(usize) -> Self::Scalar) -> Self {
-		Self(std::array::from_fn(|i| PT::from_fn(|j| f(i * PT::WIDTH + j))))
+		Self(array::from_fn(|i| PT::from_fn(|j| f(i * PT::WIDTH + j))))
 	}
 }
 
@@ -256,6 +262,7 @@ impl<PT: PackedField + MulAlpha, const N: usize> MulAlpha for ScaledPackedField<
 where
 	[PT; N]: Default,
 {
+	#[inline]
 	fn mul_alpha(self) -> Self {
 		Self(self.0.map(|v| v.mul_alpha()))
 	}
@@ -278,7 +285,7 @@ where
 	I: Transformation<IP, OP>,
 {
 	fn transform(&self, data: &ScaledPackedField<IP, N>) -> ScaledPackedField<OP, N> {
-		ScaledPackedField::from_fn(|i| self.inner.transform(&data.0[i]))
+		ScaledPackedField::from_direct_packed_fn(|i| self.inner.transform(&data.0[i]))
 	}
 }
 
@@ -373,48 +380,71 @@ macro_rules! packed_scaled_field {
 				}
 			}
 		}
-
-		unsafe impl<P> $crate::extension::PackedExtensionField<P> for $name
-		where
-			P: $crate::packed::PackedField,
-			$inner: $crate::extension::PackedExtensionField<P>,
-			<$inner as $crate::packed::PackedField>::Scalar:
-				$crate::extension::ExtensionField<P::Scalar>,
-		{
-			fn cast_to_bases(packed: &[Self]) -> &[P] {
-				<$inner>::cast_to_bases(bytemuck::must_cast_slice(packed))
-			}
-
-			fn cast_to_bases_mut(packed: &mut [Self]) -> &mut [P] {
-				<$inner>::cast_to_bases_mut(bytemuck::must_cast_slice_mut(packed))
-			}
-
-			fn try_cast_to_ext(packed: &[P]) -> Option<&[Self]> {
-				<$inner>::try_cast_to_ext(packed)
-					.and_then(|bases| bytemuck::try_cast_slice(bases).ok())
-			}
-
-			fn try_cast_to_ext_mut(packed: &mut [P]) -> Option<&mut [Self]> {
-				<$inner>::try_cast_to_ext_mut(packed)
-					.and_then(|bases| bytemuck::try_cast_slice_mut(bases).ok())
-			}
-		}
 	};
 }
 
 pub(crate) use packed_scaled_field;
 
-macro_rules! impl_scaled_512_bit_conversion_from_u128_array {
-	($name:ty, $inner:ty) => {
-		impl From<[u128; 4]> for $name {
-			fn from(value: [u128; 4]) -> Self {
-				Self([
-					<$inner>::from([value[0], value[1]]),
-					<$inner>::from([value[2], value[3]]),
-				])
-			}
-		}
-	};
+unsafe impl<PT, const N: usize> WithUnderlier for ScaledPackedField<PT, N>
+where
+	PT: WithUnderlier<Underlier: Pod>,
+{
+	type Underlier = ScaledUnderlier<PT::Underlier, N>;
+
+	fn to_underlier(self) -> Self::Underlier {
+		TransparentWrapper::peel(self)
+	}
+
+	fn to_underlier_ref(&self) -> &Self::Underlier {
+		TransparentWrapper::peel_ref(self)
+	}
+
+	fn to_underlier_ref_mut(&mut self) -> &mut Self::Underlier {
+		TransparentWrapper::peel_mut(self)
+	}
+
+	fn to_underliers_ref(val: &[Self]) -> &[Self::Underlier] {
+		TransparentWrapper::peel_slice(val)
+	}
+
+	fn to_underliers_ref_mut(val: &mut [Self]) -> &mut [Self::Underlier] {
+		TransparentWrapper::peel_slice_mut(val)
+	}
+
+	fn from_underlier(val: Self::Underlier) -> Self {
+		TransparentWrapper::wrap(val)
+	}
+
+	fn from_underlier_ref(val: &Self::Underlier) -> &Self {
+		TransparentWrapper::wrap_ref(val)
+	}
+
+	fn from_underlier_ref_mut(val: &mut Self::Underlier) -> &mut Self {
+		TransparentWrapper::wrap_mut(val)
+	}
+
+	fn from_underliers_ref(val: &[Self::Underlier]) -> &[Self] {
+		TransparentWrapper::wrap_slice(val)
+	}
+
+	fn from_underliers_ref_mut(val: &mut [Self::Underlier]) -> &mut [Self] {
+		TransparentWrapper::wrap_slice_mut(val)
+	}
 }
 
-pub(crate) use impl_scaled_512_bit_conversion_from_u128_array;
+impl<U, F, const N: usize> PackScalar<F> for ScaledUnderlier<U, N>
+where
+	U: PackScalar<F> + UnderlierType + Pod,
+	F: Field,
+	ScaledPackedField<U::Packed, N>:
+		PackedField<Scalar = F> + WithUnderlier<Underlier = ScaledUnderlier<U, N>>,
+{
+	type Packed = ScaledPackedField<U::Packed, N>;
+}
+
+unsafe impl<PT, U, const N: usize> TransparentWrapper<ScaledUnderlier<U, N>>
+	for ScaledPackedField<PT, N>
+where
+	PT: WithUnderlier<Underlier = U>,
+{
+}

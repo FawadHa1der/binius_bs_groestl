@@ -38,6 +38,12 @@ pub enum EvalcheckProof<F: Field> {
 	Shifted,
 	Packed,
 	Repeating(Box<EvalcheckProof<F>>),
+	Interleaved {
+		eval1: F,
+		eval2: F,
+		subproof1: Box<EvalcheckProof<F>>,
+		subproof2: Box<EvalcheckProof<F>>,
+	},
 	Merged {
 		eval1: F,
 		eval2: F,
@@ -49,7 +55,7 @@ pub enum EvalcheckProof<F: Field> {
 	},
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommittedEvalClaim<F: Field> {
 	pub id: CommittedId,
 	/// Evaluation Point
@@ -96,7 +102,10 @@ impl<F: Field> BatchCommittedEvalClaims<F> {
 
 	/// Insert a new claim into the batch.
 	pub fn insert(&mut self, claim: CommittedEvalClaim<F>) {
-		self.claims_by_batch[claim.id.batch_id].push(claim);
+		let claims_by_batch = &mut self.claims_by_batch[claim.id.batch_id];
+		if !claims_by_batch.contains(&claim) {
+			claims_by_batch.push(claim);
+		}
 	}
 
 	pub fn n_batches(&self) -> usize {

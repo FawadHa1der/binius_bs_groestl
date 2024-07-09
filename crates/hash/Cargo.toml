@@ -7,13 +7,15 @@ build = "build.rs"
 
 [dependencies]
 binius_field = { path = "../field" }
-binius_utils = { path = "../utils"}
+binius_utils = { path = "../utils" }
+binius_ntt = { path = "../ntt" }
 bytemuck.workspace = true
 cfg-if.workspace = true
-digest.workspace = true
-groestl_crypto.workspace = true
+lazy_static.workspace = true
 p3-symmetric.workspace = true
+thiserror.workspace = true
 log.workspace = true
+
 
 
 [build-dependencies]
@@ -24,6 +26,7 @@ criterion.workspace = true
 hex-literal.workspace = true
 rand.workspace = true
 rayon = "1.5"
+groestl_crypto.workspace = true
 
 [lib]
 bench = false

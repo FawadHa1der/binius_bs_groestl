@@ -1,9 +1,10 @@
 // Copyright 2023 Ulvetanna Inc.
 
 use crate::{
+	challenger::{CanObserve, CanSample},
 	polynomial::{
-		CompositionPoly, Error as PolynomialError, EvaluationDomain, MultilinearExtension,
-		MultilinearPoly, MultivariatePoly,
+		CompositionPoly, Error as PolynomialError, EvaluationDomainFactory, MultilinearExtension,
+		MultivariatePoly,
 	},
 	protocols::{
 		evalcheck::{
@@ -15,23 +16,22 @@ use crate::{
 			EvalcheckVerifier,
 		},
 		sumcheck::{
-			batch_prove, setup_first_round_claim, verify_final, verify_round,
-			verify_zerocheck_round, Error as SumcheckError, SumcheckBatchProof,
-			SumcheckBatchProveOutput, SumcheckClaim, SumcheckProof, SumcheckProveOutput,
-			SumcheckProver, SumcheckRoundClaim, SumcheckWitness,
+			batch_prove, Error as SumcheckError, SumcheckBatchProof, SumcheckBatchProveOutput,
+			SumcheckClaim, SumcheckProver,
 		},
 	},
 };
-use binius_field::{packed::set_packed_slice, BinaryField1b, Field, PackedField, TowerField};
-use p3_challenger::{CanObserve, CanSample};
-use std::iter::Step;
+use binius_field::{
+	packed::set_packed_slice, BinaryField1b, ExtensionField, Field, PackedField, TowerField,
+};
+use std::ops::Deref;
 use tracing::instrument;
 
 // If the macro is not used in the same module, rustc thinks it is unused for some reason
 #[allow(unused_macros, unused_imports)]
 pub mod macros {
 	macro_rules! felts {
-		($f:ident[$($elem:expr),* $(,)?]) => { vec![$($f::new($elem)),*] };
+		($f:ident[$($elem:expr),* $(,)?]) => { vec![$($f::from($elem)),*] };
 	}
 	pub(crate) use felts;
 }
@@ -86,7 +86,7 @@ where
 	let mut result: Vec<P> = vec![P::default(); packed_len];
 	for (range, value) in assignments.iter() {
 		for i in range.clone() {
-			set_packed_slice(&mut result, i, P::Scalar::new(*value));
+			set_packed_slice(&mut result, i, P::Scalar::from(*value));
 		}
 	}
 	result
@@ -103,9 +103,9 @@ impl TestProductComposition {
 	}
 }
 
-impl<F> CompositionPoly<F> for TestProductComposition
+impl<P> CompositionPoly<P> for TestProductComposition
 where
-	F: Field,
+	P: PackedField,
 {
 	fn n_vars(&self) -> usize {
 		self.arity
@@ -115,14 +115,18 @@ where
 		self.arity
 	}
 
-	fn evaluate(&self, query: &[F]) -> Result<F, PolynomialError> {
-		self.evaluate_packed(query)
-	}
-
-	fn evaluate_packed(&self, query: &[F]) -> Result<F, PolynomialError> {
+	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, PolynomialError> {
 		let n_vars = self.arity;
 		assert_eq!(query.len(), n_vars);
-		Ok(query.iter().product())
+		// Product of scalar values at the corresponding positions of the packed values.
+		Ok(query.iter().copied().product())
+	}
+
+	fn evaluate(&self, query: &[P]) -> Result<P, PolynomialError> {
+		let n_vars = self.arity;
+		assert_eq!(query.len(), n_vars);
+		// Product of scalar values at the corresponding positions of the packed values.
+		Ok(query.iter().copied().product())
 	}
 
 	fn binary_tower_level(&self) -> usize {
@@ -130,140 +134,37 @@ where
 	}
 }
 
-pub fn transform_poly<F, OF>(
-	multilin: MultilinearExtension<F>,
-) -> Result<MultilinearExtension<'static, OF>, PolynomialError>
+pub fn transform_poly<F, OF, Data>(
+	multilin: MultilinearExtension<F, Data>,
+) -> Result<MultilinearExtension<OF>, PolynomialError>
 where
 	F: Field,
 	OF: Field + From<F> + Into<F>,
+	Data: Deref<Target = [F]>,
 {
-	let values = multilin
-		.evals()
-		.iter()
-		.cloned()
-		.map(OF::from)
-		.collect::<Vec<_>>();
+	let values = multilin.evals().iter().cloned().map(OF::from).collect();
 
 	MultilinearExtension::from_values(values)
-}
-
-#[instrument(skip_all, name = "test_utils::full_verify")]
-pub fn full_verify<F, CH>(
-	claim: &SumcheckClaim<F>,
-	proof: SumcheckProof<F>,
-	mut challenger: CH,
-) -> (Vec<SumcheckRoundClaim<F>>, EvalcheckClaim<F>)
-where
-	F: Field,
-	CH: CanSample<F> + CanObserve<F>,
-{
-	let n_vars = claim.poly.n_vars();
-	assert!(n_vars > 0);
-	let is_zerocheck = claim.zerocheck_challenges.is_some();
-
-	let n_rounds = proof.rounds.len();
-	assert_eq!(n_rounds, n_vars);
-
-	let mut rd_claim = setup_first_round_claim(claim);
-	let mut rd_claims = Vec::with_capacity(n_rounds);
-	for (i, round_proof) in proof.rounds.into_iter().enumerate() {
-		rd_claims.push(rd_claim.clone());
-
-		challenger.observe_slice(round_proof.coeffs.as_slice());
-		rd_claim = if is_zerocheck {
-			let alpha = if i == 0 {
-				None
-			} else {
-				Some(claim.zerocheck_challenges.clone().unwrap()[i - 1])
-			};
-			verify_zerocheck_round(rd_claim, challenger.sample(), round_proof.clone(), alpha)
-				.unwrap()
-		} else {
-			verify_round(rd_claim, challenger.sample(), round_proof.clone()).unwrap()
-		};
-	}
-
-	let final_claim = verify_final(&claim.poly, rd_claim).unwrap();
-	(rd_claims, final_claim)
-}
-
-fn full_prove_with_switchover_impl<F, PW, PCW, M, CH>(
-	n_vars: usize,
-	mut prover_state: SumcheckProver<F, PW, PCW, M>,
-	mut challenger: CH,
-) -> (Vec<SumcheckRoundClaim<F>>, SumcheckProveOutput<F>)
-where
-	F: Field + From<PW::Scalar>,
-	PW: PackedField,
-	PW::Scalar: From<F>,
-	PCW: CompositionPoly<PW>,
-	M: MultilinearPoly<PW> + Clone + Sync,
-	CH: CanSample<F> + CanObserve<F>,
-{
-	let mut prev_rd_challenge = None;
-	let mut rd_claims = Vec::with_capacity(n_vars);
-	let mut rd_proofs = Vec::with_capacity(n_vars);
-
-	for _round in 0..n_vars {
-		let proof_round = prover_state.execute_round(prev_rd_challenge).unwrap();
-
-		challenger.observe_slice(&proof_round.coeffs);
-
-		prev_rd_challenge = Some(challenger.sample());
-
-		rd_claims.push(prover_state.round_claim().clone());
-		rd_proofs.push(proof_round);
-	}
-
-	let evalcheck_claim = prover_state.finalize(prev_rd_challenge).unwrap();
-	let prove_output = SumcheckProveOutput {
-		evalcheck_claim,
-		sumcheck_proof: SumcheckProof { rounds: rd_proofs },
-	};
-
-	(rd_claims, prove_output)
-}
-
-#[instrument(skip_all, name = "test_utils::full_prove_with_switchover")]
-pub fn full_prove_with_switchover<F, PW, CW, M, CH>(
-	claim: &SumcheckClaim<F>,
-	witness: SumcheckWitness<PW, CW, M>,
-	domain: &EvaluationDomain<PW::Scalar>,
-	challenger: CH,
-	switchover_fn: impl Fn(usize) -> usize,
-) -> (Vec<SumcheckRoundClaim<F>>, SumcheckProveOutput<F>)
-where
-	F: Field + From<PW::Scalar>,
-	PW: PackedField,
-	PW::Scalar: From<F>,
-	CW: CompositionPoly<PW>,
-	M: MultilinearPoly<PW> + Clone + Sync,
-	CH: CanSample<F> + CanObserve<F>,
-{
-	let n_vars = claim.poly.n_vars();
-
-	assert_eq!(witness.n_vars(), n_vars);
-
-	let prover_state = SumcheckProver::new(domain, claim.clone(), witness, switchover_fn).unwrap();
-	full_prove_with_switchover_impl(n_vars, prover_state, challenger)
 }
 
 #[instrument(
 	skip_all,
 	name = "test_utils::prove_bivariate_sumchecks_with_switchover"
 )]
-pub fn prove_bivariate_sumchecks_with_switchover<'a, F, PW, CH>(
+pub fn prove_bivariate_sumchecks_with_switchover<'a, F, PW, DomainField, CH>(
 	sumchecks: impl IntoIterator<Item = BivariateSumcheck<'a, F, PW>>,
 	challenger: &mut CH,
 	switchover_fn: impl Fn(usize) -> usize + Clone,
+	domain_factory: impl EvaluationDomainFactory<DomainField>,
 ) -> Result<(SumcheckBatchProof<F>, impl IntoIterator<Item = EvalcheckClaim<F>>), SumcheckError>
 where
-	F: Field + Step + From<PW::Scalar>,
+	F: Field + From<PW::Scalar>,
 	PW: PackedField,
-	PW::Scalar: From<F>,
+	PW::Scalar: From<F> + ExtensionField<DomainField>,
+	DomainField: Field,
 	CH: CanObserve<F> + CanSample<F>,
 {
-	let bivariate_domain = EvaluationDomain::new_isomorphic::<F>(3)?;
+	let bivariate_domain = domain_factory.create(3).unwrap();
 
 	let (claims, witnesses) = sumchecks.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
 
@@ -271,7 +172,12 @@ where
 		.into_iter()
 		.zip(&claims)
 		.map(|(witness, claim)| {
-			SumcheckProver::new(&bivariate_domain, claim.clone(), witness, switchover_fn.clone())
+			SumcheckProver::<_, _, DomainField, _, _>::new(
+				&bivariate_domain,
+				claim.clone(),
+				witness,
+				switchover_fn.clone(),
+			)
 		})
 		.collect::<Result<Vec<_>, _>>()?;
 

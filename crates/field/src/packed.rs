@@ -4,22 +4,19 @@
 //!
 //! Interfaces are derived from [`plonky2`](https://github.com/mir-protocol/plonky2).
 
-use crate::BinaryField;
-
 use super::{
 	arithmetic_traits::{Broadcast, MulAlpha, Square},
 	binary_field_arithmetic::TowerFieldArithmetic,
 	Error,
 };
+use crate::{arithmetic_traits::InvertOrZero, BinaryField, Field};
 use binius_utils::iter::IterExtensions;
-use ff::Field;
 use rand::RngCore;
 use std::{
 	fmt::Debug,
 	iter::{self, Product, Sum},
 	ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign},
 };
-use subtle::ConstantTimeEq;
 
 /// A packed field represents a vector of underlying field elements.
 ///
@@ -33,7 +30,6 @@ pub trait PackedField:
 	+ Copy
 	+ Eq
 	+ Sized
-	+ ConstantTimeEq
 	+ Add<Output = Self>
 	+ Sub<Output = Self>
 	+ Mul<Output = Self>
@@ -63,41 +59,99 @@ pub trait PackedField:
 	/// WIDTH is guaranteed to equal 2^LOG_WIDTH.
 	const WIDTH: usize = 1 << Self::LOG_WIDTH;
 
+	/// Get the scalar at a given index without bounds checking.
+	/// # Safety
+	/// The caller must ensure that `i` is less than `WIDTH`.
+	unsafe fn get_unchecked(&self, i: usize) -> Self::Scalar;
+
+	/// Set the scalar at a given index without bounds checking.
+	/// # Safety
+	/// The caller must ensure that `i` is less than `WIDTH`.
+	unsafe fn set_unchecked(&mut self, i: usize, scalar: Self::Scalar);
+
 	/// Get the scalar at a given index.
-	fn get_checked(&self, i: usize) -> Result<Self::Scalar, Error>;
+	#[inline]
+	fn get_checked(&self, i: usize) -> Result<Self::Scalar, Error> {
+		(i < Self::WIDTH)
+			.then_some(unsafe { self.get_unchecked(i) })
+			.ok_or(Error::IndexOutOfRange {
+				index: i,
+				max: Self::WIDTH,
+			})
+	}
 
 	/// Set the scalar at a given index.
-	fn set_checked(&mut self, i: usize, scalar: Self::Scalar) -> Result<(), Error>;
+	#[inline]
+	fn set_checked(&mut self, i: usize, scalar: Self::Scalar) -> Result<(), Error> {
+		(i < Self::WIDTH)
+			.then(|| unsafe { self.set_unchecked(i, scalar) })
+			.ok_or(Error::IndexOutOfRange {
+				index: i,
+				max: Self::WIDTH,
+			})
+	}
 
 	/// Get the scalar at a given index.
+	#[inline]
 	fn get(&self, i: usize) -> Self::Scalar {
 		self.get_checked(i).expect("index must be less than width")
 	}
 
 	/// Set the scalar at a given index.
+	#[inline]
 	fn set(&mut self, i: usize, scalar: Self::Scalar) {
 		self.set_checked(i, scalar).expect("index must be less than width")
 	}
 
+	#[inline]
 	fn into_iter(self) -> impl Iterator<Item=Self::Scalar> {
-		(0..Self::WIDTH).map_skippable(move |i| self.get(i))
+		(0..Self::WIDTH).map_skippable(move |i|
+			// Safety: `i` is always less than `WIDTH`
+			unsafe { self.get_unchecked(i) })
 	}
 
+	#[inline]
 	fn iter(&self) -> impl Iterator<Item=Self::Scalar> {
-		(0..Self::WIDTH).map_skippable(move |i| self.get(i))
+		(0..Self::WIDTH).map_skippable(move |i|
+			// Safety: `i` is always less than `WIDTH`
+			unsafe { self.get_unchecked(i) })
 	}
 
+	#[inline]
 	fn zero() -> Self {
 		Self::broadcast(Self::Scalar::ZERO)
 	}
 
+	#[inline]
 	fn one() -> Self {
 		Self::broadcast(Self::Scalar::ONE)
+	}
+
+	/// Initialize zero position with `scalar`, set other elements to zero.
+	#[inline(always)]
+	fn set_single(scalar: Self::Scalar) -> Self {
+		let mut result = Self::default();
+		result.set(0, scalar);
+
+		result
 	}
 
 	fn random(rng: impl RngCore) -> Self;
 	fn broadcast(scalar: Self::Scalar) -> Self;
 	fn from_fn(f: impl FnMut(usize) -> Self::Scalar) -> Self;
+
+	/// Construct a packed field element from a sequence of scalars.
+	///
+	/// If the number of values in the sequence is less than the packing width, the remaining
+	/// elements are set to zero. If greater than the packing width, the excess elements are
+	/// ignored.
+	fn from_scalars(values: impl IntoIterator<Item=Self::Scalar>) -> Self {
+		let mut result = Self::default();
+		for (i, val) in values.into_iter().take(Self::WIDTH).enumerate() {
+			result.set(i, val);
+		}
+		result
+	}
 
 	/// Returns the value multiplied by itself
 	fn square(self) -> Self;
@@ -128,7 +182,17 @@ pub fn iter_packed_slice<P: PackedField>(packed: &[P]) -> impl Iterator<Item = P
 }
 
 pub fn get_packed_slice<P: PackedField>(packed: &[P], i: usize) -> P::Scalar {
-	packed[i / P::WIDTH].get(i % P::WIDTH)
+	// Safety: `i % P::WIDTH` is always less than `P::WIDTH
+	unsafe { packed[i / P::WIDTH].get_unchecked(i % P::WIDTH) }
+}
+
+/// Returns the scalar at the given index without bounds checking.
+/// # Safety
+/// The caller must ensure that `i` is less than `P::WIDTH * packed.len()`.
+pub unsafe fn get_packed_slice_unchecked<P: PackedField>(packed: &[P], i: usize) -> P::Scalar {
+	packed
+		.get_unchecked(i / P::WIDTH)
+		.get_unchecked(i % P::WIDTH)
 }
 
 pub fn get_packed_slice_checked<P: PackedField>(
@@ -144,8 +208,24 @@ pub fn get_packed_slice_checked<P: PackedField>(
 		})
 }
 
+/// Sets the scalar at the given index without bounds checking.
+/// # Safety
+/// The caller must ensure that `i` is less than `P::WIDTH * packed.len()`.
+pub unsafe fn set_packed_slice_unchecked<P: PackedField>(
+	packed: &mut [P],
+	i: usize,
+	scalar: P::Scalar,
+) {
+	unsafe {
+		packed
+			.get_unchecked_mut(i / P::WIDTH)
+			.set_unchecked(i % P::WIDTH, scalar)
+	}
+}
+
 pub fn set_packed_slice<P: PackedField>(packed: &mut [P], i: usize, scalar: P::Scalar) {
-	packed[i / P::WIDTH].set(i % P::WIDTH, scalar)
+	// Safety: `i % P::WIDTH` is always less than `P::WIDTH
+	unsafe { packed[i / P::WIDTH].set_unchecked(i % P::WIDTH, scalar) }
 }
 
 pub fn set_packed_slice_checked<P: PackedField>(
@@ -166,12 +246,6 @@ pub fn len_packed_slice<P: PackedField>(packed: &[P]) -> usize {
 	packed.len() * P::WIDTH
 }
 
-impl<F: Field> Square for F {
-	fn square(self) -> Self {
-		<Self as Field>::square(&self)
-	}
-}
-
 impl<F: Field> Broadcast<F> for F {
 	fn broadcast(scalar: F) -> Self {
 		scalar
@@ -179,6 +253,7 @@ impl<F: Field> Broadcast<F> for F {
 }
 
 impl<T: TowerFieldArithmetic> MulAlpha for T {
+	#[inline]
 	fn mul_alpha(self) -> Self {
 		<Self as TowerFieldArithmetic>::multiply_alpha(self)
 	}
@@ -189,16 +264,14 @@ impl<F: Field> PackedField for F {
 
 	const LOG_WIDTH: usize = 0;
 
-	fn get_checked(&self, i: usize) -> Result<Self::Scalar, Error> {
-		(i == 0)
-			.then_some(*self)
-			.ok_or(Error::IndexOutOfRange { index: i, max: 1 })
+	#[inline]
+	unsafe fn get_unchecked(&self, _i: usize) -> Self::Scalar {
+		*self
 	}
 
-	fn set_checked(&mut self, i: usize, scalar: Self::Scalar) -> Result<(), Error> {
-		(i == 0)
-			.then(|| *self = scalar)
-			.ok_or(Error::IndexOutOfRange { index: i, max: 1 })
+	#[inline]
+	unsafe fn set_unchecked(&mut self, _i: usize, scalar: Self::Scalar) {
+		*self = scalar;
 	}
 
 	fn iter(&self) -> impl Iterator<Item = Self::Scalar> {
@@ -218,13 +291,14 @@ impl<F: Field> PackedField for F {
 	}
 
 	fn square(self) -> Self {
-		<Self as Field>::square(&self)
+		<Self as Square>::square(self)
 	}
 
 	fn invert_or_zero(self) -> Self {
-		<Self as Field>::invert(&self).unwrap_or(Self::default())
+		<Self as InvertOrZero>::invert_or_zero(self)
 	}
 
+	#[inline]
 	fn from_fn(mut f: impl FnMut(usize) -> Self::Scalar) -> Self {
 		f(0)
 	}

@@ -1,6 +1,8 @@
+// Copyright 2024 Ulvetanna Inc.
+
 use binius_field::{
 	packed_binary_field::{PackedBinaryField2x64b, PackedBinaryField8x16b},
-	BinaryField16b, ExtensionField, PackedExtensionField,
+	BinaryField16b, ExtensionField, PackedExtension, PackedFieldIndexable,
 };
 use binius_ntt::{AdditiveNTT, AdditiveNTTWithOTFCompute, AdditiveNTTWithPrecompute};
 use criterion::{
@@ -13,7 +15,7 @@ use std::{iter::repeat_with, mem};
 fn tower_ntt_16b(c: &mut Criterion) {
 	fn bench_helper<PE>(group: &mut BenchmarkGroup<WallTime>, id: &str, log_n: usize)
 	where
-		PE: PackedExtensionField<PackedBinaryField8x16b>,
+		PE: PackedExtension<BinaryField16b, PackedSubfield: PackedFieldIndexable>,
 		PE::Scalar: ExtensionField<BinaryField16b>,
 	{
 		let n = 1 << log_n;
@@ -42,7 +44,7 @@ fn tower_ntt_16b(c: &mut Criterion) {
 fn tower_ntt_with_precompute_16b(c: &mut Criterion) {
 	fn bench_helper<PE>(group: &mut BenchmarkGroup<WallTime>, id: &str, log_n: usize)
 	where
-		PE: PackedExtensionField<PackedBinaryField8x16b>,
+		PE: PackedExtension<BinaryField16b, PackedSubfield: PackedFieldIndexable>,
 		PE::Scalar: ExtensionField<BinaryField16b>,
 	{
 		let n = 1 << log_n;
@@ -64,7 +66,7 @@ fn tower_ntt_with_precompute_16b(c: &mut Criterion) {
 		c.benchmark_group("AdditiveNTTWithPrecompute<BinaryField16b>::forward_transform_packed");
 	for &log_n in [13, 14, 15, 16].iter() {
 		bench_helper::<PackedBinaryField8x16b>(&mut group, "8x16b", log_n);
-		bench_helper::<PackedBinaryField2x64b>(&mut group, "16x8b", log_n);
+		bench_helper::<PackedBinaryField2x64b>(&mut group, "2x64b", log_n);
 	}
 	group.finish();
 }

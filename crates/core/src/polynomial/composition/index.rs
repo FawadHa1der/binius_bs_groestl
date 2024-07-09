@@ -27,7 +27,18 @@ impl<P: PackedField, C: CompositionPoly<P>, const N: usize> CompositionPoly<P>
 		self.composition.degree()
 	}
 
-	fn evaluate(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error> {
+	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error> {
+		if query.len() != self.n_vars {
+			return Err(Error::IncorrectQuerySize {
+				expected: self.n_vars,
+			});
+		}
+
+		let subquery = self.indices.map(|index| query[index]);
+		self.composition.evaluate_scalar(&subquery)
+	}
+
+	fn evaluate(&self, query: &[P]) -> Result<P, Error> {
 		if query.len() != self.n_vars {
 			return Err(Error::IncorrectQuerySize {
 				expected: self.n_vars,
@@ -38,17 +49,6 @@ impl<P: PackedField, C: CompositionPoly<P>, const N: usize> CompositionPoly<P>
 		self.composition.evaluate(&subquery)
 	}
 
-	fn evaluate_packed(&self, query: &[P]) -> Result<P, Error> {
-		if query.len() != self.n_vars {
-			return Err(Error::IncorrectQuerySize {
-				expected: self.n_vars,
-			});
-		}
-
-		let subquery = self.indices.map(|index| query[index]);
-		self.composition.evaluate_packed(&subquery)
-	}
-
 	fn binary_tower_level(&self) -> usize {
 		self.composition.binary_tower_level()
 	}
@@ -57,6 +57,7 @@ impl<P: PackedField, C: CompositionPoly<P>, const N: usize> CompositionPoly<P>
 /// A factory helper method to create an [`IndexComposition`] by looking at
 ///  * `superset` - a set of identifiers of a greater (outer) query
 ///  * `subset` - a set of identifiers of a smaller query, the one which corresponds to the inner composition directly
+///
 /// Identifiers may be anything `Eq` - `OracleId`, `MultilinearPolyOracle<F>`, etc.
 pub fn index_composition<E, C, const N: usize>(
 	superset: &[E],

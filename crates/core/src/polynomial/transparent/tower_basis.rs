@@ -10,6 +10,7 @@ use std::marker::PhantomData;
 /// * Let \mathbb{F} := \mathbb{F}_2[X_0, \ldots, X_{\iota-1}]
 /// * Let \mathcal{J} := (X_0^2 + X_0 + 1, \ldots, X_{\iota-1}^2 + X_{\iota-1}X_{\iota-2} + 1)
 /// * $\mathcal{T}_{\iota} := \mathbb{F} / J $
+///
 /// and $\mathcal{T}_{\iota}$ has the following $\mathbb{F}_2$-basis:
 /// * $1, X_0, X_1, X_0X_1, X_2, \ldots, X_0 X_1 \ldots X_{\iota-1}$
 ///
@@ -39,7 +40,7 @@ impl<F: TowerField> TowerBasis<F> {
 
 	pub fn multilinear_extension<P: PackedField<Scalar = F>>(
 		&self,
-	) -> Result<MultilinearExtension<'static, P>, Error> {
+	) -> Result<MultilinearExtension<P>, Error> {
 		let n_values = (1 << self.k) / P::WIDTH;
 		let values = (0..n_values)
 			.map(|i| {
@@ -81,6 +82,10 @@ where
 			result *= r_comp + *query_i * basis_elt;
 		}
 		Ok(result)
+	}
+
+	fn binary_tower_level(&self) -> usize {
+		self.iota + self.k
 	}
 }
 

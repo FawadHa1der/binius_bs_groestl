@@ -35,6 +35,13 @@ rustc --print cfg -C target-cpu=native | grep gfni
 
 If the output of the command above is empty, the processor does not support these instructions.
 
+When including binius as a dependency, it is recommended to add the following lines to your `Cargo.toml` file to have optimizations across crates
+
+```toml
+[profile.release]
+lto = "fat"
+```
+
 ### Examples
 
 There are examples of simple commit-and-prove SNARKs in the `examples` directory. For example, you may run
@@ -43,13 +50,9 @@ There are examples of simple commit-and-prove SNARKs in the `examples` directory
 cargo run --release --example bitwise_and_proof
 ```
 
-To print out profiling information, set the environment variable `PROFILE_PRINT_TREE=1`:
-
-```bash
-PROFILE_PRINT_TREE=1 cargo run --release --example bitwise_and_proof
-```
-
 The environment variable `PROFILE_CSV_FILE` can be set to an output filename to dump profiling data to a CSV file for more detailed analysis.
+
+By default all the examples are run on a relatively small data. The environment variable `BINIUS_LOG_TRACE` can be used to override the default log trace size value.
 
 ## Support
 

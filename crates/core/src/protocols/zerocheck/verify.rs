@@ -1,18 +1,47 @@
 // Copyright 2023 Ulvetanna Inc.
 
 use super::{
-	error::VerificationError,
-	zerocheck::{reduce_zerocheck_claim, ZerocheckClaim, ZerocheckProof},
+	zerocheck::{ZerocheckClaim, ZerocheckProof, ZerocheckReductor},
+	Error, VerificationError,
 };
-use crate::protocols::sumcheck::SumcheckClaim;
+use crate::{
+	challenger::{CanObserve, CanSample},
+	protocols::{
+		abstract_sumcheck::{self, finalize_evalcheck_claim},
+		evalcheck::EvalcheckClaim,
+	},
+};
 use binius_field::TowerField;
+use tracing::instrument;
 
-pub fn verify<F: TowerField>(
+/// Verify a zerocheck to evalcheck reduction.
+#[instrument(skip_all, name = "zerocheck::verify")]
+pub fn verify<F, CH>(
 	claim: &ZerocheckClaim<F>,
-	proof: ZerocheckProof,
-	challenge: Vec<F>,
-) -> Result<SumcheckClaim<F>, VerificationError> {
-	let _ = proof;
-	let claim = reduce_zerocheck_claim(claim, challenge)?;
-	Ok(claim)
+	proof: ZerocheckProof<F>,
+	mut challenger: CH,
+) -> Result<EvalcheckClaim<F>, Error>
+where
+	F: TowerField,
+	CH: CanSample<F> + CanObserve<F>,
+{
+	if claim.poly.max_individual_degree() == 0 {
+		return Err(Error::PolynomialDegreeIsZero);
+	}
+
+	// Reduction
+	let n_vars = claim.poly.n_vars();
+	let n_rounds = proof.rounds.len();
+	if n_rounds != n_vars {
+		return Err(VerificationError::NumberOfRounds.into());
+	}
+
+	let zerocheck_challenges = challenger.sample_vec(n_vars - 1);
+	let reductor = ZerocheckReductor {
+		alphas: &zerocheck_challenges,
+	};
+	let reduced_claim =
+		abstract_sumcheck::verify(claim.clone().into(), proof, reductor, challenger)?;
+
+	finalize_evalcheck_claim(&claim.poly, reduced_claim).map_err(Into::into)
 }

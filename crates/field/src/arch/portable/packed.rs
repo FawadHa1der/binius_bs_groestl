@@ -1,12 +1,18 @@
 // Copyright 2024 Ulvetanna Inc.
 
+// This is because derive(bytemuck::TransparentWrapper) adds some type constraints to
+// PackedPrimitiveType in addition to the type constraints we define. Even more, annoying, the
+// allow attribute has to be added to the module, it doesn't work to add it to the struct
+// definition.
+#![allow(clippy::multiple_bound_locations)]
+
 use super::packed_arithmetic::UnderlierWithBitConstants;
 use crate::{
-	arithmetic_traits::{Broadcast, InvertOrZero, Square},
-	underlier::{NumCast, UnderlierType, WithUnderlier},
-	BinaryField, Error, PackedField,
+	arithmetic_traits::{Broadcast, InvertOrZero, MulAlpha, Square},
+	underlier::{NumCast, UnderlierType, UnderlierWithBitOps, WithUnderlier, U1, U2, U4},
+	BinaryField, PackedField,
 };
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{Pod, TransparentWrapper, Zeroable};
 use rand::RngCore;
 use std::{
 	fmt::Debug,
@@ -16,7 +22,9 @@ use std::{
 };
 use subtle::{Choice, ConstantTimeEq};
 
-#[derive(PartialEq, Eq, Clone, Copy, Default)]
+#[derive(PartialEq, Eq, Clone, Copy, Default, bytemuck::TransparentWrapper)]
+#[repr(transparent)]
+#[transparent(U)]
 pub struct PackedPrimitiveType<U: UnderlierType, Scalar: BinaryField>(
 	pub U,
 	pub PhantomData<Scalar>,
@@ -37,32 +45,78 @@ impl<U: UnderlierType, Scalar: BinaryField> PackedPrimitiveType<U, Scalar> {
 		result as usize
 	};
 
-	pub fn to_underlier(self) -> U {
+	#[inline]
+	pub fn from_underlier(val: U) -> Self {
+		Self(val, PhantomData)
+	}
+
+	#[inline]
+	pub const fn to_underlier(self) -> U {
 		self.0
 	}
 }
 
-impl<U: UnderlierType, Scalar: BinaryField> WithUnderlier for PackedPrimitiveType<U, Scalar>
-where
-	U: From<Self>,
-	Self: From<U>,
+unsafe impl<U: UnderlierType, Scalar: BinaryField> WithUnderlier
+	for PackedPrimitiveType<U, Scalar>
 {
-	const MEANINGFUL_BITS: usize = U::BITS;
 	type Underlier = U;
+
+	fn to_underlier(self) -> Self::Underlier {
+		TransparentWrapper::peel(self)
+	}
+
+	fn to_underlier_ref(&self) -> &Self::Underlier {
+		TransparentWrapper::peel_ref(self)
+	}
+
+	fn to_underlier_ref_mut(&mut self) -> &mut Self::Underlier {
+		TransparentWrapper::peel_mut(self)
+	}
+
+	fn to_underliers_ref(val: &[Self]) -> &[Self::Underlier] {
+		TransparentWrapper::peel_slice(val)
+	}
+
+	fn to_underliers_ref_mut(val: &mut [Self]) -> &mut [Self::Underlier] {
+		TransparentWrapper::peel_slice_mut(val)
+	}
+
+	fn from_underlier(val: Self::Underlier) -> Self {
+		TransparentWrapper::wrap(val)
+	}
+
+	fn from_underlier_ref(val: &Self::Underlier) -> &Self {
+		TransparentWrapper::wrap_ref(val)
+	}
+
+	fn from_underlier_ref_mut(val: &mut Self::Underlier) -> &mut Self {
+		TransparentWrapper::wrap_mut(val)
+	}
+
+	fn from_underliers_ref(val: &[Self::Underlier]) -> &[Self] {
+		TransparentWrapper::wrap_slice(val)
+	}
+
+	fn from_underliers_ref_mut(val: &mut [Self::Underlier]) -> &mut [Self] {
+		TransparentWrapper::wrap_slice_mut(val)
+	}
 }
 
-impl<U: UnderlierType, Scalar: BinaryField> Debug for PackedPrimitiveType<U, Scalar>
+impl<U: UnderlierWithBitOps, Scalar: BinaryField> Debug for PackedPrimitiveType<U, Scalar>
 where
-	Self: PackedField,
+	Scalar::Underlier: NumCast<U>,
 {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let width = U::BITS / Scalar::N_BITS;
-		let values: Vec<_> = (0..width).map(|i| self.get(i)).collect();
+		let values: Vec<_> = (0..width)
+			.map(|i| Scalar::from_underlier(self.0.get_subvalue(i)))
+			.collect();
 		write!(f, "Packed{}x{}({:?})", width, Scalar::N_BITS, values)
 	}
 }
 
 impl<U: UnderlierType, Scalar: BinaryField> From<U> for PackedPrimitiveType<U, Scalar> {
+	#[inline]
 	fn from(val: U) -> Self {
 		Self(val, PhantomData)
 	}
@@ -74,31 +128,39 @@ impl<U: UnderlierType, Scalar: BinaryField> ConstantTimeEq for PackedPrimitiveTy
 	}
 }
 
-impl<U: UnderlierType, Scalar: BinaryField> Add for PackedPrimitiveType<U, Scalar> {
+impl<U: UnderlierWithBitOps, Scalar: BinaryField> Add for PackedPrimitiveType<U, Scalar> {
 	type Output = Self;
 
+	#[inline]
 	#[allow(clippy::suspicious_arithmetic_impl)]
 	fn add(self, rhs: Self) -> Self::Output {
 		(self.0 ^ rhs.0).into()
 	}
 }
 
-impl<U: UnderlierType, Scalar: BinaryField> Sub for PackedPrimitiveType<U, Scalar> {
+impl<U: UnderlierWithBitOps, Scalar: BinaryField> Sub for PackedPrimitiveType<U, Scalar> {
 	type Output = Self;
 
+	#[inline]
 	#[allow(clippy::suspicious_arithmetic_impl)]
 	fn sub(self, rhs: Self) -> Self::Output {
 		(self.0 ^ rhs.0).into()
 	}
 }
 
-impl<U: UnderlierType, Scalar: BinaryField> AddAssign for PackedPrimitiveType<U, Scalar> {
+impl<U: UnderlierType, Scalar: BinaryField> AddAssign for PackedPrimitiveType<U, Scalar>
+where
+	Self: Add<Output = Self>,
+{
 	fn add_assign(&mut self, rhs: Self) {
 		*self = *self + rhs;
 	}
 }
 
-impl<U: UnderlierType, Scalar: BinaryField> SubAssign for PackedPrimitiveType<U, Scalar> {
+impl<U: UnderlierType, Scalar: BinaryField> SubAssign for PackedPrimitiveType<U, Scalar>
+where
+	Self: Sub<Output = Self>,
+{
 	fn sub_assign(&mut self, rhs: Self) {
 		*self = *self - rhs;
 	}
@@ -115,7 +177,7 @@ where
 
 impl<U: UnderlierType, Scalar: BinaryField> Add<Scalar> for PackedPrimitiveType<U, Scalar>
 where
-	Self: Broadcast<Scalar>,
+	Self: Broadcast<Scalar> + Add<Output = Self>,
 {
 	type Output = Self;
 
@@ -126,7 +188,7 @@ where
 
 impl<U: UnderlierType, Scalar: BinaryField> Sub<Scalar> for PackedPrimitiveType<U, Scalar>
 where
-	Self: Broadcast<Scalar>,
+	Self: Broadcast<Scalar> + Sub<Output = Self>,
 {
 	type Output = Self;
 
@@ -148,7 +210,7 @@ where
 
 impl<U: UnderlierType, Scalar: BinaryField> AddAssign<Scalar> for PackedPrimitiveType<U, Scalar>
 where
-	Self: Broadcast<Scalar>,
+	Self: Broadcast<Scalar> + AddAssign<Self>,
 {
 	fn add_assign(&mut self, rhs: Scalar) {
 		*self += Self::broadcast(rhs);
@@ -157,7 +219,7 @@ where
 
 impl<U: UnderlierType, Scalar: BinaryField> SubAssign<Scalar> for PackedPrimitiveType<U, Scalar>
 where
-	Self: Broadcast<Scalar>,
+	Self: Broadcast<Scalar> + SubAssign<Self>,
 {
 	fn sub_assign(&mut self, rhs: Scalar) {
 		*self -= Self::broadcast(rhs);
@@ -173,7 +235,10 @@ where
 	}
 }
 
-impl<U: UnderlierType, Scalar: BinaryField> Sum for PackedPrimitiveType<U, Scalar> {
+impl<U: UnderlierType, Scalar: BinaryField> Sum for PackedPrimitiveType<U, Scalar>
+where
+	Self: Add<Output = Self>,
+{
 	fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
 		iter.fold(Self::from(U::default()), |result, next| result + next)
 	}
@@ -181,7 +246,7 @@ impl<U: UnderlierType, Scalar: BinaryField> Sum for PackedPrimitiveType<U, Scala
 
 impl<U: UnderlierType, Scalar: BinaryField> Product for PackedPrimitiveType<U, Scalar>
 where
-	PackedPrimitiveType<U, Scalar>: Broadcast<Scalar> + Mul<Output = Self>,
+	Self: Broadcast<Scalar> + Mul<Output = Self>,
 {
 	fn product<I: Iterator<Item = Self>>(iter: I) -> Self {
 		iter.fold(Self::broadcast(Scalar::ONE), |result, next| result * next)
@@ -195,11 +260,11 @@ unsafe impl<U: UnderlierType + Zeroable, Scalar: BinaryField> Zeroable
 
 unsafe impl<U: UnderlierType + Pod, Scalar: BinaryField> Pod for PackedPrimitiveType<U, Scalar> {}
 
-impl<U: UnderlierType, Scalar: BinaryField> PackedField for PackedPrimitiveType<U, Scalar>
+impl<U: UnderlierWithBitOps, Scalar: BinaryField> PackedField for PackedPrimitiveType<U, Scalar>
 where
 	Self: Broadcast<Scalar> + Square + InvertOrZero + Mul<Output = Self>,
 	U: UnderlierWithBitConstants + Send + Sync + 'static,
-	Scalar: WithUnderlier,
+	Scalar: WithUnderlier<Underlier: UnderlierWithBitOps>,
 	U: From<Scalar::Underlier>,
 	Scalar::Underlier: NumCast<U>,
 {
@@ -207,22 +272,19 @@ where
 
 	const LOG_WIDTH: usize = (U::BITS / Scalar::N_BITS).ilog2() as usize;
 
-	fn get_checked(&self, i: usize) -> Result<Self::Scalar, Error> {
-		(i < Self::WIDTH)
-			.then(|| self.0.get_subvalue(i))
-			.ok_or(Error::IndexOutOfRange {
-				index: i,
-				max: Self::WIDTH,
-			})
+	#[inline]
+	unsafe fn get_unchecked(&self, i: usize) -> Self::Scalar {
+		Scalar::from_underlier(self.0.get_subvalue(i))
 	}
 
-	fn set_checked(&mut self, i: usize, scalar: Scalar) -> Result<(), Error> {
-		(i < Self::WIDTH)
-			.then(|| self.0.set_subvalue(i, scalar))
-			.ok_or(Error::IndexOutOfRange {
-				index: i,
-				max: Self::WIDTH,
-			})
+	#[inline]
+	unsafe fn set_unchecked(&mut self, i: usize, scalar: Scalar) {
+		self.0.set_subvalue(i, scalar.to_underlier());
+	}
+
+	#[inline]
+	fn zero() -> Self {
+		Self::from_underlier(U::ZERO)
 	}
 
 	fn random(rng: impl RngCore) -> Self {
@@ -236,71 +298,37 @@ where
 		(c.into(), d.into())
 	}
 
+	#[inline]
 	fn broadcast(scalar: Self::Scalar) -> Self {
 		<Self as Broadcast<Self::Scalar>>::broadcast(scalar)
 	}
 
-	fn from_fn(f: impl FnMut(usize) -> Self::Scalar) -> Self {
-		U::from_fn(f).into()
+	#[inline]
+	fn from_fn(mut f: impl FnMut(usize) -> Self::Scalar) -> Self {
+		U::from_fn(move |i| f(i).to_underlier()).into()
 	}
 
+	#[inline]
 	fn square(self) -> Self {
 		<Self as Square>::square(self)
 	}
 
+	#[inline]
 	fn invert_or_zero(self) -> Self {
 		<Self as InvertOrZero>::invert_or_zero(self)
 	}
 }
-
-/// Implement the PackedExtensionField trait for binary fields that are subfields of the
-/// scalar type.
-///
-/// For example, `PackedField2x64b` is `PackedExtensionField<BinaryField64b>` and also
-/// `PackedExtensionField<BinaryField32b>`, and so on.
-/// We are using macro because otherwise we will get the conflicting implementation with
-/// `PackedExtensionField<P> for P`
-macro_rules! impl_packed_extension_field {
-	($name:ty) => {
-		#[cfg(target_endian = "little")]
-		unsafe impl<P> $crate::PackedExtensionField<P> for $name
-		where
-			P: $crate::PackedField,
-			Self::Scalar: $crate::PackedExtensionField<P>,
-			Self::Scalar: $crate::ExtensionField<P::Scalar>,
-		{
-			fn cast_to_bases(packed: &[Self]) -> &[P] {
-				Self::Scalar::cast_to_bases(bytemuck::must_cast_slice(packed))
-			}
-
-			fn cast_to_bases_mut(packed: &mut [Self]) -> &mut [P] {
-				Self::Scalar::cast_to_bases_mut(bytemuck::must_cast_slice_mut(packed))
-			}
-
-			fn try_cast_to_ext(packed: &[P]) -> Option<&[Self]> {
-				Self::Scalar::try_cast_to_ext(packed)
-					.and_then(|scalars| bytemuck::try_cast_slice(scalars).ok())
-			}
-
-			fn try_cast_to_ext_mut(packed: &mut [P]) -> Option<&mut [Self]> {
-				Self::Scalar::try_cast_to_ext_mut(packed)
-					.and_then(|scalars| bytemuck::try_cast_slice_mut(scalars).ok())
-			}
-		}
-	};
-}
-
-pub(crate) use impl_packed_extension_field;
 
 macro_rules! impl_broadcast {
 	($name:ty, BinaryField1b) => {
 		impl $crate::arithmetic_traits::Broadcast<BinaryField1b>
 			for PackedPrimitiveType<$name, BinaryField1b>
 		{
+			#[inline]
 			fn broadcast(scalar: BinaryField1b) -> Self {
-				use $crate::underlier::WithUnderlier;
+				use $crate::underlier::{UnderlierWithBitOps, WithUnderlier};
 
-				<Self as WithUnderlier>::Underlier::fill_with_bit(scalar.0).into()
+				<Self as WithUnderlier>::Underlier::fill_with_bit(scalar.0.into()).into()
 			}
 		}
 	};
@@ -308,6 +336,7 @@ macro_rules! impl_broadcast {
 		impl $crate::arithmetic_traits::Broadcast<$scalar_type>
 			for PackedPrimitiveType<$name, $scalar_type>
 		{
+			#[inline]
 			fn broadcast(scalar: $scalar_type) -> Self {
 				let mut value = <$name>::from(scalar.0);
 				// For PackedBinaryField1x128b, the log bits is 7, so this is
@@ -327,115 +356,34 @@ macro_rules! impl_broadcast {
 
 pub(crate) use impl_broadcast;
 
-/// We can't define conversions to underlier and from array of scalars in a generic way due to Rust restrictions
-macro_rules! impl_conversion {
-	($underlier:ty, $name:ty) => {
-		impl From<$name> for $underlier {
-			fn from(value: $name) -> Self {
-				return value.0;
-			}
-		}
-
-		impl From<[<$name as $crate::PackedField>::Scalar; <$name>::WIDTH]> for $name {
-			fn from(val: [<$name as $crate::PackedField>::Scalar; <$name>::WIDTH]) -> Self {
-				use $crate::PackedField;
-
-				Self::from_fn(|i| val[i])
-			}
-		}
-	};
-}
-
-pub(crate) use impl_conversion;
-
-macro_rules! packed_binary_field_tower_extension {
-	($subfield_name:ident < $name:ident) => {
-		#[cfg(target_endian = "little")]
-		unsafe impl $crate::PackedExtensionField<$subfield_name> for $name {
-			fn cast_to_bases(packed: &[Self]) -> &[$subfield_name] {
-				bytemuck::must_cast_slice(packed)
-			}
-
-			fn cast_to_bases_mut(packed: &mut [Self]) -> &mut [$subfield_name] {
-				bytemuck::must_cast_slice_mut(packed)
-			}
-
-			fn try_cast_to_ext(packed: &[$subfield_name]) -> Option<&[Self]> {
-				Some(bytemuck::must_cast_slice(packed))
-			}
-
-			fn try_cast_to_ext_mut(packed: &mut [$subfield_name]) -> Option<&mut [Self]> {
-				Some(bytemuck::must_cast_slice_mut(packed))
-			}
-		}
-	};
-	($subfield_name:ident < $name:ident $(< $extfield_name:ident)+) => {
-		$crate::arch::portable::packed::packed_binary_field_tower_extension!($subfield_name < $name);
-		$(
-			$crate::arch::portable::packed::packed_binary_field_tower_extension!($subfield_name < $extfield_name);
-		)+
-		$crate::arch::portable::packed::packed_binary_field_tower_extension!($name $(< $extfield_name)+);
-	};
-}
-
-pub(crate) use packed_binary_field_tower_extension;
-
-macro_rules! packed_binary_field_tower_impl {
-	($subfield_name:ident < $name:ident) => {
-		impl $crate::arch::portable::packed_arithmetic::PackedTowerField for $name {
-			type Underlier = <Self as $crate::underlier::WithUnderlier>::Underlier;
-			type DirectSubfield = <$subfield_name as $crate::PackedField>::Scalar;
-
-			type PackedDirectSubfield = $subfield_name;
-		}
-	};
-	($subfield_name:ident < $name:ident $(< $extfield_name:ident)+) => {
-		impl $crate::arch::portable::packed_arithmetic::PackedTowerField for $name {
-			type Underlier = <Self as $crate::underlier::WithUnderlier>::Underlier;
-			type DirectSubfield = <$subfield_name as $crate::PackedField>::Scalar;
-
-			type PackedDirectSubfield = $subfield_name;
-		}
-
-		$crate::arch::portable::packed::packed_binary_field_tower_impl!($name $(< $extfield_name)+);
-	}
-}
-
-pub(crate) use packed_binary_field_tower_impl;
-
-macro_rules! packed_binary_field_tower {
-	($name:ident $(< $extfield_name:ident)+) => {
-		$crate::arch::portable::packed::packed_binary_field_tower_extension!($name $(< $extfield_name)+ );
-		$crate::arch::portable::packed::packed_binary_field_tower_impl!($name $(< $extfield_name)+ );
-	}
-}
-
-pub(crate) use packed_binary_field_tower;
-
 macro_rules! impl_ops_for_zero_height {
 	($name:ty) => {
 		impl std::ops::Mul for $name {
 			type Output = Self;
 
 			#[allow(clippy::suspicious_arithmetic_impl)]
+			#[inline]
 			fn mul(self, b: Self) -> Self {
 				(self.to_underlier() & b.to_underlier()).into()
 			}
 		}
 
 		impl $crate::arithmetic_traits::MulAlpha for $name {
+			#[inline]
 			fn mul_alpha(self) -> Self {
 				self
 			}
 		}
 
 		impl $crate::arithmetic_traits::Square for $name {
+			#[inline]
 			fn square(self) -> Self {
 				self
 			}
 		}
 
 		impl $crate::arithmetic_traits::InvertOrZero for $name {
+			#[inline]
 			fn invert_or_zero(self) -> Self {
 				self
 			}
@@ -444,3 +392,92 @@ macro_rules! impl_ops_for_zero_height {
 }
 
 pub(crate) use impl_ops_for_zero_height;
+
+/// Multiply `PT1` values by upcasting to wider `PT2` type with the same scalar.
+/// This is useful for the cases when SIMD multiplication is faster.
+pub fn mul_as_bigger_type<PT1, PT2>(lhs: PT1, rhs: PT1) -> PT1
+where
+	PT1: PackedField + WithUnderlier,
+	PT2: PackedField<Scalar = PT1::Scalar> + WithUnderlier,
+	PT2::Underlier: From<PT1::Underlier>,
+	PT1::Underlier: NumCast<PT2::Underlier>,
+{
+	let bigger_lhs = PT2::from_underlier(lhs.to_underlier().into());
+	let bigger_rhs = PT2::from_underlier(rhs.to_underlier().into());
+
+	let bigger_result = bigger_lhs * bigger_rhs;
+
+	PT1::from_underlier(PT1::Underlier::num_cast_from(bigger_result.to_underlier()))
+}
+
+/// Square `PT1` values by upcasting to wider `PT2` type with the same scalar.
+/// This is useful for the cases when SIMD square is faster.
+pub fn square_as_bigger_type<PT1, PT2>(val: PT1) -> PT1
+where
+	PT1: PackedField + WithUnderlier,
+	PT2: PackedField<Scalar = PT1::Scalar> + WithUnderlier,
+	PT2::Underlier: From<PT1::Underlier>,
+	PT1::Underlier: NumCast<PT2::Underlier>,
+{
+	let bigger_val = PT2::from_underlier(val.to_underlier().into());
+
+	let bigger_result = bigger_val.square();
+
+	PT1::from_underlier(PT1::Underlier::num_cast_from(bigger_result.to_underlier()))
+}
+
+/// Invert `PT1` values by upcasting to wider `PT2` type with the same scalar.
+/// This is useful for the cases when SIMD invert is faster.
+pub fn invert_as_bigger_type<PT1, PT2>(val: PT1) -> PT1
+where
+	PT1: PackedField + WithUnderlier,
+	PT2: PackedField<Scalar = PT1::Scalar> + WithUnderlier,
+	PT2::Underlier: From<PT1::Underlier>,
+	PT1::Underlier: NumCast<PT2::Underlier>,
+{
+	let bigger_val = PT2::from_underlier(val.to_underlier().into());
+
+	let bigger_result = bigger_val.invert_or_zero();
+
+	PT1::from_underlier(PT1::Underlier::num_cast_from(bigger_result.to_underlier()))
+}
+
+/// Multiply by alpha `PT1` values by upcasting to wider `PT2` type with the same scalar.
+/// This is useful for the cases when SIMD multiply by alpha is faster.
+pub fn mul_alpha_as_bigger_type<PT1, PT2>(val: PT1) -> PT1
+where
+	PT1: PackedField + WithUnderlier,
+	PT2: PackedField<Scalar = PT1::Scalar> + WithUnderlier + MulAlpha,
+	PT2::Underlier: From<PT1::Underlier>,
+	PT1::Underlier: NumCast<PT2::Underlier>,
+{
+	let bigger_val = PT2::from_underlier(val.to_underlier().into());
+
+	let bigger_result = bigger_val.mul_alpha();
+
+	PT1::from_underlier(PT1::Underlier::num_cast_from(bigger_result.to_underlier()))
+}
+
+macro_rules! impl_pack_scalar {
+	($underlier:ty) => {
+		impl<F> $crate::as_packed_field::PackScalar<F> for $underlier
+		where
+			F: BinaryField,
+			PackedPrimitiveType<$underlier, F>:
+				$crate::packed::PackedField<Scalar = F> + WithUnderlier<Underlier = $underlier>,
+		{
+			type Packed = PackedPrimitiveType<$underlier, F>;
+		}
+	};
+}
+
+pub(crate) use impl_pack_scalar;
+
+impl_pack_scalar!(U1);
+impl_pack_scalar!(U2);
+impl_pack_scalar!(U4);
+impl_pack_scalar!(u8);
+impl_pack_scalar!(u16);
+impl_pack_scalar!(u32);
+impl_pack_scalar!(u64);
+impl_pack_scalar!(u128);

@@ -6,6 +6,6 @@ pub mod arch;
 
 pub mod bs_groestl;
 
-pub use arch::Groestl256;
+pub use arch::Groestl256Core;
 pub use hasher::*;
 pub use bs_groestl::*;

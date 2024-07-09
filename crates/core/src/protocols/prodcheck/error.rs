@@ -1,6 +1,9 @@
 // Copyright 2024 Ulvetanna Inc.
 
-use crate::{oracle::Error as IOPolynomialError, polynomial::Error as PolynomialError};
+use crate::{
+	oracle::Error as OracleError, polynomial::Error as PolynomialError,
+	witness::Error as WitnessError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -10,22 +13,18 @@ pub enum Error {
 	EvaluationDomainMismatch,
 	#[error("the number of variables of the two input polynomials do not match")]
 	NumVariablesMismatch,
+	#[error("witnesses smaller than the underlier are not supported")]
+	WitnessSmallerThanUnderlier,
+	#[error("numerator and denominator of the grand product are of different size")]
+	NumeratorDenominatorSizeMismatch,
+	#[error("the number of variables of the grand product oracle is incorrect")]
+	NumGrandProductVariablesIncorrect,
 	#[error("the input was not well formed: {0}")]
 	ImproperInput(String),
+	#[error("oracle error: {0}")]
+	Oracle(#[from] OracleError),
+	#[error("witness error: {0}")]
+	Witness(#[from] WitnessError),
 	#[error("polynomial error: {0}")]
 	Polynomial(#[from] PolynomialError),
-	#[error("iopolynomial error: {0}")]
-	IOPolynomial(#[from] IOPolynomialError),
-	#[error("verification failure: {0}")]
-	Verification(#[from] VerificationError),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum VerificationError {
-	#[error("evaluation is incorrect")]
-	IncorrectEvaluation,
-	#[error("incorrect number of coefficients in round {round}")]
-	NumberOfCoefficients { round: usize },
-	#[error("incorrect number of coefficients")]
-	NumberOfRounds,
 }

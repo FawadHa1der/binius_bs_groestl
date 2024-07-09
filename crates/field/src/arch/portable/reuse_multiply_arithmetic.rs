@@ -1,3 +1,5 @@
+// Copyright 2024 Ulvetanna Inc.
+
 use std::ops::Mul;
 
 use crate::{
@@ -22,6 +24,7 @@ impl<T> TaggedMulAlpha<ReuseMultiplyStrategy> for T
 where
 	T: Mul<Self, Output = Self> + Alpha,
 {
+	#[inline]
 	fn mul_alpha(self) -> Self {
 		self * Self::alpha()
 	}

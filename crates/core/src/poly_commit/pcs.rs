@@ -1,8 +1,11 @@
 // Copyright 2023 Ulvetanna Inc.
 
-use crate::polynomial::MultilinearExtension;
+use crate::{
+	challenger::{CanObserve, CanSample, CanSampleBits},
+	polynomial::MultilinearExtension,
+};
 use binius_field::{ExtensionField, PackedField};
-use p3_challenger::{CanObserve, CanSample, CanSampleBits};
+use std::ops::Deref;
 
 pub trait PolyCommitScheme<P, FE>
 where
@@ -17,20 +20,23 @@ where
 	fn n_vars(&self) -> usize;
 
 	/// Commit to a batch of polynomials
-	fn commit(
+	fn commit<Data>(
 		&self,
-		polys: &[MultilinearExtension<P>],
-	) -> Result<(Self::Commitment, Self::Committed), Self::Error>;
+		polys: &[MultilinearExtension<P, Data>],
+	) -> Result<(Self::Commitment, Self::Committed), Self::Error>
+	where
+		Data: Deref<Target = [P]> + Send + Sync;
 
 	/// Generate an evaluation proof at a *random* challenge point.
-	fn prove_evaluation<CH>(
+	fn prove_evaluation<Data, CH>(
 		&self,
 		challenger: &mut CH,
 		committed: &Self::Committed,
-		polys: &[MultilinearExtension<P>],
+		polys: &[MultilinearExtension<P, Data>],
 		query: &[FE],
 	) -> Result<Self::Proof, Self::Error>
 	where
+		Data: Deref<Target = [P]> + Send + Sync,
 		CH: CanObserve<FE> + CanSample<FE> + CanSampleBits<usize>;
 
 	/// Verify an evaluation proof at a *random* challenge point.

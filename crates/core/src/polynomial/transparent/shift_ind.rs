@@ -4,11 +4,7 @@ use crate::{
 	oracle::ShiftVariant,
 	polynomial::{Error, MultilinearExtension, MultivariatePoly},
 };
-use binius_field::{
-	packed::{get_packed_slice, set_packed_slice},
-	util::eq,
-	Field, PackedField,
-};
+use binius_field::{util::eq, Field, PackedFieldIndexable, TowerField};
 
 /// Represents MLE of shift indicator $f_{b, o}(X, Y)$ on $2*b$ variables
 /// partially evaluated at $Y = r$
@@ -18,16 +14,20 @@ use binius_field::{
 /// If ShiftVariant is CircularLeft:
 ///     * $f(x, y) = 1$ if $\{y\} - \{o\} \equiv \{x\} (\text{mod } 2^b)$
 ///     * $f(x, y) = 0$ otw
+///
 /// Else if ShiftVariant is LogicalLeft:
 ///    * $f(x, y) = 1$ if $\{y\} - \{o\} \equiv \{x\}$
 ///    * $f(x, y) = 0$ otw
+///
 /// Else, ShiftVariant is LogicalRight:
 ///    * $f(x, y) = 1$ if $\{y\} + \{o\} \equiv \{x\}$
 ///    * $f(x, y) = 0$ otw
+///
 /// where:
-///     * $\{x\}$ is the integer representation of the hypercube point $x \in \{0, 1\}^b$,
-///     * $b$ is the block size parameter'
-///     * $o$ is the shift offset parameter.
+///    * $\{x\}$ is the integer representation of the hypercube point $x \in \{0, 1\}^b$,
+///    * $b$ is the block size parameter'
+///    * $o$ is the shift offset parameter.
+///
 /// Observe $\forall x \in \{0, 1\}^b$, there is at most one $y \in \{0, 1\}^b$ s.t. $f(x, y) = 1$
 ///
 /// # Intuition
@@ -107,9 +107,9 @@ impl<F: Field> ShiftIndPartialEval<F> {
 		})
 	}
 
-	fn multilinear_extension_circular<P>(&self) -> Result<MultilinearExtension<'static, P>, Error>
+	fn multilinear_extension_circular<P>(&self) -> Result<MultilinearExtension<P>, Error>
 	where
-		P: PackedField<Scalar = F>,
+		P: PackedFieldIndexable<Scalar = F>,
 	{
 		let (ps, pps) =
 			partial_evaluate_hypercube_impl::<P>(self.block_size, self.shift_offset, &self.r)?;
@@ -121,22 +121,18 @@ impl<F: Field> ShiftIndPartialEval<F> {
 		MultilinearExtension::from_values(values)
 	}
 
-	fn multilinear_extension_logical_left<P>(
-		&self,
-	) -> Result<MultilinearExtension<'static, P>, Error>
+	fn multilinear_extension_logical_left<P>(&self) -> Result<MultilinearExtension<P>, Error>
 	where
-		P: PackedField<Scalar = F>,
+		P: PackedFieldIndexable<Scalar = F>,
 	{
 		let (ps, _) =
 			partial_evaluate_hypercube_impl::<P>(self.block_size, self.shift_offset, &self.r)?;
 		MultilinearExtension::from_values(ps)
 	}
 
-	fn multilinear_extension_logical_right<P>(
-		&self,
-	) -> Result<MultilinearExtension<'static, P>, Error>
+	fn multilinear_extension_logical_right<P>(&self) -> Result<MultilinearExtension<P>, Error>
 	where
-		P: PackedField<Scalar = F>,
+		P: PackedFieldIndexable<Scalar = F>,
 	{
 		let right_shift_offset = get_left_shift_offset(self.block_size, self.shift_offset);
 		let (_, pps) =
@@ -146,9 +142,9 @@ impl<F: Field> ShiftIndPartialEval<F> {
 
 	/// Evaluates this partially evaluated circular shift indicator MLE $f(X, r)$
 	/// over the entire $b$-variate hypercube
-	pub fn multilinear_extension<P>(&self) -> Result<MultilinearExtension<'static, P>, Error>
+	pub fn multilinear_extension<P>(&self) -> Result<MultilinearExtension<P>, Error>
 	where
-		P: PackedField<Scalar = F>,
+		P: PackedFieldIndexable<Scalar = F>,
 	{
 		match self.shift_variant {
 			ShiftVariant::CircularLeft => self.multilinear_extension_circular(),
@@ -182,7 +178,7 @@ impl<F: Field> ShiftIndPartialEval<F> {
 	}
 }
 
-impl<F: Field> MultivariatePoly<F> for ShiftIndPartialEval<F> {
+impl<F: TowerField> MultivariatePoly<F> for ShiftIndPartialEval<F> {
 	fn n_vars(&self) -> usize {
 		self.block_size
 	}
@@ -193,6 +189,10 @@ impl<F: Field> MultivariatePoly<F> for ShiftIndPartialEval<F> {
 
 	fn evaluate(&self, query: &[F]) -> Result<F, Error> {
 		self.evaluate_at_point(query)
+	}
+
+	fn binary_tower_level(&self) -> usize {
+		F::TOWER_LEVEL
 	}
 }
 
@@ -263,7 +263,7 @@ fn evaluate_shift_ind_help<F: Field>(
 /// Total time is O(2^b) field operations (optimal in light of output size)
 /// Requires length of $r$ is exactly block_size
 /// Requires shift offset is at most $2^b$ where $b$ is block_size
-fn partial_evaluate_hypercube_impl<P: PackedField>(
+fn partial_evaluate_hypercube_impl<P: PackedFieldIndexable>(
 	block_size: usize,
 	shift_offset: usize,
 	r: &[P::Scalar],
@@ -272,44 +272,70 @@ fn partial_evaluate_hypercube_impl<P: PackedField>(
 	let mut s_ind_p = vec![P::one(); 1 << (block_size - P::LOG_WIDTH)];
 	let mut s_ind_pp = vec![P::zero(); 1 << (block_size - P::LOG_WIDTH)];
 
-	(0..block_size).for_each(|k| {
-		let o_k = shift_offset >> k;
+	partial_evaluate_hypercube_with_buffers(
+		block_size.min(P::LOG_WIDTH),
+		shift_offset,
+		r,
+		P::unpack_scalars_mut(&mut s_ind_p),
+		P::unpack_scalars_mut(&mut s_ind_pp),
+	);
+	if block_size > P::LOG_WIDTH {
+		partial_evaluate_hypercube_with_buffers(
+			block_size - P::LOG_WIDTH,
+			shift_offset >> P::LOG_WIDTH,
+			&r[P::LOG_WIDTH..],
+			&mut s_ind_p,
+			&mut s_ind_pp,
+		);
+	}
+
+	Ok((s_ind_p, s_ind_pp))
+}
+
+fn partial_evaluate_hypercube_with_buffers<P: PackedFieldIndexable>(
+	block_size: usize,
+	shift_offset: usize,
+	r: &[P::Scalar],
+	s_ind_p: &mut [P],
+	s_ind_pp: &mut [P],
+) {
+	for k in 0..block_size {
 		// complexity: just two multiplications per iteration!
-		(0..(1 << k)).for_each(|i| {
-			if o_k % 2 == 1 {
-				let mut pp_lo = get_packed_slice(&s_ind_pp, i);
+		if (shift_offset >> k) % 2 == 1 {
+			for i in 0..(1 << k) {
+				let mut pp_lo = s_ind_pp[i];
 				let mut pp_hi = pp_lo * r[k];
 
 				pp_lo -= pp_hi;
 
-				let p_lo = get_packed_slice(&s_ind_p, i);
+				let p_lo = s_ind_p[i];
 				let p_hi = p_lo * r[k];
 				pp_hi += p_lo - p_hi; // * 1 - r
 
-				set_packed_slice(&mut s_ind_pp, i, pp_lo);
-				set_packed_slice(&mut s_ind_pp, 1 << k | i, pp_hi);
+				s_ind_pp[i] = pp_lo;
+				s_ind_pp[1 << k | i] = pp_hi;
 
-				set_packed_slice(&mut s_ind_p, i, p_hi);
-				set_packed_slice(&mut s_ind_p, 1 << k | i, P::Scalar::ZERO); // clear upper half
-			} else {
-				let mut p_lo = get_packed_slice(&s_ind_p, i);
+				s_ind_p[i] = p_hi;
+				s_ind_p[1 << k | i] = P::zero(); // clear upper half
+			}
+		} else {
+			for i in 0..(1 << k) {
+				let mut p_lo = s_ind_p[i];
 				let p_hi = p_lo * r[k];
 				p_lo -= p_hi;
 
-				let pp_lo = get_packed_slice(&s_ind_pp, i);
-				let pp_hi = pp_lo * (P::Scalar::ONE - r[k]);
+				let pp_lo = s_ind_pp[i];
+				let pp_hi = pp_lo * (P::one() - r[k]);
 				p_lo += pp_lo - pp_hi;
 
-				set_packed_slice(&mut s_ind_p, i, p_lo);
-				set_packed_slice(&mut s_ind_p, 1 << k | i, p_hi);
+				s_ind_p[i] = p_lo;
+				s_ind_p[1 << k | i] = p_hi;
 
-				set_packed_slice(&mut s_ind_pp, i, P::Scalar::ZERO); // clear lower half
-				set_packed_slice(&mut s_ind_pp, 1 << k | i, pp_hi);
+				s_ind_pp[i] = P::zero(); // clear lower half
+				s_ind_pp[1 << k | i] = pp_hi;
 			}
-		})
-	});
-
-	Ok((s_ind_p, s_ind_pp))
+		}
+	}
 }
 
 #[cfg(test)]
@@ -319,12 +345,15 @@ mod tests {
 		polynomial::multilinear_query::MultilinearQuery,
 		protocols::test_utils::decompose_index_to_hypercube_point,
 	};
-	use binius_field::BinaryField32b;
+	use binius_field::{BinaryField32b, PackedBinaryField4x32b};
 	use rand::{rngs::StdRng, SeedableRng};
 	use std::iter::repeat_with;
 
 	// Consistency Tests for each shift variant
-	fn test_circular_left_shift_consistency_help<F: Field>(
+	fn test_circular_left_shift_consistency_help<
+		F: TowerField,
+		P: PackedFieldIndexable<Scalar = F>,
+	>(
 		block_size: usize,
 		right_shift_offset: usize,
 	) {
@@ -343,15 +372,18 @@ mod tests {
 		let eval_mvp = shift_r_mvp.evaluate(eval_point).unwrap();
 
 		// Get MultilinearExtension version
-		let shift_r_mle = shift_r_mvp.multilinear_extension::<F>().unwrap();
-		let multilin_query = MultilinearQuery::<F>::with_full_query(eval_point).unwrap();
+		let shift_r_mle = shift_r_mvp.multilinear_extension::<P>().unwrap();
+		let multilin_query = MultilinearQuery::<P>::with_full_query(eval_point).unwrap();
 		let eval_mle = shift_r_mle.evaluate(&multilin_query).unwrap();
 
 		// Assert equality
 		assert_eq!(eval_mle, eval_mvp);
 	}
 
-	fn test_logical_left_shift_consistency_help<F: Field>(
+	fn test_logical_left_shift_consistency_help<
+		F: TowerField,
+		P: PackedFieldIndexable<Scalar = F>,
+	>(
 		block_size: usize,
 		right_shift_offset: usize,
 	) {
@@ -370,15 +402,18 @@ mod tests {
 		let eval_mvp = shift_r_mvp.evaluate(eval_point).unwrap();
 
 		// Get MultilinearExtension version
-		let shift_r_mle = shift_r_mvp.multilinear_extension::<F>().unwrap();
-		let multilin_query = MultilinearQuery::<F>::with_full_query(eval_point).unwrap();
+		let shift_r_mle = shift_r_mvp.multilinear_extension::<P>().unwrap();
+		let multilin_query = MultilinearQuery::<P>::with_full_query(eval_point).unwrap();
 		let eval_mle = shift_r_mle.evaluate(&multilin_query).unwrap();
 
 		// Assert equality
 		assert_eq!(eval_mle, eval_mvp);
 	}
 
-	fn test_logical_right_shift_consistency_help<F: Field>(
+	fn test_logical_right_shift_consistency_help<
+		F: TowerField,
+		P: PackedFieldIndexable<Scalar = F>,
+	>(
 		block_size: usize,
 		left_shift_offset: usize,
 	) {
@@ -397,8 +432,8 @@ mod tests {
 		let eval_mvp = shift_r_mvp.evaluate(eval_point).unwrap();
 
 		// Get MultilinearExtension version
-		let shift_r_mle = shift_r_mvp.multilinear_extension::<F>().unwrap();
-		let multilin_query = MultilinearQuery::<F>::with_full_query(eval_point).unwrap();
+		let shift_r_mle = shift_r_mvp.multilinear_extension::<P>().unwrap();
+		let multilin_query = MultilinearQuery::<P>::with_full_query(eval_point).unwrap();
 		let eval_mle = shift_r_mle.evaluate(&multilin_query).unwrap();
 
 		// Assert equality
@@ -409,7 +444,7 @@ mod tests {
 	fn test_circular_left_shift_consistency_schwartz_zippel() {
 		for block_size in 2..=10 {
 			for right_shift_offset in [1, 2, 3, (1 << block_size) - 1, (1 << block_size) / 2] {
-				test_circular_left_shift_consistency_help::<BinaryField32b>(
+				test_circular_left_shift_consistency_help::<_, PackedBinaryField4x32b>(
 					block_size,
 					right_shift_offset,
 				);
@@ -421,7 +456,7 @@ mod tests {
 	fn test_logical_left_shift_consistency_schwartz_zippel() {
 		for block_size in 2..=10 {
 			for right_shift_offset in [1, 2, 3, (1 << block_size) - 1, (1 << block_size) / 2] {
-				test_logical_left_shift_consistency_help::<BinaryField32b>(
+				test_logical_left_shift_consistency_help::<_, PackedBinaryField4x32b>(
 					block_size,
 					right_shift_offset,
 				);
@@ -433,7 +468,7 @@ mod tests {
 	fn test_logical_right_shift_consistency_schwartz_zippel() {
 		for block_size in 2..=10 {
 			for left_shift_offset in [1, 2, 3, (1 << block_size) - 1, (1 << block_size) / 2] {
-				test_logical_right_shift_consistency_help::<BinaryField32b>(
+				test_logical_right_shift_consistency_help::<_, PackedBinaryField4x32b>(
 					block_size,
 					left_shift_offset,
 				);
@@ -442,7 +477,7 @@ mod tests {
 	}
 
 	// Functionality Tests for each shift variant
-	fn test_circular_left_shift_functionality_help<F: Field>(
+	fn test_circular_left_shift_functionality_help<F: TowerField>(
 		block_size: usize,
 		right_shift_offset: usize,
 	) {
@@ -462,7 +497,7 @@ mod tests {
 			});
 		});
 	}
-	fn test_logical_left_shift_functionality_help<F: Field>(
+	fn test_logical_left_shift_functionality_help<F: TowerField>(
 		block_size: usize,
 		right_shift_offset: usize,
 	) {
@@ -483,7 +518,7 @@ mod tests {
 		});
 	}
 
-	fn test_logical_right_shift_functionality_help<F: Field>(
+	fn test_logical_right_shift_functionality_help<F: TowerField>(
 		block_size: usize,
 		left_shift_offset: usize,
 	) {

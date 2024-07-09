@@ -1,12 +1,20 @@
 // Copyright 2024 Ulvetanna Inc.
 
 use crate::{
-	arch::portable::{
-		packed::PackedPrimitiveType,
-		packed_arithmetic::{interleave_mask_even, interleave_mask_odd, UnderlierWithBitConstants},
+	arch::{
+		binary_utils::as_array_mut,
+		portable::{
+			packed::{impl_pack_scalar, PackedPrimitiveType},
+			packed_arithmetic::{
+				interleave_mask_even, interleave_mask_odd, UnderlierWithBitConstants,
+			},
+		},
+		x86_64::{m128::M128, m256::M256},
 	},
 	arithmetic_traits::Broadcast,
-	underlier::{NumCast, Random, UnderlierType, WithUnderlier},
+	underlier::{
+		impl_divisible, NumCast, Random, SmallU, UnderlierType, UnderlierWithBitOps, WithUnderlier,
+	},
 	BinaryField,
 };
 use bytemuck::{must_cast, Pod, Zeroable};
@@ -16,10 +24,11 @@ use std::{
 	mem::transmute_copy,
 	ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not, Shl, Shr},
 };
-use subtle::{Choice, ConstantTimeEq};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 /// 512-bit value that is used for 512-bit SIMD operations
 #[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
 pub struct M512(pub(super) __m512i);
 
 impl M512 {
@@ -81,6 +90,13 @@ impl From<u8> for M512 {
 		Self::from(value as u128)
 	}
 }
+
+impl<const N: usize> From<SmallU<N>> for M512 {
+	fn from(value: SmallU<N>) -> Self {
+		Self::from(value.val() as u128)
+	}
+}
+
 impl From<M512> for [u128; 4] {
 	fn from(value: M512) -> Self {
 		let result: [u128; 4] = unsafe { transmute_copy(&value.0) };
@@ -101,6 +117,9 @@ impl<U: NumCast<u128>> NumCast<M512> for U {
 		Self::num_cast_from(low)
 	}
 }
+
+impl_divisible!(@pairs M512, M256, M128, u128, u64, u32, u16, u8);
+impl_pack_scalar!(M512);
 
 impl Default for M512 {
 	#[inline(always)]
@@ -286,6 +305,18 @@ impl ConstantTimeEq for M512 {
 	}
 }
 
+impl ConditionallySelectable for M512 {
+	fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+		let a = <[u128; 4]>::from(*a);
+		let b = <[u128; 4]>::from(*b);
+		let result: [u128; 4] = std::array::from_fn(|i| {
+			ConditionallySelectable::conditional_select(&a[i], &b[i], choice)
+		});
+
+		result.into()
+	}
+}
+
 impl Random for M512 {
 	fn random(mut rng: impl RngCore) -> Self {
 		let val: [u128; 4] = rng.gen();
@@ -314,10 +345,12 @@ pub(super) use m512_from_u128s;
 
 impl UnderlierType for M512 {
 	const LOG_BITS: usize = 9;
+}
 
-	const ONE: Self = { Self(m512_from_u128s!(0, 0, 0, 1,)) };
-
+impl UnderlierWithBitOps for M512 {
 	const ZERO: Self = { Self(m512_from_u128s!(0, 0, 0, 0,)) };
+	const ONE: Self = { Self(m512_from_u128s!(0, 0, 0, 1,)) };
+	const ONES: Self = { Self(m512_from_u128s!(u128::MAX, u128::MAX, u128::MAX, u128::MAX,)) };
 
 	#[inline(always)]
 	fn fill_with_bit(val: u8) -> Self {
@@ -327,26 +360,25 @@ impl UnderlierType for M512 {
 	#[inline(always)]
 	fn get_subvalue<T>(&self, i: usize) -> T
 	where
-		T: WithUnderlier,
-		T::Underlier: NumCast<Self>,
+		T: UnderlierType + NumCast<Self>,
 	{
-		match T::MEANINGFUL_BITS {
+		match T::BITS {
 			1 | 2 | 4 | 8 | 16 | 32 | 64 => {
-				let elements_in_64 = 64 / T::MEANINGFUL_BITS;
+				let elements_in_64 = 64 / T::BITS;
 				let shuffle = unsafe { _mm512_set1_epi64((i / elements_in_64) as i64) };
 				let chunk_64 =
 					u64::num_cast_from(Self(unsafe { _mm512_permutexvar_epi64(shuffle, self.0) }));
 
-				let result_64 = if T::MEANINGFUL_BITS == 64 {
+				let result_64 = if T::BITS == 64 {
 					chunk_64
 				} else {
-					let ones = ((1u128 << T::MEANINGFUL_BITS) - 1) as u64;
-					let val_64 = chunk_64 >> (T::MEANINGFUL_BITS * (i % elements_in_64)) & ones;
+					let ones = ((1u128 << T::BITS) - 1) as u64;
+					let val_64 = chunk_64 >> (T::BITS * (i % elements_in_64)) & ones;
 
 					val_64
 				};
 
-				T::Underlier::num_cast_from(Self::from(result_64)).into()
+				T::num_cast_from(Self::from(result_64))
 			}
 			128 => {
 				let chunk_128 = unsafe {
@@ -357,9 +389,47 @@ impl UnderlierType for M512 {
 						_ => _mm512_extracti32x4_epi32(self.0, 3),
 					}
 				};
-				T::Underlier::num_cast_from(Self(unsafe { _mm512_castsi128_si512(chunk_128) }))
-					.into()
+				T::num_cast_from(Self(unsafe { _mm512_castsi128_si512(chunk_128) }))
 			}
+			_ => panic!("unsupported bit count"),
+		}
+	}
+
+	#[inline(always)]
+	fn set_subvalue<T>(&mut self, i: usize, val: T)
+	where
+		T: UnderlierWithBitOps,
+		Self: From<T>,
+	{
+		match T::BITS {
+			1 | 2 | 4 => {
+				let elements_in_8 = 8 / T::BITS;
+				let mask = (1u8 << T::BITS) - 1;
+				let shift = (i % elements_in_8) * T::BITS;
+				let val = u8::num_cast_from(Self::from(val)) << shift;
+				let mask = mask << shift;
+
+				as_array_mut::<_, u8, 64>(self, |array| {
+					let element = &mut array[i / elements_in_8];
+					*element &= !mask;
+					*element |= val;
+				});
+			}
+			8 => as_array_mut::<_, u8, 64>(self, |array| {
+				array[i] = u8::num_cast_from(Self::from(val));
+			}),
+			16 => as_array_mut::<_, u16, 32>(self, |array| {
+				array[i] = u16::num_cast_from(Self::from(val));
+			}),
+			32 => as_array_mut::<_, u32, 16>(self, |array| {
+				array[i] = u32::num_cast_from(Self::from(val));
+			}),
+			64 => as_array_mut::<_, u64, 8>(self, |array| {
+				array[i] = u64::num_cast_from(Self::from(val));
+			}),
+			128 => as_array_mut::<_, u128, 4>(self, |array| {
+				array[i] = u128::num_cast_from(Self::from(val));
+			}),
 			_ => panic!("unsupported bit count"),
 		}
 	}
@@ -391,7 +461,7 @@ impl<Scalar: BinaryField> From<PackedPrimitiveType<M512, Scalar>> for __m512i {
 	}
 }
 
-impl<Scalar: BinaryField + WithUnderlier> Broadcast<Scalar> for PackedPrimitiveType<M512, Scalar>
+impl<Scalar: BinaryField> Broadcast<Scalar> for PackedPrimitiveType<M512, Scalar>
 where
 	u128: From<Scalar::Underlier>,
 {

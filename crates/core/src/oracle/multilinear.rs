@@ -8,7 +8,7 @@ use crate::{
 };
 use binius_field::{Field, TowerField};
 use getset::{CopyGetters, Getters};
-use std::{fmt::Debug, sync::Arc};
+use std::{array, fmt::Debug, mem::ManuallyDrop, sync::Arc};
 
 /// Identifier for a multilinear oracle in a [`MultilinearOracleSet`].
 pub type OracleId = usize;
@@ -27,10 +27,7 @@ struct CommittedBatchMeta {
 /// This is kept internal to [`MultilinearOracleSet`].
 #[derive(Debug, Clone)]
 enum MultilinearOracleMeta<F: TowerField> {
-	Transparent {
-		poly: Arc<dyn MultivariatePoly<F>>,
-		tower_level: usize,
-	},
+	Transparent(Arc<dyn MultivariatePoly<F>>),
 	Committed(CommittedId),
 	Repeating {
 		inner_id: OracleId,
@@ -44,6 +41,10 @@ enum MultilinearOracleMeta<F: TowerField> {
 		block_bits: usize,
 		variant: ShiftVariant,
 	},
+	Packed {
+		inner_id: OracleId,
+		log_degree: usize,
+	},
 	Projected {
 		inner_id: OracleId,
 		values: Vec<F>,
@@ -51,6 +52,7 @@ enum MultilinearOracleMeta<F: TowerField> {
 	},
 	LinearCombination {
 		n_vars: usize,
+		offset: F,
 		inner: Vec<(OracleId, F)>,
 	},
 }
@@ -86,13 +88,14 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 
 	pub fn add_transparent(
 		&mut self,
-		poly: Arc<dyn MultivariatePoly<F>>,
-		tower_level: usize,
+		poly: impl MultivariatePoly<F> + 'static,
 	) -> Result<OracleId, Error> {
-		if tower_level > F::TOWER_LEVEL {
-			return Err(Error::TowerLevelTooHigh { tower_level });
+		if poly.binary_tower_level() > F::TOWER_LEVEL {
+			return Err(Error::TowerLevelTooHigh {
+				tower_level: poly.binary_tower_level(),
+			});
 		}
-		let id = self.add(MultilinearOracleMeta::Transparent { poly, tower_level });
+		let id = self.add(MultilinearOracleMeta::Transparent(Arc::new(poly)));
 		Ok(id)
 	}
 
@@ -109,6 +112,21 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 				.push(MultilinearOracleMeta::Committed(CommittedId { batch_id, index }));
 		}
 		batch_id
+	}
+
+	pub fn build_committed_batch(
+		&mut self,
+		n_vars: usize,
+		tower_level: usize,
+	) -> CommittedBatchBuildScope<F> {
+		let first_oracle_id = self.oracles.len();
+		CommittedBatchBuildScope {
+			oracles: self,
+			first_oracle_id,
+			n_polys: 0,
+			n_vars,
+			tower_level,
+		}
 	}
 
 	pub fn add_repeating(&mut self, id: OracleId, log_count: usize) -> Result<OracleId, Error> {
@@ -194,6 +212,27 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 		Ok(id)
 	}
 
+	pub fn add_packed(&mut self, id: OracleId, log_degree: usize) -> Result<OracleId, Error> {
+		if id >= self.oracles.len() {
+			return Err(Error::InvalidOracleId(id));
+		}
+
+		let inner_n_vars = self.n_vars(id);
+		if log_degree > inner_n_vars {
+			return Err(Error::NotEnoughVarsForPacking {
+				n_vars: inner_n_vars,
+				log_degree,
+			});
+		}
+
+		let id = self.add(MultilinearOracleMeta::Packed {
+			inner_id: id,
+			log_degree,
+		});
+
+		Ok(id)
+	}
+
 	pub fn add_projected(
 		&mut self,
 		id: OracleId,
@@ -221,6 +260,15 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 		n_vars: usize,
 		inner: impl IntoIterator<Item = (OracleId, F)>,
 	) -> Result<OracleId, Error> {
+		self.add_linear_combination_with_offset(n_vars, F::ZERO, inner)
+	}
+
+	pub fn add_linear_combination_with_offset(
+		&mut self,
+		n_vars: usize,
+		offset: F,
+		inner: impl IntoIterator<Item = (OracleId, F)>,
+	) -> Result<OracleId, Error> {
 		let inner = inner
 			.into_iter()
 			.map(|(inner_id, coeff)| {
@@ -234,7 +282,11 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 			})
 			.collect::<Result<_, _>>()?;
 
-		let id = self.add(MultilinearOracleMeta::LinearCombination { n_vars, inner });
+		let id = self.add(MultilinearOracleMeta::LinearCombination {
+			n_vars,
+			offset,
+			inner,
+		});
 		Ok(id)
 	}
 
@@ -242,7 +294,6 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 		let batch = &self.batches[id].spec;
 		CommittedBatch {
 			id,
-			round_id: batch.round_id,
 			n_vars: batch.n_vars,
 			n_polys: batch.n_polys,
 			tower_level: batch.tower_level,
@@ -257,7 +308,6 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 				let spec = &batch.spec;
 				CommittedBatch {
 					id,
-					round_id: spec.round_id,
 					n_vars: spec.n_vars,
 					n_polys: spec.n_polys,
 					tower_level: spec.tower_level,
@@ -273,18 +323,22 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 		batch.first_oracle_id + index
 	}
 
+	pub fn committed_oracle_ids(&self, batch_id: BatchId) -> impl Iterator<Item = OracleId> {
+		let batch = self.batches[batch_id].clone();
+		(0..batch.spec.n_polys).map(move |index| batch.first_oracle_id + index)
+	}
+
 	pub fn committed_oracle(&self, id: CommittedId) -> MultilinearPolyOracle<F> {
 		self.oracle(self.committed_oracle_id(id))
 	}
 
 	pub fn oracle(&self, id: OracleId) -> MultilinearPolyOracle<F> {
 		match &self.oracles[id] {
-			MultilinearOracleMeta::Transparent { poly, tower_level } => {
-				MultilinearPolyOracle::Transparent(
-					id,
-					TransparentPolyOracle::new(poly.clone(), *tower_level),
-				)
-			}
+			MultilinearOracleMeta::Transparent(poly) => MultilinearPolyOracle::Transparent(
+				id,
+				TransparentPolyOracle::new(poly.clone())
+					.expect("polynomial validated by add_transparent"),
+			),
 			MultilinearOracleMeta::Committed(CommittedId { batch_id, index }) => {
 				let batch = &self.batches[*batch_id].spec;
 				MultilinearPolyOracle::Committed {
@@ -327,6 +381,16 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 				Shifted::new(self.oracle(*inner_id), *offset, *block_bits, *variant)
 					.expect("shift parameters validated by add_shifted"),
 			),
+			MultilinearOracleMeta::Packed {
+				inner_id,
+				log_degree,
+			} => MultilinearPolyOracle::Packed(
+				id,
+				Packed {
+					inner: Box::new(self.oracle(*inner_id)),
+					log_degree: *log_degree,
+				},
+			),
 			MultilinearOracleMeta::Projected {
 				inner_id,
 				values,
@@ -336,25 +400,28 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 				Projected::new(self.oracle(*inner_id), values.clone(), *variant)
 					.expect("projection parameters validated by add_projected"),
 			),
-			MultilinearOracleMeta::LinearCombination { n_vars, inner } => {
-				MultilinearPolyOracle::LinearCombination(
-					id,
-					LinearCombination::new(
-						*n_vars,
-						inner
-							.iter()
-							.map(|(inner_id, coeff)| (self.oracle(*inner_id), *coeff)),
-					)
-					.expect("linear combination parameters validated by add_linear_combination"),
+			MultilinearOracleMeta::LinearCombination {
+				n_vars,
+				offset,
+				inner,
+			} => MultilinearPolyOracle::LinearCombination(
+				id,
+				LinearCombination::new(
+					*n_vars,
+					*offset,
+					inner
+						.iter()
+						.map(|(inner_id, coeff)| (self.oracle(*inner_id), *coeff)),
 				)
-			}
+				.expect("linear combination parameters validated by add_linear_combination"),
+			),
 		}
 	}
 
 	pub fn n_vars(&self, id: OracleId) -> usize {
 		use MultilinearOracleMeta::*;
 		match &self.oracles[id] {
-			Transparent { poly, .. } => poly.n_vars(),
+			Transparent(poly) => poly.n_vars(),
 			Committed(CommittedId { batch_id, .. }) => self.batches[*batch_id].spec.n_vars,
 			Repeating {
 				inner_id,
@@ -363,6 +430,10 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 			Interleaved(inner_id_0, _) => self.n_vars(*inner_id_0) + 1,
 			Merged(inner_id_0, _) => self.n_vars(*inner_id_0) + 1,
 			Shifted { inner_id, .. } => self.n_vars(*inner_id),
+			Packed {
+				inner_id,
+				log_degree,
+			} => self.n_vars(*inner_id) - log_degree,
 			Projected {
 				inner_id, values, ..
 			} => self.n_vars(*inner_id) - values.len(),
@@ -370,10 +441,11 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 		}
 	}
 
+	/// Maximum tower level of the oracle's values over the boolean hypercube.
 	pub fn tower_level(&self, id: OracleId) -> usize {
 		use MultilinearOracleMeta::*;
 		match &self.oracles[id] {
-			Transparent { tower_level, .. } => *tower_level,
+			Transparent(poly) => poly.binary_tower_level(),
 			Committed(CommittedId { batch_id, .. }) => self.batches[*batch_id].spec.tower_level,
 			Repeating { inner_id, .. } => self.tower_level(*inner_id),
 			Interleaved(inner_id_0, inner_id_1) => self
@@ -383,6 +455,10 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 				.tower_level(*inner_id_0)
 				.max(self.tower_level(*inner_id_1)),
 			Shifted { inner_id, .. } => self.tower_level(*inner_id),
+			Packed {
+				inner_id,
+				log_degree,
+			} => self.tower_level(*inner_id) + log_degree,
 			Projected { .. } => F::TOWER_LEVEL,
 			// TODO: We can derive this more tightly by inspecting the coefficients and inner
 			// polynomials.
@@ -391,6 +467,26 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 	}
 }
 
+/// A multilinear polynomial oracle in the polynomial IOP model.
+///
+/// In the multilinear polynomial IOP model, a prover sends multilinear polynomials to an oracle,
+/// and the verifier may at the end of the protocol query their evaluations at chosen points. An
+/// oracle is a verifier and prover's shared view of a polynomial that can be queried for
+/// evaluations by the verifier.
+///
+/// There are three fundamental categories of oracles:
+///
+/// 1. *Transparent oracles*. These are multilinear polynomials with a succinct description and
+///    evaluation algorithm that are known to the verifier. When the verifier queries a transparent
+///    oracle, it evaluates the polynomial itself.
+/// 2. *Committed oracles*. These are polynomials actually sent by the prover. When the polynomial
+///    IOP is compiled to an interactive protocol, these polynomial are committed with a polynomial
+///    commitment scheme.
+/// 3. *Virtual oracles*. A virtual multilinear oracle is not actually sent by the prover, but
+///    instead admits an interactive reduction for evaluation queries to evaluation queries to
+///    other oracles. This is formalized in [DP23] Section 4.
+///
+/// [DP23]: <https://eprint.iacr.org/2023/1784>
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultilinearPolyOracle<F: Field> {
 	Transparent(OracleId, TransparentPolyOracle<F>),
@@ -413,23 +509,36 @@ pub enum MultilinearPolyOracle<F: Field> {
 	LinearCombination(OracleId, LinearCombination<F>),
 }
 
+/// A transparent multilinear polynomial oracle.
+///
+/// See the [`MultilinearPolyOracle`] documentation for context.
 #[derive(Debug, Clone, Getters, CopyGetters)]
 pub struct TransparentPolyOracle<F: Field> {
 	#[get = "pub"]
 	poly: Arc<dyn MultivariatePoly<F>>,
-	#[get_copy = "pub"]
-	tower_level: usize,
+}
+
+impl<F: TowerField> TransparentPolyOracle<F> {
+	fn new(poly: Arc<dyn MultivariatePoly<F>>) -> Result<Self, Error> {
+		if poly.binary_tower_level() > F::TOWER_LEVEL {
+			return Err(Error::TowerLevelTooHigh {
+				tower_level: poly.binary_tower_level(),
+			});
+		}
+		Ok(TransparentPolyOracle { poly })
+	}
 }
 
 impl<F: Field> TransparentPolyOracle<F> {
-	fn new(poly: Arc<dyn MultivariatePoly<F>>, tower_level: usize) -> Self {
-		TransparentPolyOracle { poly, tower_level }
+	/// Maximum tower level of the oracle's values over the boolean hypercube.
+	pub fn binary_tower_level(&self) -> usize {
+		self.poly.binary_tower_level()
 	}
 }
 
 impl<F: Field> PartialEq for TransparentPolyOracle<F> {
 	fn eq(&self, other: &Self) -> bool {
-		Arc::ptr_eq(&self.poly, &other.poly) && self.tower_level == other.tower_level
+		Arc::ptr_eq(&self.poly, &other.poly)
 	}
 }
 
@@ -545,12 +654,15 @@ pub struct Packed<F: Field> {
 pub struct LinearCombination<F: Field> {
 	#[get_copy = "pub"]
 	n_vars: usize,
+	#[get_copy = "pub"]
+	offset: F,
 	inner: Vec<(Box<MultilinearPolyOracle<F>>, F)>,
 }
 
 impl<F: Field> LinearCombination<F> {
 	fn new(
 		n_vars: usize,
+		offset: F,
 		inner: impl IntoIterator<Item = (MultilinearPolyOracle<F>, F)>,
 	) -> Result<Self, Error> {
 		let inner = inner
@@ -563,7 +675,11 @@ impl<F: Field> LinearCombination<F> {
 			})
 			.collect::<Result<_, _>>()?;
 
-		Ok(Self { n_vars, inner })
+		Ok(Self {
+			n_vars,
+			offset,
+			inner,
+		})
 	}
 
 	pub fn n_polys(&self) -> usize {
@@ -612,10 +728,11 @@ impl<F: Field> MultilinearPolyOracle<F> {
 		}
 	}
 
+	/// Maximum tower level of the oracle's values over the boolean hypercube.
 	pub fn binary_tower_level(&self) -> usize {
 		use MultilinearPolyOracle::*;
 		match self {
-			Transparent(_, transparent) => transparent.tower_level(),
+			Transparent(_, transparent) => transparent.binary_tower_level(),
 			Committed { tower_level, .. } => *tower_level,
 			Repeating { inner, .. } => inner.binary_tower_level(),
 			Interleaved(_, poly0, poly1) => {
@@ -639,5 +756,47 @@ impl<F: Field> MultilinearPolyOracle<F> {
 		let composite =
 			CompositePolyOracle::new(self.n_vars(), vec![self], IdentityCompositionPoly);
 		composite.expect("Can always apply the identity composition to one variable")
+	}
+}
+
+pub struct CommittedBatchBuildScope<'a, F: TowerField> {
+	oracles: &'a mut MultilinearOracleSet<F>,
+	first_oracle_id: OracleId,
+	n_polys: usize,
+	n_vars: usize,
+	tower_level: usize,
+}
+
+impl<'a, F: TowerField> CommittedBatchBuildScope<'a, F> {
+	pub fn add_one(&mut self) -> OracleId {
+		let oracle_id = self.first_oracle_id + self.n_polys;
+		self.n_polys += 1;
+		oracle_id
+	}
+
+	pub fn add_multiple<const N: usize>(&mut self) -> [OracleId; N] {
+		let oracle_ids = array::from_fn::<_, N, _>(|i| self.first_oracle_id + self.n_polys + i);
+		self.n_polys += N;
+		oracle_ids
+	}
+
+	pub fn build(self) -> BatchId {
+		let batch_id = self.oracles.add_committed_batch(CommittedBatchSpec {
+			n_vars: self.n_vars,
+			n_polys: self.n_polys,
+			tower_level: self.tower_level,
+		});
+		let _ = ManuallyDrop::new(self);
+		batch_id
+	}
+}
+
+impl<'a, F: TowerField> Drop for CommittedBatchBuildScope<'a, F> {
+	fn drop(&mut self) {
+		let _ = self.oracles.add_committed_batch(CommittedBatchSpec {
+			n_vars: self.n_vars,
+			n_polys: self.n_polys,
+			tower_level: self.tower_level,
+		});
 	}
 }

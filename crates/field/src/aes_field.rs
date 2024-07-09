@@ -3,12 +3,20 @@
 use super::{
 	arithmetic_traits::InvertOrZero,
 	binary_field::{binary_field, impl_field_extension, BinaryField, BinaryField1b},
-	binary_field_arithmetic::{binary_tower_arithmetic_recursive, TowerFieldArithmetic},
+	binary_field_arithmetic::TowerFieldArithmetic,
 	mul_by_binary_field_1b, BinaryField8b, Error,
 };
 use crate::{
-	affine_transformation::{FieldAffineTransformation, Transformation},
-	binary_tower, ExtensionField, Field, TowerExtensionField, TowerField,
+	affine_transformation::{
+		FieldAffineTransformation, PackedTransformationFactory, Transformation,
+	},
+	as_packed_field::{AsPackedField, PackScalar, PackedType},
+	binary_field_arithmetic::{impl_arithmetic_using_packed, impl_mul_primitive},
+	binary_tower,
+	packed::PackedField,
+	underlier::{WithUnderlier, U1},
+	BinaryField128b, BinaryField16b, BinaryField32b, BinaryField64b, ExtensionField, Field,
+	RepackedExtension, TowerExtensionField, TowerField,
 };
 use bytemuck::{Pod, Zeroable};
 use rand::RngCore;
@@ -16,9 +24,10 @@ use std::{
 	array,
 	fmt::{Debug, Display, Formatter},
 	iter::{Product, Step, Sum},
+	marker::PhantomData,
 	ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
 };
-use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 // These fields represent a tower based on AES GF(2^8) field (GF(256)/x^8+x^4+x^3+x+1)
 // that is isomorphically included into binary tower, i.e.:
@@ -26,11 +35,11 @@ use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 // BinaryField8b isomorphically projected to AESTowerField8b.
 //  - AESTowerField32b is GF(2^32) / (x^2 + x * x_3 + 1), where `x_3` is 0x1000 from AESTowerField16b.
 //  ...
-binary_field!(pub AESTowerField8b(u8));
-binary_field!(pub AESTowerField16b(u16));
-binary_field!(pub AESTowerField32b(u32));
-binary_field!(pub AESTowerField64b(u64));
-binary_field!(pub AESTowerField128b(u128));
+binary_field!(pub AESTowerField8b(u8), 0xD0);
+binary_field!(pub AESTowerField16b(u16), 0x4745);
+binary_field!(pub AESTowerField32b(u32), 0xBD478FAB);
+binary_field!(pub AESTowerField64b(u64), 0x0DE1555D2BD78EB4);
+binary_field!(pub AESTowerField128b(u128), 0x6DB54066349EDB96C33A87244A742678);
 
 unsafe impl Pod for AESTowerField8b {}
 unsafe impl Pod for AESTowerField16b {}
@@ -46,11 +55,11 @@ binary_tower!(
 	< AESTowerField128b(u128)
 );
 
-impl_field_extension!(BinaryField1b(u8) < @8 => AESTowerField8b(u8));
-impl_field_extension!(BinaryField1b(u8) < @16 => AESTowerField16b(u16));
-impl_field_extension!(BinaryField1b(u8) < @32 => AESTowerField32b(u32));
-impl_field_extension!(BinaryField1b(u8) < @64 => AESTowerField64b(u64));
-impl_field_extension!(BinaryField1b(u8) < @128 => AESTowerField128b(u128));
+impl_field_extension!(BinaryField1b(U1) < @8 => AESTowerField8b(u8));
+impl_field_extension!(BinaryField1b(U1) < @16 => AESTowerField16b(u16));
+impl_field_extension!(BinaryField1b(U1) < @32 => AESTowerField32b(u32));
+impl_field_extension!(BinaryField1b(U1) < @64 => AESTowerField64b(u64));
+impl_field_extension!(BinaryField1b(U1) < @128 => AESTowerField128b(u128));
 
 mul_by_binary_field_1b!(AESTowerField8b);
 mul_by_binary_field_1b!(AESTowerField16b);
@@ -58,145 +67,224 @@ mul_by_binary_field_1b!(AESTowerField32b);
 mul_by_binary_field_1b!(AESTowerField64b);
 mul_by_binary_field_1b!(AESTowerField128b);
 
-#[rustfmt::skip]
-const AES_EXP_TABLE: [u8; 256] = [
-    0x01, 0x03, 0x05, 0x0f, 0x11, 0x33, 0x55, 0xff, 0x1a, 0x2e, 0x72, 0x96, 0xa1, 0xf8, 0x13, 0x35,
-    0x5f, 0xe1, 0x38, 0x48, 0xd8, 0x73, 0x95, 0xa4, 0xf7, 0x02, 0x06, 0x0a, 0x1e, 0x22, 0x66, 0xaa,
-    0xe5, 0x34, 0x5c, 0xe4, 0x37, 0x59, 0xeb, 0x26, 0x6a, 0xbe, 0xd9, 0x70, 0x90, 0xab, 0xe6, 0x31,
-    0x53, 0xf5, 0x04, 0x0c, 0x14, 0x3c, 0x44, 0xcc, 0x4f, 0xd1, 0x68, 0xb8, 0xd3, 0x6e, 0xb2, 0xcd,
-    0x4c, 0xd4, 0x67, 0xa9, 0xe0, 0x3b, 0x4d, 0xd7, 0x62, 0xa6, 0xf1, 0x08, 0x18, 0x28, 0x78, 0x88,
-    0x83, 0x9e, 0xb9, 0xd0, 0x6b, 0xbd, 0xdc, 0x7f, 0x81, 0x98, 0xb3, 0xce, 0x49, 0xdb, 0x76, 0x9a,
-    0xb5, 0xc4, 0x57, 0xf9, 0x10, 0x30, 0x50, 0xf0, 0x0b, 0x1d, 0x27, 0x69, 0xbb, 0xd6, 0x61, 0xa3,
-    0xfe, 0x19, 0x2b, 0x7d, 0x87, 0x92, 0xad, 0xec, 0x2f, 0x71, 0x93, 0xae, 0xe9, 0x20, 0x60, 0xa0,
-    0xfb, 0x16, 0x3a, 0x4e, 0xd2, 0x6d, 0xb7, 0xc2, 0x5d, 0xe7, 0x32, 0x56, 0xfa, 0x15, 0x3f, 0x41,
-    0xc3, 0x5e, 0xe2, 0x3d, 0x47, 0xc9, 0x40, 0xc0, 0x5b, 0xed, 0x2c, 0x74, 0x9c, 0xbf, 0xda, 0x75,
-    0x9f, 0xba, 0xd5, 0x64, 0xac, 0xef, 0x2a, 0x7e, 0x82, 0x9d, 0xbc, 0xdf, 0x7a, 0x8e, 0x89, 0x80,
-    0x9b, 0xb6, 0xc1, 0x58, 0xe8, 0x23, 0x65, 0xaf, 0xea, 0x25, 0x6f, 0xb1, 0xc8, 0x43, 0xc5, 0x54,
-    0xfc, 0x1f, 0x21, 0x63, 0xa5, 0xf4, 0x07, 0x09, 0x1b, 0x2d, 0x77, 0x99, 0xb0, 0xcb, 0x46, 0xca,
-    0x45, 0xcf, 0x4a, 0xde, 0x79, 0x8b, 0x86, 0x91, 0xa8, 0xe3, 0x3e, 0x42, 0xc6, 0x51, 0xf3, 0x0e,
-    0x12, 0x36, 0x5a, 0xee, 0x29, 0x7b, 0x8d, 0x8c, 0x8f, 0x8a, 0x85, 0x94, 0xa7, 0xf2, 0x0d, 0x17,
-    0x39, 0x4b, 0xdd, 0x7c, 0x84, 0x97, 0xa2, 0xfd, 0x1c, 0x24, 0x6c, 0xb4, 0xc7, 0x52, 0xf6, 0x0
-];
+impl_arithmetic_using_packed!(AESTowerField8b);
+impl_arithmetic_using_packed!(AESTowerField16b);
+impl_arithmetic_using_packed!(AESTowerField32b);
+impl_arithmetic_using_packed!(AESTowerField64b);
+impl_arithmetic_using_packed!(AESTowerField128b);
 
-#[rustfmt::skip]
-const AES_LOG_TABLE: [u8; 256] = [
-	0x00, 0x00, 0x19, 0x01, 0x32, 0x02, 0x1a, 0xc6, 0x4b, 0xc7, 0x1b, 0x68, 0x33, 0xee, 0xdf, 0x03,
-	0x64, 0x04, 0xe0, 0x0e, 0x34, 0x8d, 0x81, 0xef, 0x4c, 0x71, 0x08, 0xc8, 0xf8, 0x69, 0x1c, 0xc1,
-	0x7d, 0xc2, 0x1d, 0xb5, 0xf9, 0xb9, 0x27, 0x6a, 0x4d, 0xe4, 0xa6, 0x72, 0x9a, 0xc9, 0x09, 0x78,
-	0x65, 0x2f, 0x8a, 0x05, 0x21, 0x0f, 0xe1, 0x24, 0x12, 0xf0, 0x82, 0x45, 0x35, 0x93, 0xda, 0x8e,
-	0x96, 0x8f, 0xdb, 0xbd, 0x36, 0xd0, 0xce, 0x94, 0x13, 0x5c, 0xd2, 0xf1, 0x40, 0x46, 0x83, 0x38,
-	0x66, 0xdd, 0xfd, 0x30, 0xbf, 0x06, 0x8b, 0x62, 0xb3, 0x25, 0xe2, 0x98, 0x22, 0x88, 0x91, 0x10,
-	0x7e, 0x6e, 0x48, 0xc3, 0xa3, 0xb6, 0x1e, 0x42, 0x3a, 0x6b, 0x28, 0x54, 0xfa, 0x85, 0x3d, 0xba,
-	0x2b, 0x79, 0x0a, 0x15, 0x9b, 0x9f, 0x5e, 0xca, 0x4e, 0xd4, 0xac, 0xe5, 0xf3, 0x73, 0xa7, 0x57,
-	0xaf, 0x58, 0xa8, 0x50, 0xf4, 0xea, 0xd6, 0x74, 0x4f, 0xae, 0xe9, 0xd5, 0xe7, 0xe6, 0xad, 0xe8,
-	0x2c, 0xd7, 0x75, 0x7a, 0xeb, 0x16, 0x0b, 0xf5, 0x59, 0xcb, 0x5f, 0xb0, 0x9c, 0xa9, 0x51, 0xa0,
-	0x7f, 0x0c, 0xf6, 0x6f, 0x17, 0xc4, 0x49, 0xec, 0xd8, 0x43, 0x1f, 0x2d, 0xa4, 0x76, 0x7b, 0xb7,
-	0xcc, 0xbb, 0x3e, 0x5a, 0xfb, 0x60, 0xb1, 0x86, 0x3b, 0x52, 0xa1, 0x6c, 0xaa, 0x55, 0x29, 0x9d,
-	0x97, 0xb2, 0x87, 0x90, 0x61, 0xbe, 0xdc, 0xfc, 0xbc, 0x95, 0xcf, 0xcd, 0x37, 0x3f, 0x5b, 0xd1,
-	0x53, 0x39, 0x84, 0x3c, 0x41, 0xa2, 0x6d, 0x47, 0x14, 0x2a, 0x9e, 0x5d, 0x56, 0xf2, 0xd3, 0xab,
-	0x44, 0x11, 0x92, 0xd9, 0x23, 0x20, 0x2e, 0x89, 0xb4, 0x7c, 0xb8, 0x26, 0x77, 0x99, 0xe3, 0xa5,
-	0x67, 0x4a, 0xed, 0xde, 0xc5, 0x31, 0xfe, 0x18, 0x0d, 0x63, 0x8c, 0x80, 0xc0, 0xf7, 0x70, 0x07,
-];
-
-impl TowerField for AESTowerField8b {}
-
-impl InvertOrZero for AESTowerField8b {
-	fn invert_or_zero(self) -> Self {
-		// TODO: use lookup table
-		if self.0 != 0 {
-			Self(AES_EXP_TABLE[(255 - AES_LOG_TABLE[self.0 as usize]) as usize % 255])
-		} else {
-			Self(0)
+impl TowerField for AESTowerField8b {
+	fn mul_primitive(self, iota: usize) -> Result<Self, Error> {
+		match iota {
+			0..=1 => Ok(self * ISOMORPHIC_ALPHAS[iota]),
+			2 => Ok(self.multiply_alpha()),
+			_ => Err(Error::ExtensionDegreeMismatch),
 		}
 	}
 }
 
-impl TowerFieldArithmetic for AESTowerField8b {
-	fn multiply(self, rhs: Self) -> Self {
-		let result = if self.0 != 0 && rhs.0 != 0 {
-			let log_table_index =
-				AES_LOG_TABLE[self.0 as usize] as usize + AES_LOG_TABLE[rhs.0 as usize] as usize;
-			let log_table_index = if log_table_index > 254 {
-				log_table_index - 255
-			} else {
-				log_table_index
-			};
-
-			unsafe {
-				// Safety: `log_table_index` is smaller than 255 because:
-				// - all values in `LOG_TABLE` do not exceed 254
-				// - sum of two values do not exceed 254*2
-				*AES_EXP_TABLE.get_unchecked(log_table_index)
-			}
-		} else {
-			0
-		};
-
-		Self(result)
-	}
-
-	fn multiply_alpha(self) -> Self {
-		// TODO: use lookup table
-		// `0xD3` is the value isomorphic to 0x10 in BinaryField8b
-		self * Self(0xD3)
-	}
-
-	fn square(self) -> Self {
-		// TODO: use lookup table
-		let result = if self.0 == 0 {
-			0
-		} else {
-			AES_EXP_TABLE[(2 * AES_LOG_TABLE[self.0 as usize] as usize) % 255]
-		};
-
-		Self(result)
-	}
-}
+pub const AES_TO_BINARY_AFFINE_TRANSFORMATION: FieldAffineTransformation<BinaryField8b> =
+	FieldAffineTransformation::new_const(&[
+		BinaryField8b(0x01),
+		BinaryField8b(0x3c),
+		BinaryField8b(0x8c),
+		BinaryField8b(0x8a),
+		BinaryField8b(0x59),
+		BinaryField8b(0x7a),
+		BinaryField8b(0x53),
+		BinaryField8b(0x27),
+	]);
 
 impl From<AESTowerField8b> for BinaryField8b {
 	fn from(value: AESTowerField8b) -> Self {
-		const AFFINE_TRANSFORMATION: FieldAffineTransformation<BinaryField8b> =
-			FieldAffineTransformation::new_const(&[
-				Self(0x01),
-				Self(0x3c),
-				Self(0x8c),
-				Self(0x8a),
-				Self(0x59),
-				Self(0x7a),
-				Self(0x53),
-				Self(0x27),
-			]);
-
-		AFFINE_TRANSFORMATION.transform(&value)
+		AES_TO_BINARY_AFFINE_TRANSFORMATION.transform(&value)
 	}
 }
+
+pub const BINARY_TO_AES_AFFINE_TRANSFORMATION: FieldAffineTransformation<AESTowerField8b> =
+	FieldAffineTransformation::new_const(&[
+		AESTowerField8b(0x01),
+		AESTowerField8b(0xbc),
+		AESTowerField8b(0xb0),
+		AESTowerField8b(0xec),
+		AESTowerField8b(0xd3),
+		AESTowerField8b(0x8d),
+		AESTowerField8b(0x2e),
+		AESTowerField8b(0x58),
+	]);
 
 impl From<BinaryField8b> for AESTowerField8b {
 	fn from(value: BinaryField8b) -> Self {
-		const AFFINE_TRANSFORMATION: FieldAffineTransformation<AESTowerField8b> =
-			FieldAffineTransformation::new_const(&[
-				Self(0x01),
-				Self(0xbc),
-				Self(0xb0),
-				Self(0xec),
-				Self(0xd3),
-				Self(0x8d),
-				Self(0x2e),
-				Self(0x58),
-			]);
-
-		AFFINE_TRANSFORMATION.transform(&value)
+		BINARY_TO_AES_AFFINE_TRANSFORMATION.transform(&value)
 	}
 }
 
-binary_tower_arithmetic_recursive!(AESTowerField16b);
-binary_tower_arithmetic_recursive!(AESTowerField32b);
-binary_tower_arithmetic_recursive!(AESTowerField64b);
-binary_tower_arithmetic_recursive!(AESTowerField128b);
+/// A 3- step transformation :
+/// 1. Cast to base b-bit packed field
+/// 2. Apply affine transformation between aes and binary b8 tower fields
+/// 3. Cast back to the target field
+struct SubfieldTransformer<IP, OP, T> {
+	inner_transform: T,
+	_ip_pd: PhantomData<IP>,
+	_op_pd: PhantomData<OP>,
+}
+
+impl<IP, OP, T> SubfieldTransformer<IP, OP, T> {
+	fn new(inner_transform: T) -> Self {
+		Self {
+			inner_transform,
+			_ip_pd: PhantomData,
+			_op_pd: PhantomData,
+		}
+	}
+}
+
+impl<IP, OP, IEP, OEP, T> Transformation<IEP, OEP> for SubfieldTransformer<IP, OP, T>
+where
+	IP: PackedField + WithUnderlier,
+	OP: PackedField + WithUnderlier<Underlier = IP::Underlier>,
+	IEP: RepackedExtension<IP, Scalar: ExtensionField<IP::Scalar>>
+		+ WithUnderlier<Underlier = IP::Underlier>,
+	OEP: RepackedExtension<OP, Scalar: ExtensionField<OP::Scalar>>
+		+ WithUnderlier<Underlier = IP::Underlier>,
+	T: Transformation<IP, OP>,
+{
+	fn transform(&self, input: &IEP) -> OEP {
+		OEP::from_underlier(
+			self.inner_transform
+				.transform(&IP::from_underlier(input.to_underlier()))
+				.to_underlier(),
+		)
+	}
+}
+
+/// Creates transformation object from AES tower to binary tower for packed field.
+/// Note that creation of this object is not cheap, so it is better to create it once and reuse.
+pub fn make_aes_to_binary_packed_transformer<IP, OP>() -> impl Transformation<IP, OP>
+where
+	IP: PackedField<Scalar: ExtensionField<AESTowerField8b>> + WithUnderlier,
+	OP: PackedField<Scalar: ExtensionField<BinaryField8b>>
+		+ WithUnderlier<Underlier = IP::Underlier>,
+	IP::Underlier: PackScalar<
+			AESTowerField8b,
+			Packed: PackedTransformationFactory<PackedType<IP::Underlier, BinaryField8b>>,
+		> + PackScalar<BinaryField8b>,
+{
+	SubfieldTransformer::<
+		PackedType<IP::Underlier, AESTowerField8b>,
+		PackedType<IP::Underlier, BinaryField8b>,
+		_,
+	>::new(PackedType::<IP::Underlier, AESTowerField8b>::make_packed_transformation(
+		AES_TO_BINARY_AFFINE_TRANSFORMATION,
+	))
+}
+
+/// Creates transformation object from AES tower to binary tower for packed field.
+/// Note that creation of this object is not cheap, so it is better to create it once and reuse.
+pub fn make_binary_to_aes_packed_transformer<IP, OP>() -> impl Transformation<IP, OP>
+where
+	IP: PackedField<Scalar: ExtensionField<BinaryField8b>> + WithUnderlier,
+	OP: PackedField<Scalar: ExtensionField<AESTowerField8b>>
+		+ WithUnderlier<Underlier = IP::Underlier>,
+	IP::Underlier: PackScalar<
+			BinaryField8b,
+			Packed: PackedTransformationFactory<PackedType<IP::Underlier, AESTowerField8b>>,
+		> + PackScalar<AESTowerField8b>,
+{
+	SubfieldTransformer::<
+		PackedType<IP::Underlier, BinaryField8b>,
+		PackedType<IP::Underlier, AESTowerField8b>,
+		_,
+	>::new(PackedType::<IP::Underlier, BinaryField8b>::make_packed_transformation(
+		BINARY_TO_AES_AFFINE_TRANSFORMATION,
+	))
+}
+
+/// Values isomorphic to 0x02, 0x04 and 0x10 in BinaryField8b
+const ISOMORPHIC_ALPHAS: [AESTowerField8b; 3] = [
+	AESTowerField8b(0xBC),
+	AESTowerField8b(0xB0),
+	AESTowerField8b(0xD3),
+];
+
+// MulPrimitive implementation for AES tower
+impl_mul_primitive!(AESTowerField16b,
+	mul_by 0 => ISOMORPHIC_ALPHAS[0],
+	mul_by 1 => ISOMORPHIC_ALPHAS[1],
+	repack 2 => AESTowerField8b,
+	repack 3 => AESTowerField16b,
+);
+impl_mul_primitive!(AESTowerField32b,
+	mul_by 0 => ISOMORPHIC_ALPHAS[0],
+	mul_by 1 => ISOMORPHIC_ALPHAS[1],
+	repack 2 => AESTowerField8b,
+	repack 3 => AESTowerField16b,
+	repack 4 => AESTowerField32b,
+);
+impl_mul_primitive!(AESTowerField64b,
+	mul_by 0 => ISOMORPHIC_ALPHAS[0],
+	mul_by 1 => ISOMORPHIC_ALPHAS[1],
+	repack 2 => AESTowerField8b,
+	repack 3 => AESTowerField16b,
+	repack 4 => AESTowerField32b,
+	repack 5 => AESTowerField64b,
+);
+impl_mul_primitive!(AESTowerField128b,
+	mul_by 0 => ISOMORPHIC_ALPHAS[0],
+	mul_by 1 => ISOMORPHIC_ALPHAS[1],
+	repack 2 => AESTowerField8b,
+	repack 3 => AESTowerField16b,
+	repack 4 => AESTowerField32b,
+	repack 5 => AESTowerField64b,
+	repack 6 => AESTowerField128b,
+);
+
+/// We use this function to define isomorphisms between AES and binary tower fields.
+/// Repack field as 8b packed field and apply isomorphism for each 8b element
+fn convert_as_packed_8b<F1, F2, Scalar1, Scalar2>(val: F1) -> F2
+where
+	Scalar1: Field,
+	Scalar2: Field + From<Scalar1>,
+	F1: AsPackedField<Scalar1>,
+	F2: AsPackedField<Scalar2>,
+{
+	assert_eq!(F1::Packed::WIDTH, F2::Packed::WIDTH);
+
+	let val_repacked = val.to_packed();
+	let converted_repacked = F2::Packed::from_fn(|i| val_repacked.get(i).into());
+
+	F2::from_packed(converted_repacked)
+}
+
+macro_rules! impl_tower_field_conversion {
+	($aes_field:ty, $binary_field:ty) => {
+		impl From<$aes_field> for $binary_field {
+			fn from(value: $aes_field) -> Self {
+				convert_as_packed_8b::<_, _, AESTowerField8b, BinaryField8b>(value)
+			}
+		}
+
+		impl From<$binary_field> for $aes_field {
+			fn from(value: $binary_field) -> Self {
+				convert_as_packed_8b::<_, _, BinaryField8b, AESTowerField8b>(value)
+			}
+		}
+	};
+}
+
+impl_tower_field_conversion!(AESTowerField16b, BinaryField16b);
+impl_tower_field_conversion!(AESTowerField32b, BinaryField32b);
+impl_tower_field_conversion!(AESTowerField64b, BinaryField64b);
+impl_tower_field_conversion!(AESTowerField128b, BinaryField128b);
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::{
+		binary_field::tests::is_binary_field_valid_generator, PackedAESBinaryField16x32b,
+		PackedAESBinaryField4x32b, PackedAESBinaryField8x32b, PackedBinaryField16x32b,
+		PackedBinaryField4x32b, PackedBinaryField8x32b,
+	};
 
 	use proptest::{arbitrary::any, proptest};
 
@@ -233,11 +321,16 @@ mod tests {
 
 	fn check_invert(f: impl Field) {
 		let inversed = f.invert();
-		if f.is_zero().into() {
-			assert!(bool::from(inversed.is_none()));
+		if f.is_zero() {
+			assert!(inversed.is_none());
 		} else {
 			assert_eq!(inversed.unwrap() * f, Field::ONE);
 		}
+	}
+
+	fn check_isomorphism_preserves_ops<F1: Field, F2: Field + From<F1>>(a: F1, b: F1) {
+		assert_eq!(F2::from(a * b), F2::from(a) * F2::from(b));
+		assert_eq!(F2::from(a + b), F2::from(a) + F2::from(b));
 	}
 
 	proptest! {
@@ -275,23 +368,33 @@ mod tests {
 		}
 
 		#[test]
-		fn test_isomorphism_to_binary_tower8b_props(a in any::<u8>(), b in any::<u8>()) {
-			let a_val = AESTowerField8b(a);
-			let b_val = AESTowerField8b(b);
-			assert_eq!(BinaryField8b::from(a_val) * BinaryField8b::from(b_val),
-				BinaryField8b::from(a_val * b_val));
-			assert_eq!(BinaryField8b::from(a_val) + BinaryField8b::from(b_val),
-				BinaryField8b::from(a_val + b_val));
+		fn test_isomorphism_8b(a in any::<u8>(), b in any::<u8>()) {
+			check_isomorphism_preserves_ops::<AESTowerField8b, BinaryField8b>(a.into(), b.into());
+			check_isomorphism_preserves_ops::<BinaryField8b, AESTowerField8b>(a.into(), b.into());
 		}
 
 		#[test]
-		fn test_isomorphism_from_binary_tower8b_props(a in any::<u8>(), b in any::<u8>()) {
-			let a_val = BinaryField8b(a);
-			let b_val = BinaryField8b(b);
-			assert_eq!(AESTowerField8b::from(a_val) * AESTowerField8b::from(b_val),
-				AESTowerField8b::from(a_val * b_val));
-			assert_eq!(AESTowerField8b::from(a_val) + AESTowerField8b::from(b_val),
-				AESTowerField8b::from(a_val + b_val));
+		fn test_isomorphism_16b(a in any::<u16>(), b in any::<u16>()) {
+			check_isomorphism_preserves_ops::<AESTowerField16b, BinaryField16b>(a.into(), b.into());
+			check_isomorphism_preserves_ops::<BinaryField16b, AESTowerField16b>(a.into(), b.into());
+		}
+
+		#[test]
+		fn test_isomorphism_32b(a in any::<u32>(), b in any::<u32>()) {
+			check_isomorphism_preserves_ops::<AESTowerField32b, BinaryField32b>(a.into(), b.into());
+			check_isomorphism_preserves_ops::<BinaryField32b, AESTowerField32b>(a.into(), b.into());
+		}
+
+		#[test]
+		fn test_isomorphism_64b(a in any::<u64>(), b in any::<u64>()) {
+			check_isomorphism_preserves_ops::<AESTowerField64b, BinaryField64b>(a.into(), b.into());
+			check_isomorphism_preserves_ops::<BinaryField64b, AESTowerField64b>(a.into(), b.into());
+		}
+
+		#[test]
+		fn test_isomorphism_128b(a in any::<u128>(), b in any::<u128>()) {
+			check_isomorphism_preserves_ops::<AESTowerField128b, BinaryField128b>(a.into(), b.into());
+			check_isomorphism_preserves_ops::<BinaryField128b, AESTowerField128b>(a.into(), b.into());
 		}
 	}
 
@@ -357,6 +460,117 @@ mod tests {
 			let a_val = AESTowerField8b(a);
 			let converted = BinaryField8b::from(a_val);
 			assert_eq!(a_val, AESTowerField8b::from(converted));
+		}
+	}
+
+	#[test]
+	fn test_multiplicative_generators() {
+		assert!(is_binary_field_valid_generator::<AESTowerField8b>());
+		assert!(is_binary_field_valid_generator::<AESTowerField16b>());
+		assert!(is_binary_field_valid_generator::<AESTowerField32b>());
+		assert!(is_binary_field_valid_generator::<AESTowerField64b>());
+		assert!(is_binary_field_valid_generator::<AESTowerField128b>());
+	}
+
+	fn test_mul_primitive<F: TowerField + WithUnderlier<Underlier: From<u8>>>(val: F, iota: usize) {
+		let result = val.mul_primitive(iota);
+		let expected = match iota {
+			0..=2 => {
+				Ok(val
+					* F::from_underlier(F::Underlier::from(ISOMORPHIC_ALPHAS[iota].to_underlier())))
+			}
+			_ => <F as ExtensionField<BinaryField1b>>::basis(1 << iota).map(|b| val * b),
+		};
+		assert_eq!(result.is_ok(), expected.is_ok());
+		if result.is_ok() {
+			assert_eq!(result.unwrap(), expected.unwrap());
+		} else {
+			assert!(matches!(result.unwrap_err(), Error::ExtensionDegreeMismatch));
+		}
+	}
+
+	proptest! {
+		#[test]
+		fn test_mul_primitive_8b(val in 0u8.., iota in 3usize..8) {
+			test_mul_primitive::<AESTowerField8b>(val.into(), iota)
+		}
+
+		#[test]
+		fn test_mul_primitive_16b(val in 0u16.., iota in 3usize..8) {
+			test_mul_primitive::<AESTowerField16b>(val.into(), iota)
+		}
+
+		#[test]
+		fn test_mul_primitive_32b(val in 0u32.., iota in 3usize..8) {
+			test_mul_primitive::<AESTowerField32b>(val.into(), iota)
+		}
+
+		#[test]
+		fn test_mul_primitive_64b(val in 0u64.., iota in 3usize..8) {
+			test_mul_primitive::<AESTowerField64b>(val.into(), iota)
+		}
+
+		#[test]
+		fn test_mul_primitive_128b(val in 0u128.., iota in 3usize..8) {
+			test_mul_primitive::<AESTowerField128b>(val.into(), iota)
+		}
+	}
+
+	fn convert_pairwise<IP, OP>(val: IP) -> OP
+	where
+		IP: PackedField + WithUnderlier,
+		OP: PackedField<Scalar: From<IP::Scalar>> + WithUnderlier<Underlier = IP::Underlier>,
+	{
+		OP::from_fn(|i| val.get(i).into())
+	}
+
+	proptest! {
+		#[test]
+		fn test_aes_to_binary_packed_transform_128(val in 0u128..) {
+			let transform = make_aes_to_binary_packed_transformer::<PackedAESBinaryField4x32b, PackedBinaryField4x32b>();
+			let input = PackedAESBinaryField4x32b::from(val);
+			let result = transform.transform(&input);
+			assert_eq!(result, convert_pairwise(input));
+		}
+
+		#[test]
+		fn test_binary_to_aes_packed_transform_128(val in 0u128..) {
+			let transform = make_binary_to_aes_packed_transformer::<PackedBinaryField4x32b, PackedAESBinaryField4x32b>();
+			let input = PackedBinaryField4x32b::from(val);
+			let result = transform.transform(&input);
+			assert_eq!(result, convert_pairwise(input));
+		}
+
+		#[test]
+		fn test_aes_to_binary_packed_transform_256(val in any::<[u128; 2]>()) {
+			let transform = make_aes_to_binary_packed_transformer::<PackedAESBinaryField8x32b, PackedBinaryField8x32b>();
+			let input = PackedAESBinaryField8x32b::from(val);
+			let result = transform.transform(&input);
+			assert_eq!(result, convert_pairwise(input));
+		}
+
+		#[test]
+		fn test_binary_to_aes_packed_transform_256(val in any::<[u128; 2]>()) {
+			let transform = make_binary_to_aes_packed_transformer::<PackedBinaryField8x32b, PackedAESBinaryField8x32b>();
+			let input = PackedBinaryField8x32b::from(val);
+			let result = transform.transform(&input);
+			assert_eq!(result, convert_pairwise(input));
+		}
+
+		#[test]
+		fn test_aes_to_binary_packed_transform_512(val in any::<[u128; 4]>()) {
+			let transform = make_aes_to_binary_packed_transformer::<PackedAESBinaryField16x32b, PackedBinaryField16x32b>();
+			let input = PackedAESBinaryField16x32b::from_underlier(val.into());
+			let result = transform.transform(&input);
+			assert_eq!(result, convert_pairwise(input));
+		}
+
+		#[test]
+		fn test_binary_to_aes_packed_transform_512(val in any::<[u128; 4]>()) {
+			let transform = make_binary_to_aes_packed_transformer::<PackedBinaryField16x32b, PackedAESBinaryField16x32b>();
+			let input = PackedBinaryField16x32b::from_underlier(val.into());
+			let result = transform.transform(&input);
+			assert_eq!(result, convert_pairwise(input));
 		}
 	}
 }

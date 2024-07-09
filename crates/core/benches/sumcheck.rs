@@ -1,3 +1,6 @@
+// Copyright 2024 Ulvetanna Inc.
+#![feature(step_trait)]
+
 use binius_core::{
 	challenger::HashChallenger,
 	oracle::{CommittedBatchSpec, CommittedId, CompositePolyOracle, MultilinearOracleSet},
@@ -6,42 +9,68 @@ use binius_core::{
 		MultilinearPoly,
 	},
 	protocols::{
-		sumcheck::{Error as SumcheckError, SumcheckClaim},
-		test_utils::{full_prove_with_switchover, transform_poly, TestProductComposition},
+		sumcheck::{prove, Error as SumcheckError, SumcheckClaim},
+		test_utils::{transform_poly, TestProductComposition},
 	},
 };
 use binius_field::{
-	BinaryField128b, BinaryField128bPolyval, BinaryField1b, BinaryField8b, ExtensionField, Field,
-	PackedField, TowerField,
+	BinaryField128b, BinaryField128bPolyval, BinaryField1b, BinaryField32b, BinaryField8b,
+	ExtensionField, Field, PackedField, TowerField,
 };
 use binius_hash::GroestlHasher;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::thread_rng;
-use std::{fmt::Debug, iter::repeat_with, mem, sync::Arc};
+use std::{
+	fmt::Debug,
+	iter::{repeat_with, Step},
+	mem,
+	sync::Arc,
+};
 
 fn sumcheck_128b_over_1b(c: &mut Criterion) {
-	sumcheck_128b_with_switchover::<BinaryField1b>(c, "Sumcheck 128b over 1b", 8)
+	sumcheck_128b_with_switchover::<BinaryField1b, BinaryField128b>(c, "Sumcheck 128b over 1b", 8)
 }
 
 fn sumcheck_128b_over_8b(c: &mut Criterion) {
-	sumcheck_128b_with_switchover::<BinaryField8b>(c, "Sumcheck 128b over 8b", 7)
+	sumcheck_128b_with_switchover::<BinaryField8b, BinaryField128b>(c, "Sumcheck 128b over 8b", 7)
 }
 
 fn sumcheck_128b_tower_basis(c: &mut Criterion) {
-	sumcheck_128b_with_switchover::<BinaryField128b>(c, "Sumcheck 128b tower basis", 1)
+	sumcheck_128b_with_switchover::<BinaryField128b, BinaryField128b>(
+		c,
+		"Sumcheck 128b tower basis",
+		1,
+	)
 }
 
-fn sumcheck_128b_with_switchover<P>(c: &mut Criterion, id: &str, switchover: usize)
+fn sumcheck_128b_tower_basis_32b_domain(c: &mut Criterion) {
+	sumcheck_128b_with_switchover::<BinaryField128b, BinaryField32b>(
+		c,
+		"Sumcheck 128b tower basis, 32b domain",
+		1,
+	)
+}
+
+fn sumcheck_128b_tower_basis_8b_domain(c: &mut Criterion) {
+	sumcheck_128b_with_switchover::<BinaryField128b, BinaryField8b>(
+		c,
+		"Sumcheck 128b tower basis, 8b domain",
+		1,
+	)
+}
+
+fn sumcheck_128b_with_switchover<P, DomainField>(c: &mut Criterion, id: &str, switchover: usize)
 where
 	P: PackedField + Debug,
-	BinaryField128b: ExtensionField<P::Scalar>,
+	DomainField: Field + Step + Debug,
+	BinaryField128b: ExtensionField<P::Scalar> + ExtensionField<DomainField>,
 {
 	type FTower = BinaryField128b;
 
 	let n_multilinears = 3;
 	let composition = TestProductComposition::new(n_multilinears);
 
-	let domain = EvaluationDomain::<FTower>::new(n_multilinears + 1).unwrap();
+	let domain = EvaluationDomain::<DomainField>::new(n_multilinears + 1).unwrap();
 
 	let mut rng = thread_rng();
 
@@ -71,7 +100,7 @@ where
 			let prove_challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
 
 			b.iter(|| {
-				full_prove_with_switchover::<FTower, FTower, _, _, _>(
+				prove::<FTower, FTower, DomainField, _, _, _>(
 					&sumcheck_claim,
 					sumcheck_witness.clone(),
 					&domain,
@@ -128,7 +157,7 @@ fn sumcheck_128b_monomial_basis(c: &mut Criterion) {
 				multilinears
 					.iter()
 					.map(|multilin| {
-						transform_poly::<_, FPolyval>(multilin.to_ref())
+						transform_poly::<_, FPolyval, _>(multilin.to_ref())
 							.unwrap()
 							.specialize()
 					})
@@ -140,7 +169,7 @@ fn sumcheck_128b_monomial_basis(c: &mut Criterion) {
 			let prove_challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
 
 			b.iter(|| {
-				full_prove_with_switchover::<FTower, FPolyval, _, _, _>(
+				prove::<FTower, FPolyval, FPolyval, _, _, _>(
 					&sumcheck_claim,
 					prover_poly.clone(),
 					&domain,
@@ -196,7 +225,7 @@ fn sumcheck_128b_monomial_basis_with_arc(c: &mut Criterion) {
 				multilinears
 					.iter()
 					.map(|multilin| {
-						transform_poly::<_, FPolyval>(multilin.to_ref())
+						transform_poly::<_, FPolyval, _>(multilin.to_ref())
 							.unwrap()
 							.specialize()
 					})
@@ -220,7 +249,7 @@ fn sumcheck_128b_monomial_basis_with_arc(c: &mut Criterion) {
 			let prove_challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
 
 			b.iter(|| {
-				full_prove_with_switchover(
+				prove::<_, _, FPolyval, _, _, _>(
 					&sumcheck_claim,
 					prover_poly.clone(),
 					&domain,
@@ -232,8 +261,7 @@ fn sumcheck_128b_monomial_basis_with_arc(c: &mut Criterion) {
 	}
 }
 
-/// Given a sumcheck witness and a domain, make sumcheck claim
-/// REQUIRES: Composition is the product composition
+/// Given a sumcheck witness poly, make sumcheck claim
 pub fn make_sumcheck_claim<F, C, M>(
 	poly: &MultilinearComposite<F, C, M>,
 ) -> Result<SumcheckClaim<F>, SumcheckError>
@@ -245,7 +273,6 @@ where
 	// Setup poly_oracle
 	let mut oracles = MultilinearOracleSet::new();
 	let batch_id = oracles.add_committed_batch(CommittedBatchSpec {
-		round_id: 0,
 		n_vars: poly.n_vars(),
 		n_polys: poly.n_multilinears(),
 		tower_level: F::TOWER_LEVEL,
@@ -268,14 +295,13 @@ where
 			for (evals_i, multilin) in evals.iter_mut().zip(&poly.multilinears) {
 				*evals_i = multilin.evaluate_on_hypercube(i).unwrap();
 			}
-			poly.composition.evaluate_packed(&evals).unwrap()
+			poly.composition.evaluate(&evals).unwrap()
 		})
 		.sum();
 
 	let sumcheck_claim = SumcheckClaim {
 		poly: composite_poly,
 		sum,
-		zerocheck_challenges: None,
 	};
 
 	Ok(sumcheck_claim)
@@ -287,6 +313,8 @@ criterion_group!(
 	sumcheck_128b_monomial_basis,
 	sumcheck_128b_monomial_basis_with_arc,
 	sumcheck_128b_over_1b,
-	sumcheck_128b_over_8b
+	sumcheck_128b_over_8b,
+	sumcheck_128b_tower_basis_32b_domain,
+	sumcheck_128b_tower_basis_8b_domain
 );
 criterion_main!(sumcheck);

@@ -1,9 +1,13 @@
 // Copyright 2024 Ulvetanna Inc.
 
 use super::Error;
-use binius_field::PackedField;
+use binius_field::{
+	as_packed_field::{PackScalar, PackedType},
+	underlier::{UnderlierType, WithUnderlier},
+	Field, PackedField,
+};
 use rayon::prelude::*;
-use std::cmp::max;
+use std::{cmp::max, marker::PhantomData, ops::Deref};
 
 /// Tensor Product expansion of values with partial eq indicator evaluated at extra_query_coordinates
 ///
@@ -65,6 +69,34 @@ pub fn tensor_prod_eq_ind<P: PackedField>(
 	Ok(())
 }
 
+/// A wrapper for containers of underlier types that dereferences as packed field slices.
+#[derive(Debug, Clone)]
+pub struct PackingDeref<U, F, Data>(Data, PhantomData<F>)
+where
+	Data: Deref<Target = [U]>;
+
+impl<U, F, Data> PackingDeref<U, F, Data>
+where
+	Data: Deref<Target = [U]>,
+{
+	pub fn new(data: Data) -> Self {
+		Self(data, PhantomData)
+	}
+}
+
+impl<U, F, Data> Deref for PackingDeref<U, F, Data>
+where
+	U: UnderlierType + PackScalar<F>,
+	F: Field,
+	Data: Deref<Target = [U]>,
+{
+	type Target = [PackedType<U, F>];
+
+	fn deref(&self) -> &Self::Target {
+		<PackedType<U, F>>::from_underliers_ref(self.0.deref())
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::iter::repeat_with;
@@ -75,7 +107,7 @@ mod tests {
 		multilinear_query::MultilinearQuery, transparent::eq_ind::EqIndPartialEval,
 		MultilinearExtension, MultivariatePoly,
 	};
-	use binius_field::{BinaryField32b, Field, PackedField};
+	use binius_field::{BinaryField32b, Field, PackedField, TowerField};
 
 	use super::tensor_prod_eq_ind;
 
@@ -87,7 +119,7 @@ mod tests {
 		extra_query_coordinates: Vec<F>,
 	) -> F
 	where
-		F: Field,
+		F: TowerField,
 		P: PackedField<Scalar = F>,
 	{
 		let eq_ind_k = EqIndPartialEval::new(k, extra_query_coordinates.clone()).unwrap();
@@ -95,14 +127,13 @@ mod tests {
 		let multilin_query =
 			MultilinearQuery::<F>::with_full_query(&challenge[..log_n_values]).unwrap();
 		let eval_mle = if packed_evals.len() == 1 {
-			let mut scalar_evals = vec![F::default(); 1 << log_n_values];
-			(0..(1 << log_n_values)).for_each(|i| {
-				scalar_evals[i] = packed_evals[0].get(i);
-			});
+			let scalar_evals = (0..(1 << log_n_values))
+				.map(|i| packed_evals[0].get(i))
+				.collect();
 			let mle = MultilinearExtension::from_values(scalar_evals).unwrap();
 			mle.evaluate(&multilin_query).unwrap()
 		} else {
-			let mle = MultilinearExtension::from_values(packed_evals.clone()).unwrap();
+			let mle = MultilinearExtension::from_values(packed_evals).unwrap();
 			mle.evaluate(&multilin_query).unwrap()
 		};
 		eval_mle * eval_eq_ind
@@ -125,10 +156,9 @@ mod tests {
 		let multilin_query = MultilinearQuery::<F>::with_full_query(&challenge).unwrap();
 
 		if new_len == 1 {
-			let mut scalar_evals = vec![F::default(); 1 << (log_n_values + k)];
-			(0..(1 << (log_n_values + k))).for_each(|i| {
-				scalar_evals[i] = packed_evals[0].get(i);
-			});
+			let scalar_evals = (0..(1 << (log_n_values + k)))
+				.map(|i| packed_evals[0].get(i))
+				.collect();
 			let extended_mle = MultilinearExtension::from_values(scalar_evals).unwrap();
 			extended_mle.evaluate(&multilin_query).unwrap()
 		} else {
@@ -140,7 +170,7 @@ mod tests {
 	// k = num_extra_query_coordinates
 	fn test_consistency<F, P>(log_n_values: usize, k: usize)
 	where
-		F: Field,
+		F: TowerField,
 		P: PackedField<Scalar = F>,
 	{
 		let mut rng = StdRng::seed_from_u64(0);

@@ -1,8 +1,6 @@
 // Copyright 2023 Ulvetanna Inc.
 
-use super::{
-	packed::PackedField, unpack_scalars, unpack_scalars_mut, ExtensionField, PackedExtensionField,
-};
+use super::{packed::PackedField, ExtensionField, PackedFieldIndexable, RepackedExtension};
 use p3_util::log2_strict_usize;
 
 /// Error thrown when a transpose operation fails.
@@ -30,7 +28,7 @@ pub enum Error {
 ///   or equal to the base-2 logarithm of the packing width.
 /// * `elems`: The packed field elements, length is a power-of-two multiple of `1 << log_n`.
 pub fn square_transpose<P: PackedField>(log_n: usize, elems: &mut [P]) -> Result<(), Error> {
-	if P::WIDTH % (1 << log_n) != 0 {
+	if P::LOG_WIDTH < log_n {
 		return Err(Error::SquareBlockDimensionMustDivideWidth);
 	}
 
@@ -76,16 +74,11 @@ pub fn square_transpose<P: PackedField>(log_n: usize, elems: &mut [P]) -> Result
 /// The `src` buffer is vector of `n` field extension field elements, or alternatively viewed as an
 /// n x d matrix of base field elements, where `d` is the extension degree. This transposes the
 /// base field elements into a d x n matrix in row-major order.
-///
-/// # Throws
-///
-/// * `Error::UnalignedDestination` if the destination buffer is not aligned to the packed
-///   extension field.
 pub fn transpose_scalars<P, FE, PE>(src: &[PE], dst: &mut [P]) -> Result<(), Error>
 where
 	P: PackedField,
 	FE: ExtensionField<P::Scalar>,
-	PE: PackedField<Scalar = FE> + PackedExtensionField<P> + PackedExtensionField<FE>,
+	PE: PackedFieldIndexable<Scalar = FE> + RepackedExtension<P>,
 {
 	let len = src.len();
 	if !len.is_power_of_two() {
@@ -117,10 +110,10 @@ where
 	}
 
 	{
-		let dst_ext = PE::try_cast_to_ext_mut(dst).ok_or(Error::UnalignedDestination)?;
+		let dst_ext = PE::cast_exts_mut(dst);
 		transpose::transpose(
-			unpack_scalars(src),
-			unpack_scalars_mut(dst_ext),
+			PE::unpack_scalars(src),
+			PE::unpack_scalars_mut(dst_ext),
 			1 << log_d,
 			1 << (log_n - log_d),
 		);
@@ -133,7 +126,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		BinaryField32b, PackedBinaryField128x1b, PackedBinaryField16x8b, PackedBinaryField4x32b,
-		PackedBinaryField64x2b,
+		PackedBinaryField64x2b, PackedExtension,
 	};
 
 	#[test]
@@ -270,7 +263,7 @@ mod tests {
 				0x7b7a7978,
 				0x7f7e7d7c,
 			],
-		].map(|vals| PackedBinaryField4x32b::from(vals.map(BinaryField32b::new)));
+		].map(|vals| PackedBinaryField4x32b::from_scalars(vals.map(BinaryField32b::new)));
 
 		let expected = [
 			[0x0c080400, 0x1c181410, 0x2c282420, 0x3c383430],
@@ -284,10 +277,10 @@ mod tests {
 
 			[0x0f0b0703, 0x1f1b1713, 0x2f2b2723, 0x3f3b3733],
 			[0x4f4b4743, 0x5f5b5753, 0x6f6b6763, 0x7f7b7773],
-		].map(|vals| PackedBinaryField4x32b::from(vals.map(BinaryField32b::new)));
+		].map(|vals| PackedBinaryField4x32b::from_scalars(vals.map(BinaryField32b::new)));
 
 		let mut dst = [PackedBinaryField4x32b::default(); 8];
-		transpose_scalars(&elems, PackedExtensionField::<PackedBinaryField16x8b>::cast_to_bases_mut(&mut dst)).unwrap();
+		transpose_scalars::<PackedBinaryField16x8b,_,_>(&elems, PackedBinaryField4x32b::cast_bases_mut(&mut dst)).unwrap();
 		assert_eq!(dst, expected);
 	}
 }

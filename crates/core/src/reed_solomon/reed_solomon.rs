@@ -1,11 +1,25 @@
 // Copyright 2023 Ulvetanna Inc.
 
+//! [Reed–Solomon] codes over binary fields.
+//!
+//! The Reed–Solomon code admits an efficient encoding algorithm over binary fields due to [LCH14].
+//! The additive NTT encoding algorithm encodes messages interpreted as the coefficients of a
+//! polynomial in a non-standard, novel polynomial basis and the codewords are the polynomial
+//! evaluations over a linear subspace of the field. See the [binius_ntt] crate for more details.
+//!
+//! [Reed–Solomon]: <https://en.wikipedia.org/wiki/Reed%E2%80%93Solomon_error_correction>
+//! [LCH14]: <https://arxiv.org/abs/1404.3458>
+
 use crate::linear_code::{LinearCode, LinearCodeWithExtensionEncoding};
-use binius_field::{BinaryField, ExtensionField, PackedExtensionField, PackedField};
+use binius_field::{
+	BinaryField, ExtensionField, PackedExtension, PackedField, PackedFieldIndexable,
+	RepackedExtension,
+};
 use binius_ntt::{AdditiveNTT, AdditiveNTTWithOTFCompute, Error};
 use rayon::prelude::*;
 use std::marker::PhantomData;
 
+#[derive(Debug)]
 pub struct ReedSolomonCode<P>
 where
 	P: PackedField,
@@ -36,7 +50,7 @@ where
 
 impl<P, F> LinearCode for ReedSolomonCode<P>
 where
-	P: PackedField<Scalar = F> + PackedExtensionField<F>,
+	P: PackedField<Scalar = F> + PackedExtension<F> + PackedFieldIndexable,
 	F: BinaryField,
 {
 	type P = P;
@@ -86,12 +100,12 @@ where
 
 impl<P, F> LinearCodeWithExtensionEncoding for ReedSolomonCode<P>
 where
-	P: PackedField<Scalar = F> + PackedExtensionField<F>,
+	P: PackedField<Scalar = F> + PackedExtension<F> + PackedFieldIndexable,
 	F: BinaryField,
 {
 	fn encode_extension_inplace<PE>(&self, code: &mut [PE]) -> Result<(), Self::EncodeError>
 	where
-		PE: PackedExtensionField<Self::P>,
+		PE: RepackedExtension<P>,
 		PE::Scalar: ExtensionField<<Self::P as PackedField>::Scalar>,
 	{
 		if code.len() * PE::WIDTH < self.len() {

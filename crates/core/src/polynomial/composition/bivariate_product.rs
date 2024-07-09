@@ -15,14 +15,14 @@ impl<P: PackedField> CompositionPoly<P> for BivariateProduct {
 		2
 	}
 
-	fn evaluate(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error> {
+	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error> {
 		if query.len() != 2 {
 			return Err(Error::IncorrectQuerySize { expected: 2 });
 		}
 		Ok(query[0] * query[1])
 	}
 
-	fn evaluate_packed(&self, query: &[P]) -> Result<P, Error> {
+	fn evaluate(&self, query: &[P]) -> Result<P, Error> {
 		if query.len() != 2 {
 			return Err(Error::IncorrectQuerySize { expected: 2 });
 		}

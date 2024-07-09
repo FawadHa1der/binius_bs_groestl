@@ -8,10 +8,8 @@ use crate::{
 		MultilinearExtension, MultilinearExtensionSpecialized, MultilinearQuery,
 	},
 	protocols::{
-		sumcheck::{batch_prove, batch_verify, SumcheckClaim, SumcheckProver},
-		test_utils::{
-			full_prove_with_switchover, full_verify, transform_poly, TestProductComposition,
-		},
+		sumcheck::{batch_prove, batch_verify, prove, verify, SumcheckClaim, SumcheckProver},
+		test_utils::{transform_poly, TestProductComposition},
 	},
 	witness::MultilinearWitnessIndex,
 };
@@ -27,15 +25,10 @@ use std::iter::repeat_with;
 
 fn generate_poly_and_sum_helper<F, FE>(
 	rng: &mut StdRng,
-	is_zerocheck: bool,
 	n_vars: usize,
 	n_multilinears: usize,
 ) -> (
-	MultilinearComposite<
-		FE,
-		TestProductComposition,
-		MultilinearExtensionSpecialized<'static, F, FE>,
-	>,
+	MultilinearComposite<FE, TestProductComposition, MultilinearExtensionSpecialized<F, FE>>,
 	F,
 )
 where
@@ -43,28 +36,14 @@ where
 	FE: ExtensionField<F>,
 {
 	let composition = TestProductComposition::new(n_multilinears);
-	let multilinears = if is_zerocheck {
-		(0..n_multilinears)
-			.map(|j| {
-				let mut values = vec![F::ZERO; 1 << n_vars];
-				(0..(1 << n_vars)).for_each(|i| {
-					if i % n_multilinears != j {
-						values[i] = Field::random(&mut *rng);
-					}
-				});
-				MultilinearExtension::from_values(values).unwrap()
-			})
-			.collect::<Vec<_>>()
-	} else {
-		repeat_with(|| {
-			let values = repeat_with(|| Field::random(&mut *rng))
-				.take(1 << n_vars)
-				.collect::<Vec<F>>();
-			MultilinearExtension::from_values(values).unwrap()
-		})
-		.take(<_ as CompositionPoly<FE>>::n_vars(&composition))
-		.collect::<Vec<_>>()
-	};
+	let multilinears = repeat_with(|| {
+		let values = repeat_with(|| Field::random(&mut *rng))
+			.take(1 << n_vars)
+			.collect::<Vec<F>>();
+		MultilinearExtension::from_values(values).unwrap()
+	})
+	.take(<_ as CompositionPoly<FE>>::n_vars(&composition))
+	.collect::<Vec<_>>();
 
 	let poly = MultilinearComposite::<FE, _, _>::new(
 		n_vars,
@@ -87,15 +66,10 @@ where
 		})
 		.sum::<F>();
 
-	if is_zerocheck && sum != F::ZERO {
-		panic!("Zerocheck sum is not zero");
-	}
-
 	(poly, sum)
 }
 
 fn test_prove_verify_interaction_helper(
-	is_zerocheck: bool,
 	n_vars: usize,
 	n_multilinears: usize,
 	switchover_rd: usize,
@@ -104,14 +78,12 @@ fn test_prove_verify_interaction_helper(
 	type FE = BinaryField128b;
 	let mut rng = StdRng::seed_from_u64(0);
 
-	let (poly, sum) =
-		generate_poly_and_sum_helper::<F, FE>(&mut rng, is_zerocheck, n_vars, n_multilinears);
+	let (poly, sum) = generate_poly_and_sum_helper::<F, FE>(&mut rng, n_vars, n_multilinears);
 	let sumcheck_witness = poly.clone();
 
 	// Setup Claim
 	let mut oracles = MultilinearOracleSet::new();
 	let batch_id = oracles.add_committed_batch(CommittedBatchSpec {
-		round_id: 0,
 		n_vars,
 		n_polys: n_multilinears,
 		tower_level: F::TOWER_LEVEL,
@@ -122,38 +94,29 @@ fn test_prove_verify_interaction_helper(
 	let composite_poly =
 		CompositePolyOracle::new(n_vars, h, TestProductComposition::new(n_multilinears)).unwrap();
 
-	let zerocheck_challenges = if is_zerocheck {
-		let zc_challenges = repeat_with(|| Field::random(&mut rng))
-			.take(n_vars - 1)
-			.collect::<Vec<FE>>();
-		Some(zc_challenges)
-	} else {
-		None
-	};
-
 	let sumcheck_claim = SumcheckClaim {
 		sum: sum.into(),
 		poly: composite_poly,
-		zerocheck_challenges,
 	};
 
 	// Setup evaluation domain
-	let domain = EvaluationDomain::new(n_multilinears + 1).unwrap();
+	let domain = EvaluationDomain::<FE>::new(n_multilinears + 1).unwrap();
 
 	let challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
 
-	let (prover_rd_claims, final_prove_output) = full_prove_with_switchover(
+	let final_prove_output = prove::<_, _, FE, _, _, _>(
 		&sumcheck_claim,
 		sumcheck_witness,
 		&domain,
 		challenger.clone(),
 		|_| switchover_rd,
-	);
+	)
+	.expect("failed to prove sumcheck");
 
-	let (verifier_rd_claims, final_verify_output) =
-		full_verify(&sumcheck_claim, final_prove_output.sumcheck_proof, challenger.clone());
+	let final_verify_output =
+		verify(&sumcheck_claim, final_prove_output.sumcheck_proof, challenger.clone())
+			.expect("failed to verify sumcheck proof");
 
-	assert_eq!(prover_rd_claims, verifier_rd_claims);
 	assert_eq!(final_prove_output.evalcheck_claim.eval, final_verify_output.eval);
 	assert_eq!(final_prove_output.evalcheck_claim.eval_point, final_verify_output.eval_point);
 	assert_eq!(final_prove_output.evalcheck_claim.poly.n_vars(), n_vars);
@@ -168,7 +131,6 @@ fn test_prove_verify_interaction_helper(
 }
 
 fn test_prove_verify_interaction_with_monomial_basis_conversion_helper(
-	is_zerocheck: bool,
 	n_vars: usize,
 	n_multilinears: usize,
 ) {
@@ -176,8 +138,7 @@ fn test_prove_verify_interaction_with_monomial_basis_conversion_helper(
 	type OF = BinaryField128bPolyval;
 	let mut rng = StdRng::seed_from_u64(0);
 
-	let (poly, sum) =
-		generate_poly_and_sum_helper::<F, F>(&mut rng, is_zerocheck, n_vars, n_multilinears);
+	let (poly, sum) = generate_poly_and_sum_helper::<F, F>(&mut rng, n_vars, n_multilinears);
 
 	let prover_poly = MultilinearComposite::new(
 		n_vars,
@@ -185,7 +146,7 @@ fn test_prove_verify_interaction_with_monomial_basis_conversion_helper(
 		poly.multilinears
 			.iter()
 			.map(|multilin| {
-				transform_poly::<_, OF>(multilin.as_ref().to_ref())
+				transform_poly::<_, OF, _>(multilin.as_ref().to_ref())
 					.unwrap()
 					.specialize::<OF>()
 			})
@@ -198,7 +159,6 @@ fn test_prove_verify_interaction_with_monomial_basis_conversion_helper(
 	// CLAIM
 	let mut oracles = MultilinearOracleSet::new();
 	let batch_id = oracles.add_committed_batch(CommittedBatchSpec {
-		round_id: 0,
 		n_vars,
 		n_polys: n_multilinears,
 		tower_level: F::TOWER_LEVEL,
@@ -210,19 +170,9 @@ fn test_prove_verify_interaction_with_monomial_basis_conversion_helper(
 		CompositePolyOracle::new(n_vars, h, TestProductComposition::new(n_multilinears)).unwrap();
 	let poly_oracle = composite_poly;
 
-	let zerocheck_challenges = if is_zerocheck {
-		let zc_challenges = repeat_with(|| Field::random(&mut rng))
-			.take(n_vars - 1)
-			.collect::<Vec<F>>();
-		Some(zc_challenges)
-	} else {
-		None
-	};
-
 	let sumcheck_claim = SumcheckClaim {
 		sum,
 		poly: poly_oracle,
-		zerocheck_challenges,
 	};
 
 	// Setup evaluation domain
@@ -230,18 +180,19 @@ fn test_prove_verify_interaction_with_monomial_basis_conversion_helper(
 
 	let challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
 	let switchover_fn = |_| 3;
-	let (prover_rd_claims, final_prove_output) = full_prove_with_switchover(
+	let final_prove_output = prove::<_, _, OF, _, _, _>(
 		&sumcheck_claim,
 		operating_witness,
 		&domain,
 		challenger.clone(),
 		switchover_fn,
-	);
+	)
+	.expect("failed to prove sumcheck");
 
-	let (verifier_rd_claims, final_verify_output) =
-		full_verify(&sumcheck_claim, final_prove_output.sumcheck_proof, challenger.clone());
+	let final_verify_output =
+		verify(&sumcheck_claim, final_prove_output.sumcheck_proof, challenger.clone())
+			.expect("failed to verify sumcheck proof");
 
-	assert_eq!(prover_rd_claims, verifier_rd_claims);
 	assert_eq!(final_prove_output.evalcheck_claim.eval, final_verify_output.eval);
 	assert_eq!(final_prove_output.evalcheck_claim.eval_point, final_verify_output.eval_point);
 	assert_eq!(final_prove_output.evalcheck_claim.poly.n_vars(), n_vars);
@@ -260,18 +211,7 @@ fn test_sumcheck_prove_verify_interaction_basic() {
 	for n_vars in 2..8 {
 		for n_multilinears in 1..4 {
 			for switchover_rd in 1..=n_vars / 2 {
-				test_prove_verify_interaction_helper(false, n_vars, n_multilinears, switchover_rd);
-			}
-		}
-	}
-}
-
-#[test]
-fn test_zerocheck_prove_verify_interaction_basic() {
-	for n_vars in 2..8 {
-		for n_multilinears in 1..4 {
-			for switchover_rd in 1..=n_vars / 2 {
-				test_prove_verify_interaction_helper(true, n_vars, n_multilinears, switchover_rd);
+				test_prove_verify_interaction_helper(n_vars, n_multilinears, switchover_rd);
 			}
 		}
 	}
@@ -283,8 +223,7 @@ fn test_prove_verify_interaction_pigeonhole_cores() {
 	let n_vars = log2_ceil_usize(n_threads) + 1;
 	for n_multilinears in 1..4 {
 		for switchover_rd in 1..=n_vars / 2 {
-			test_prove_verify_interaction_helper(true, n_vars, n_multilinears, switchover_rd);
-			test_prove_verify_interaction_helper(false, n_vars, n_multilinears, switchover_rd);
+			test_prove_verify_interaction_helper(n_vars, n_multilinears, switchover_rd);
 		}
 	}
 }
@@ -294,12 +233,6 @@ fn test_prove_verify_interaction_with_monomial_basis_conversion_basic() {
 	for n_vars in 2..8 {
 		for n_multilinears in 1..4 {
 			test_prove_verify_interaction_with_monomial_basis_conversion_helper(
-				true,
-				n_vars,
-				n_multilinears,
-			);
-			test_prove_verify_interaction_with_monomial_basis_conversion_helper(
-				false,
 				n_vars,
 				n_multilinears,
 			);
@@ -312,23 +245,14 @@ fn test_prove_verify_interaction_with_monomial_basis_conversion_pigeonhole_cores
 	let n_threads = current_num_threads();
 	let n_vars = log2_ceil_usize(n_threads) + 1;
 	for n_multilinears in 1..6 {
-		test_prove_verify_interaction_with_monomial_basis_conversion_helper(
-			true,
-			n_vars,
-			n_multilinears,
-		);
-		test_prove_verify_interaction_with_monomial_basis_conversion_helper(
-			false,
-			n_vars,
-			n_multilinears,
-		);
+		test_prove_verify_interaction_with_monomial_basis_conversion_helper(n_vars, n_multilinears);
 	}
 }
 
 #[derive(Debug, Clone)]
 struct SquareComposition;
 
-impl<F: Field> CompositionPoly<F> for SquareComposition {
+impl<P: PackedField> CompositionPoly<P> for SquareComposition {
 	fn n_vars(&self) -> usize {
 		1
 	}
@@ -337,11 +261,13 @@ impl<F: Field> CompositionPoly<F> for SquareComposition {
 		2
 	}
 
-	fn evaluate(&self, query: &[F]) -> Result<F, PolynomialError> {
-		self.evaluate_packed(query)
+	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, PolynomialError> {
+		// Square each scalar value in the given packed value.
+		Ok(query[0].square())
 	}
 
-	fn evaluate_packed(&self, query: &[F]) -> Result<F, PolynomialError> {
+	fn evaluate(&self, query: &[P]) -> Result<P, PolynomialError> {
+		// Square each scalar value in the given packed value.
 		Ok(query[0].square())
 	}
 
@@ -362,7 +288,6 @@ fn test_prove_verify_batch() {
 
 	let batch_ids = [4, 6, 8].map(|n_vars| {
 		oracles.add_committed_batch(CommittedBatchSpec {
-			round_id: 0,
 			n_vars,
 			n_polys: 1,
 			tower_level: F::TOWER_LEVEL,
@@ -424,17 +349,13 @@ fn test_prove_verify_batch() {
 	let sumcheck_claims = composites
 		.into_iter()
 		.zip(composite_sums)
-		.map(|(poly, sum)| SumcheckClaim {
-			poly,
-			sum,
-			zerocheck_challenges: None,
-		})
+		.map(|(poly, sum)| SumcheckClaim { poly, sum })
 		.collect::<Vec<_>>();
 
-	let domain = EvaluationDomain::new(3).unwrap();
+	let domain = EvaluationDomain::<FE>::new(3).unwrap();
 
 	let mut witness_iter = witnesses.into_iter();
-	let prover0 = SumcheckProver::new(
+	let prover0 = SumcheckProver::<_, _, FE, _, _>::new(
 		&domain,
 		sumcheck_claims[0].clone(),
 		witness_iter.next().unwrap(),

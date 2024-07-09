@@ -87,15 +87,15 @@ mod tests {
 			1
 		}
 
-		fn evaluate(&self, query: &[BinaryField128b]) -> Result<BinaryField128b, PolynomialError> {
-			self.evaluate_packed(query)
-		}
-
-		fn evaluate_packed(
+		fn evaluate_scalar(
 			&self,
 			query: &[BinaryField128b],
 		) -> Result<BinaryField128b, PolynomialError> {
-			Ok(query[0] * query[1] + query[2] * BinaryField8b::new(125))
+			self.evaluate(query)
+		}
+
+		fn evaluate(&self, query: &[BinaryField128b]) -> Result<BinaryField128b, PolynomialError> {
+			Ok(query[0] * query[1] + query[2] * BinaryField128b::new(125))
 		}
 
 		fn binary_tower_level(&self) -> usize {
@@ -107,12 +107,10 @@ mod tests {
 	fn test_composite_tower_level() {
 		type F = BinaryField128b;
 
-		let round_id = 0;
 		let n_vars = 5;
 
 		let mut oracles = MultilinearOracleSet::<F>::new();
 		let batch_id_2b = oracles.add_committed_batch(CommittedBatchSpec {
-			round_id,
 			n_vars,
 			n_polys: 1,
 			tower_level: BinaryField2b::TOWER_LEVEL,
@@ -123,7 +121,6 @@ mod tests {
 		});
 
 		let batch_id_8b = oracles.add_committed_batch(CommittedBatchSpec {
-			round_id,
 			n_vars,
 			n_polys: 1,
 			tower_level: BinaryField8b::TOWER_LEVEL,
@@ -134,7 +131,6 @@ mod tests {
 		});
 
 		let batch_id_32b = oracles.add_committed_batch(CommittedBatchSpec {
-			round_id,
 			n_vars,
 			n_polys: 1,
 			tower_level: BinaryField32b::TOWER_LEVEL,

@@ -1,20 +1,21 @@
 // Copyright 2024 Ulvetanna Inc.
 
+use super::{AbstractSumcheckProver, AbstractSumcheckRound, ReducedClaim};
 use crate::{
+	challenger::{CanObserve, CanSample},
 	polynomial::{
 		Error as PolynomialError, MultilinearExtensionSpecialized, MultilinearPoly,
 		MultilinearQuery,
 	},
-	protocols::sumcheck::Error,
 };
 use binius_field::{Field, PackedField};
-use either::Either;
+use binius_utils::array_2d::Array2D;
 use rayon::prelude::*;
-use std::{borrow::Borrow, cmp};
+use std::{borrow::Borrow, cmp, ops::Range};
 
 /// An individual multilinear polynomial in a multivariate composite.
 #[derive(Debug)]
-enum SumcheckMultilinear<P: PackedField, M> {
+enum SumcheckMultilinear<P: PackedField, M: Send> {
 	/// Small field polynomial - to be folded into large field at `switchover` round
 	Transparent {
 		switchover: usize,
@@ -22,28 +23,28 @@ enum SumcheckMultilinear<P: PackedField, M> {
 	},
 	/// Large field polynomial - halved in size each round
 	Folded {
-		large_field_folded_multilin: MultilinearExtensionSpecialized<'static, P, P>,
+		large_field_folded_multilin: MultilinearExtensionSpecialized<P, P>,
 	},
 }
 
 /// Parallel fold state, consisting of scratch area and result accumulator.
-struct ParFoldState<F: Field> {
+struct ParFoldStates<F: Field> {
 	// Evaluations at 0, 1 and domain points, per MLE. Scratch space.
-	evals_0: Vec<F>,
-	evals_1: Vec<F>,
-	evals_z: Vec<F>,
+	evals_0: Array2D<F>,
+	evals_1: Array2D<F>,
+	evals_z: Array2D<F>,
 
 	// Accumulated sums of evaluations over univariate domain.
-	round_evals: Vec<F>,
+	round_evals: Array2D<F>,
 }
 
-impl<F: Field> ParFoldState<F> {
-	fn new(n_multilinears: usize, n_round_evals: usize) -> Self {
+impl<F: Field> ParFoldStates<F> {
+	fn new(n_multilinears: usize, n_round_evals: usize, n_states: usize) -> Self {
 		Self {
-			evals_0: vec![F::ZERO; n_multilinears],
-			evals_1: vec![F::ZERO; n_multilinears],
-			evals_z: vec![F::ZERO; n_multilinears],
-			round_evals: vec![F::ZERO; n_round_evals],
+			evals_0: Array2D::new(n_states, n_multilinears),
+			evals_1: Array2D::new(n_states, n_multilinears),
+			evals_z: Array2D::new(n_states, n_multilinears),
+			round_evals: Array2D::new(n_states, n_round_evals),
 		}
 	}
 }
@@ -51,7 +52,9 @@ impl<F: Field> ParFoldState<F> {
 /// Represents an object that can evaluate the composition function of a generalized sumcheck.
 ///
 /// Generalizes handling of regular sumcheck and zerocheck protocols.
-pub trait SumcheckEvaluator<F>: Send + Sync {
+pub trait AbstractSumcheckEvaluator<P: PackedField>: Sync {
+	type VertexState;
+
 	/// The number of points to evaluate at.
 	fn n_round_evals(&self) -> usize;
 
@@ -59,7 +62,8 @@ pub trait SumcheckEvaluator<F>: Send + Sync {
 	///
 	/// ## Arguments
 	///
-	/// * `index`: index of the hypercube vertex
+	/// * `i`: index of the hypercube vertex under processing
+	/// * `vertex_state`: state of the hypercube vertex under processing
 	/// * `evals_0`: the n multilinear polynomial evaluations at 0
 	/// * `evals_1`: the n multilinear polynomial evaluations at 1
 	/// * `evals_z`: a scratch buffer of size n for storing multilinear polynomial evaluations at a
@@ -67,43 +71,25 @@ pub trait SumcheckEvaluator<F>: Send + Sync {
 	/// * `round_evals`: the accumulated evaluations for the round
 	fn process_vertex(
 		&self,
-		index: usize,
-		evals_0: &[F],
-		evals_1: &[F],
-		evals_z: &mut [F],
-		round_evals: &mut [F],
+		i: usize,
+		vertex_state: Self::VertexState,
+		evals_0: &[P::Scalar],
+		evals_1: &[P::Scalar],
+		evals_z: &mut [P::Scalar],
+		round_evals: &mut [P::Scalar],
 	);
-}
 
-impl<F, L, R> SumcheckEvaluator<F> for Either<L, R>
-where
-	L: SumcheckEvaluator<F>,
-	R: SumcheckEvaluator<F>,
-{
-	fn n_round_evals(&self) -> usize {
-		match self {
-			Either::Left(left) => left.n_round_evals(),
-			Either::Right(right) => right.n_round_evals(),
-		}
-	}
-
-	fn process_vertex(
+	/// Given evaluations of the round polynomial, interpolate and return monomial coefficients
+	///
+	/// ## Arguments
+	///
+	/// * `current_round_sum`: the claimed sum for the current round
+	/// * `round_evals`: the computed evaluations of the round polynomial
+	fn round_evals_to_coeffs(
 		&self,
-		index: usize,
-		evals_0: &[F],
-		evals_1: &[F],
-		evals_z: &mut [F],
-		round_evals: &mut [F],
-	) {
-		match self {
-			Either::Left(left) => {
-				left.process_vertex(index, evals_0, evals_1, evals_z, round_evals)
-			}
-			Either::Right(right) => {
-				right.process_vertex(index, evals_0, evals_1, evals_z, round_evals)
-			}
-		}
-	}
+		current_round_sum: P::Scalar,
+		round_evals: Vec<P::Scalar>,
+	) -> Result<Vec<P::Scalar>, PolynomialError>;
 }
 
 /// A prover state for a generalized sumcheck protocol.
@@ -115,7 +101,7 @@ where
 /// evaluating the composed multilinears.
 ///
 /// Once initialized, the expected caller behavior is to alternate invocations of
-/// [`Self::sum_round_evals`] and [`Self::fold`], for a total of `n_rounds` calls to each.
+/// [`Self::calculate_round_coeffs`] and [`Self::fold`], for a total of `n_rounds` calls to each.
 ///
 /// We associate with each multilinear a `switchover` round number, which controls small field
 /// optimization and corresponding time/memory tradeoff. In rounds $0, \ldots, switchover-1$ the
@@ -133,7 +119,7 @@ where
 ///
 /// [Gruen24]: https://eprint.iacr.org/2024/108
 #[derive(Debug)]
-pub struct ProverState<PW, M>
+pub struct ProverState<PW, M: Send>
 where
 	PW: PackedField,
 	M: MultilinearPoly<PW> + Sync,
@@ -141,19 +127,18 @@ where
 	multilinears: Vec<SumcheckMultilinear<PW, M>>,
 	query: Option<MultilinearQuery<PW>>,
 	round: usize,
-	n_rounds: usize,
 }
 
 impl<PW, M> ProverState<PW, M>
 where
 	PW: PackedField,
-	M: MultilinearPoly<PW> + Sync,
+	M: MultilinearPoly<PW> + Sync + Send,
 {
 	pub fn new(
 		n_rounds: usize,
 		multilinears: impl IntoIterator<Item = M>,
 		switchover_fn: impl Fn(usize) -> usize,
-	) -> Result<Self, Error> {
+	) -> Result<Self, PolynomialError> {
 		let mut max_query_vars = 1;
 		let multilinears = multilinears
 			.into_iter()
@@ -162,8 +147,7 @@ where
 					return Err(PolynomialError::IncorrectNumberOfVariables {
 						expected: n_rounds,
 						actual: small_field_multilin.n_vars(),
-					}
-					.into());
+					});
 				}
 
 				let switchover = switchover_fn(small_field_multilin.extension_degree());
@@ -173,7 +157,7 @@ where
 					small_field_multilin,
 				})
 			})
-			.collect::<Result<_, Error>>()?;
+			.collect::<Result<_, _>>()?;
 
 		let query = Some(MultilinearQuery::new(max_query_vars)?);
 
@@ -181,7 +165,6 @@ where
 			multilinears,
 			query,
 			round: 0,
-			n_rounds,
 		})
 	}
 
@@ -192,7 +175,7 @@ where
 	/// (pre-switchover).
 	///
 	/// See struct documentation for more details on the generalized sumcheck proving algorithm.
-	pub fn fold(&mut self, prev_rd_challenge: PW::Scalar) -> Result<(), Error> {
+	pub fn fold(&mut self, prev_rd_challenge: PW::Scalar) -> Result<(), PolynomialError> {
 		let &mut Self {
 			ref mut multilinears,
 			ref mut query,
@@ -212,42 +195,46 @@ where
 		let partial_query = MultilinearQuery::with_full_query(&[prev_rd_challenge])?;
 
 		// Perform switchover and/or folding
-		let mut any_transparent_left = false;
-
-		for multilin in multilinears.iter_mut() {
-			match *multilin {
-				SumcheckMultilinear::Transparent {
-					switchover,
-					ref small_field_multilin,
-				} => {
-					if switchover <= *round {
-						let query_ref = query.as_ref().expect(
-							"query is guaranteed to be Some while there are transparent \
+		let any_transparent_left = multilinears
+			.par_iter_mut()
+			.map(|multilin| -> Result<bool, PolynomialError> {
+				let mut any_transparent_left = false;
+				match *multilin {
+					SumcheckMultilinear::Transparent {
+						switchover,
+						ref small_field_multilin,
+					} => {
+						if switchover <= *round {
+							let query_ref = query.as_ref().expect(
+								"query is guaranteed to be Some while there are transparent \
 								multilinears remaining",
-						);
-						// At switchover, perform inner products in large field and save them
-						// in a newly created MLE.
-						let large_field_folded_multilin = small_field_multilin
-							.borrow()
-							.evaluate_partial_low(query_ref)?;
+							);
+							// At switchover, perform inner products in large field and save them
+							// in a newly created MLE.
+							let large_field_folded_multilin = small_field_multilin
+								.borrow()
+								.evaluate_partial_low(query_ref)?;
 
-						*multilin = SumcheckMultilinear::Folded {
-							large_field_folded_multilin,
-						};
-					} else {
-						any_transparent_left = true;
+							*multilin = SumcheckMultilinear::Folded {
+								large_field_folded_multilin,
+							};
+						} else {
+							any_transparent_left = true;
+						}
+					}
+
+					SumcheckMultilinear::Folded {
+						ref mut large_field_folded_multilin,
+					} => {
+						// Post-switchover, simply halve large field MLE.
+						*large_field_folded_multilin =
+							large_field_folded_multilin.evaluate_partial_low(&partial_query)?;
 					}
 				}
 
-				SumcheckMultilinear::Folded {
-					ref mut large_field_folded_multilin,
-				} => {
-					// Post-switchover, simply halve large field MLE.
-					*large_field_folded_multilin =
-						large_field_folded_multilin.evaluate_partial_low(&partial_query)?;
-				}
-			}
-		}
+				Ok(any_transparent_left)
+			})
+			.reduce(|| Ok(false), |lhs, rhs| Ok(lhs? || rhs?))?;
 
 		// All folded large field - tensor is no more needed.
 		if !any_transparent_left {
@@ -258,10 +245,12 @@ where
 	}
 
 	/// Compute the sum of the partial polynomial evaluations over the hypercube.
-	pub fn sum_round_evals(
+	pub fn calculate_round_coeffs<S>(
 		&self,
-		evaluator: impl SumcheckEvaluator<PW::Scalar>,
-	) -> Vec<PW::Scalar> {
+		evaluator: impl AbstractSumcheckEvaluator<PW, VertexState = S>,
+		current_round_sum: PW::Scalar,
+		vertex_state_iterator: impl IndexedParallelIterator<Item = S>,
+	) -> Result<Vec<PW::Scalar>, PolynomialError> {
 		// Extract multilinears & round
 		let &Self {
 			ref multilinears,
@@ -282,40 +271,64 @@ where
 			(true, false) => {
 				if round == 0 {
 					// All transparent, first round - direct sampling
-					self.sum_round_evals_helper(
+					self.calculate_round_coeffs_helper(
 						Self::only_transparent,
 						Self::direct_sample,
 						evaluator,
+						vertex_state_iterator,
+						current_round_sum,
 					)
 				} else {
 					// All transparent, rounds 1..n_vars - small field inner product
-					self.sum_round_evals_helper(
+					self.calculate_round_coeffs_helper(
 						Self::only_transparent,
-						|multilin, i| self.subcube_inner_product(multilin, i),
+						|multilin, indices, evals0, evals1, col| {
+							self.subcube_inner_product(multilin, indices, evals0, evals1, col)
+						},
 						evaluator,
+						vertex_state_iterator,
+						current_round_sum,
 					)
 				}
 			}
 
 			// All folded - direct sampling
-			(false, true) => {
-				self.sum_round_evals_helper(Self::only_folded, Self::direct_sample, evaluator)
-			}
+			(false, true) => self.calculate_round_coeffs_helper(
+				Self::only_folded,
+				Self::direct_sample,
+				evaluator,
+				vertex_state_iterator,
+				current_round_sum,
+			),
 
 			// Heterogeneous case
-			_ => self.sum_round_evals_helper(
+			_ => self.calculate_round_coeffs_helper(
 				|x| x,
-				|sc_multilin, i| match sc_multilin {
+				|sc_multilin, indices, evals0, evals1, col| match sc_multilin {
 					SumcheckMultilinear::Transparent {
 						small_field_multilin,
 						..
-					} => self.subcube_inner_product(small_field_multilin.borrow(), i),
+					} => self.subcube_inner_product(
+						small_field_multilin.borrow(),
+						indices,
+						evals0,
+						evals1,
+						col,
+					),
 
 					SumcheckMultilinear::Folded {
 						large_field_folded_multilin,
-					} => Self::direct_sample(large_field_folded_multilin, i),
+					} => Self::direct_sample(
+						large_field_folded_multilin,
+						indices,
+						evals0,
+						evals1,
+						col,
+					),
 				},
 				evaluator,
+				vertex_state_iterator,
+				current_round_sum,
 			),
 		}
 	}
@@ -325,17 +338,19 @@ where
 	// field, and `rd_vars = n_vars - round` remaining variables that are being summed over. `eval01` closure
 	// computes 0 & 1 evaluations at some index - either by performing inner product over assigned variables
 	// pre-switchover or directly sampling MLE representation during first round or post-switchover.
-	fn sum_round_evals_helper<'b, T>(
+	fn calculate_round_coeffs_helper<'b, T, S>(
 		&'b self,
 		precomp: impl Fn(&'b SumcheckMultilinear<PW, M>) -> T,
-		eval01: impl Fn(T, usize) -> (PW::Scalar, PW::Scalar) + Sync,
-		evaluator: impl SumcheckEvaluator<PW::Scalar>,
-	) -> Vec<PW::Scalar>
+		eval01: impl Fn(T, Range<usize>, &mut Array2D<PW::Scalar>, &mut Array2D<PW::Scalar>, usize)
+			+ Sync,
+		evaluator: impl AbstractSumcheckEvaluator<PW, VertexState = S>,
+		vertex_state_iterator: impl IndexedParallelIterator<Item = S>,
+		current_round_sum: PW::Scalar,
+	) -> Result<Vec<PW::Scalar>, PolynomialError>
 	where
 		T: Copy + Sync + 'b,
 		M: 'b,
 	{
-		let rd_vars = self.n_rounds - self.round;
 		let n_multilinears = self.multilinears.len();
 		let n_round_evals = evaluator.n_round_evals();
 
@@ -343,29 +358,42 @@ where
 		// For performance, it's ideal to hoist this out of the tight loop.
 		let precomps = self.multilinears.iter().map(precomp).collect::<Vec<_>>();
 
-		(0..1 << (rd_vars - 1))
-			.into_par_iter()
+		/// Process batches of vertices in parallel, accumulating the round evaluations.
+		const BATCH_SIZE: usize = 64;
+
+		let evals = vertex_state_iterator
+			.chunks(BATCH_SIZE)
+			.enumerate()
 			.fold(
-				|| ParFoldState::new(n_multilinears, n_round_evals),
-				|mut state, i| {
+				|| ParFoldStates::new(n_multilinears, n_round_evals, BATCH_SIZE),
+				|mut par_fold_states, (vertex, vertex_states)| {
+					let begin = vertex * BATCH_SIZE;
+					let end = begin + vertex_states.len();
 					for (j, precomp) in precomps.iter().enumerate() {
-						let (eval0, eval1) = eval01(*precomp, i);
-						state.evals_0[j] = eval0;
-						state.evals_1[j] = eval1;
+						eval01(
+							*precomp,
+							begin..end,
+							&mut par_fold_states.evals_0,
+							&mut par_fold_states.evals_1,
+							j,
+						);
 					}
 
-					evaluator.process_vertex(
-						i,
-						&state.evals_0,
-						&state.evals_1,
-						&mut state.evals_z,
-						&mut state.round_evals,
-					);
+					for (k, vertex_state) in vertex_states.into_iter().enumerate() {
+						evaluator.process_vertex(
+							begin + k,
+							vertex_state,
+							par_fold_states.evals_0.get_row(k),
+							par_fold_states.evals_1.get_row(k),
+							par_fold_states.evals_z.get_row_mut(k),
+							par_fold_states.round_evals.get_row_mut(k),
+						);
+					}
 
-					state
+					par_fold_states
 				},
 			)
-			.map(|state| state.round_evals)
+			.map(|states| states.round_evals.sum_rows())
 			// Simply sum up the fold partitions.
 			.reduce(
 				|| vec![PW::Scalar::ZERO; n_round_evals],
@@ -376,38 +404,47 @@ where
 						.for_each(|(f, s)| *f += s);
 					overall_round_evals
 				},
-			)
+			);
+
+		evaluator.round_evals_to_coeffs(current_round_sum, evals)
 	}
 
 	// Note the generic parameter - this method samples small field in first round and
 	// large field post-switchover.
 	#[inline]
-	fn direct_sample<MD>(multilin: MD, i: usize) -> (PW::Scalar, PW::Scalar)
-	where
+	fn direct_sample<MD>(
+		multilin: MD,
+		indices: Range<usize>,
+		evals_0: &mut Array2D<PW::Scalar>,
+		evals_1: &mut Array2D<PW::Scalar>,
+		col_index: usize,
+	) where
 		MD: MultilinearPoly<PW>,
 	{
-		let eval0 = multilin
-			.evaluate_on_hypercube(i << 1)
-			.expect("eval 0 within range");
-		let eval1 = multilin
-			.evaluate_on_hypercube((i << 1) + 1)
-			.expect("eval 1 within range");
-
-		(eval0, eval1)
+		for (k, i) in indices.enumerate() {
+			evals_0[(k, col_index)] = multilin
+				.evaluate_on_hypercube(i << 1)
+				.expect("eval 0 within range");
+			evals_1[(k, col_index)] = multilin
+				.evaluate_on_hypercube((i << 1) + 1)
+				.expect("eval 1 within range");
+		}
 	}
 
 	#[inline]
-	fn subcube_inner_product(&self, multilin: &M, i: usize) -> (PW::Scalar, PW::Scalar) where {
+	fn subcube_inner_product(
+		&self,
+		multilin: &M,
+		indices: Range<usize>,
+		evals_0: &mut Array2D<PW::Scalar>,
+		evals_1: &mut Array2D<PW::Scalar>,
+		col_index: usize,
+	) {
 		let query = self.query.as_ref().expect("tensor present by invariant");
 
-		let eval0 = multilin
-			.evaluate_subcube(i << 1, query)
-			.expect("eval 0 within range");
-		let eval1 = multilin
-			.evaluate_subcube((i << 1) + 1, query)
-			.expect("eval 1 within range");
-
-		(eval0, eval1)
+		multilin
+			.evaluate_subcube(indices, query, evals_0, evals_1, col_index)
+			.expect("indices within range");
 	}
 
 	fn only_transparent(sc_multilin: &SumcheckMultilinear<PW, M>) -> &M {
@@ -422,7 +459,7 @@ where
 
 	fn only_folded(
 		sc_multilin: &SumcheckMultilinear<PW, M>,
-	) -> &MultilinearExtensionSpecialized<'static, PW, PW> {
+	) -> &MultilinearExtensionSpecialized<PW, PW> {
 		match sc_multilin {
 			SumcheckMultilinear::Folded {
 				large_field_folded_multilin,
@@ -430,4 +467,29 @@ where
 			_ => panic!("all folded by invariant"),
 		}
 	}
+}
+
+pub fn prove<F, CH, E>(
+	n_vars: usize,
+	mut sumcheck_prover: impl AbstractSumcheckProver<F, Error = E>,
+	mut challenger: CH,
+) -> Result<(ReducedClaim<F>, Vec<AbstractSumcheckRound<F>>), E>
+where
+	F: Field,
+	CH: CanSample<F> + CanObserve<F>,
+	E: From<PolynomialError> + Sync,
+{
+	let mut prev_rd_challenge = None;
+	let mut rd_proofs = Vec::with_capacity(n_vars);
+
+	for _round_no in 0..n_vars {
+		let sumcheck_round = sumcheck_prover.execute_round(prev_rd_challenge)?;
+		challenger.observe_slice(&sumcheck_round.coeffs);
+		prev_rd_challenge = Some(challenger.sample());
+		rd_proofs.push(sumcheck_round);
+	}
+
+	let reduced_claim = sumcheck_prover.finalize(prev_rd_challenge)?;
+
+	Ok((reduced_claim, rd_proofs))
 }

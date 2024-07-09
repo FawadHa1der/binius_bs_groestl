@@ -1,12 +1,19 @@
 // Copyright 2024 Ulvetanna Inc.
 
 use crate::{
-	arch::portable::{
-		packed::PackedPrimitiveType,
-		packed_arithmetic::{interleave_mask_even, interleave_mask_odd, UnderlierWithBitConstants},
+	arch::{
+		binary_utils::{as_array_mut, as_array_ref},
+		portable::{
+			packed::{impl_pack_scalar, PackedPrimitiveType},
+			packed_arithmetic::{
+				interleave_mask_even, interleave_mask_odd, UnderlierWithBitConstants,
+			},
+		},
 	},
 	arithmetic_traits::Broadcast,
-	underlier::{NumCast, Random, UnderlierType, WithUnderlier},
+	underlier::{
+		impl_divisible, NumCast, Random, SmallU, UnderlierType, UnderlierWithBitOps, WithUnderlier,
+	},
 	BinaryField,
 };
 use bytemuck::{must_cast, Pod, Zeroable};
@@ -16,10 +23,11 @@ use std::{
 	mem::transmute,
 	ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not, Shl, Shr},
 };
-use subtle::{Choice, ConstantTimeEq};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 /// 256-bit value that is used for 256-bit SIMD operations
 #[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
 pub struct M256(pub(super) __m256i);
 
 impl M256 {
@@ -77,6 +85,13 @@ impl From<u8> for M256 {
 		Self::from(value as u128)
 	}
 }
+
+impl<const N: usize> From<SmallU<N>> for M256 {
+	fn from(value: SmallU<N>) -> Self {
+		Self::from(value.val() as u128)
+	}
+}
+
 impl From<M256> for [u128; 2] {
 	fn from(value: M256) -> Self {
 		let result: [u128; 2] = unsafe { transmute(value.0) };
@@ -91,7 +106,12 @@ impl From<M256> for __m256i {
 		value.0
 	}
 }
+
+impl_divisible!(@pairs M256, M128, u128, u64, u32, u16, u8);
+impl_pack_scalar!(M256);
+
 impl<U: NumCast<u128>> NumCast<M256> for U {
+	#[inline(always)]
 	fn num_cast_from(val: M256) -> Self {
 		let [low, _high] = val.into();
 		Self::num_cast_from(low)
@@ -235,6 +255,18 @@ impl ConstantTimeEq for M256 {
 	}
 }
 
+impl ConditionallySelectable for M256 {
+	fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+		let a = <[u128; 2]>::from(*a);
+		let b = <[u128; 2]>::from(*b);
+		let result: [u128; 2] = std::array::from_fn(|i| {
+			ConditionallySelectable::conditional_select(&a[i], &b[i], choice)
+		});
+
+		result.into()
+	}
+}
+
 impl Random for M256 {
 	fn random(mut rng: impl RngCore) -> Self {
 		let val: [u128; 2] = rng.gen();
@@ -261,12 +293,16 @@ macro_rules! m256_from_u128s {
 
 pub(super) use m256_from_u128s;
 
+use super::m128::M128;
+
 impl UnderlierType for M256 {
 	const LOG_BITS: usize = 8;
+}
 
-	const ONE: Self = { Self(m256_from_u128s!(0, 1,)) };
-
+impl UnderlierWithBitOps for M256 {
 	const ZERO: Self = { Self(m256_from_u128s!(0, 0,)) };
+	const ONE: Self = { Self(m256_from_u128s!(0, 1,)) };
+	const ONES: Self = { Self(m256_from_u128s!(u128::MAX, u128::MAX,)) };
 
 	fn fill_with_bit(val: u8) -> Self {
 		Self(unsafe { _mm256_set1_epi8(val.wrapping_neg() as i8) })
@@ -275,12 +311,11 @@ impl UnderlierType for M256 {
 	#[inline(always)]
 	fn get_subvalue<T>(&self, i: usize) -> T
 	where
-		T: WithUnderlier,
-		T::Underlier: NumCast<Self>,
+		T: UnderlierType + NumCast<Self>,
 	{
-		match T::MEANINGFUL_BITS {
+		match T::BITS {
 			1 | 2 | 4 | 8 | 16 | 32 => {
-				let elements_in_64 = 64 / T::MEANINGFUL_BITS;
+				let elements_in_64 = 64 / T::BITS;
 				let chunk_64 = unsafe {
 					match i / elements_in_64 {
 						0 => _mm256_extract_epi64(self.0, 0),
@@ -290,28 +325,21 @@ impl UnderlierType for M256 {
 					}
 				};
 
-				let result_64 = if T::MEANINGFUL_BITS == 64 {
+				let result_64 = if T::BITS == 64 {
 					chunk_64
 				} else {
-					let ones = ((1u128 << T::MEANINGFUL_BITS) - 1) as u64;
-					let val_64 =
-						(chunk_64 as u64) >> (T::MEANINGFUL_BITS * (i % elements_in_64)) & ones;
+					let ones = ((1u128 << T::BITS) - 1) as u64;
+					let val_64 = (chunk_64 as u64) >> (T::BITS * (i % elements_in_64)) & ones;
 
 					val_64 as i64
 				};
-				T::Underlier::num_cast_from(Self(unsafe { _mm256_set_epi64x(0, 0, 0, result_64) }))
-					.into()
+				T::num_cast_from(Self(unsafe { _mm256_set_epi64x(0, 0, 0, result_64) }))
 			}
 			// NOTE: benchmark show that this strategy is optimal for getting 64-bit subvalues from 256-bit register.
 			// However using similar code for 1..32 bits is slower than the version above.
 			// Also even getting `chunk_64` in the code above using this code shows worser benchmarks results.
 			64 => {
-				#[repr(align(16))]
-				struct Data64x4([i64; 4]);
-				let result_64 = unsafe { transmute::<_, Data64x4>(self.0) }.0[i];
-
-				T::Underlier::num_cast_from(Self(unsafe { _mm256_set_epi64x(0, 0, 0, result_64) }))
-					.into()
+				T::num_cast_from(as_array_ref::<_, u64, 4, _>(self, |array| Self::from(array[i])))
 			}
 			128 => {
 				let chunk_128 = unsafe {
@@ -321,11 +349,47 @@ impl UnderlierType for M256 {
 						_mm256_extracti128_si256(self.0, 1)
 					}
 				};
-				T::Underlier::num_cast_from(Self(unsafe {
-					_mm256_set_m128i(_mm_setzero_si128(), chunk_128)
-				}))
-				.into()
+				T::num_cast_from(Self(unsafe { _mm256_set_m128i(_mm_setzero_si128(), chunk_128) }))
 			}
+			_ => panic!("unsupported bit count"),
+		}
+	}
+
+	#[inline(always)]
+	fn set_subvalue<T>(&mut self, i: usize, val: T)
+	where
+		T: UnderlierWithBitOps,
+		Self: From<T>,
+	{
+		match T::BITS {
+			1 | 2 | 4 => {
+				let elements_in_8 = 8 / T::BITS;
+				let mask = (1u8 << T::BITS) - 1;
+				let shift = (i % elements_in_8) * T::BITS;
+				let val = u8::num_cast_from(Self::from(val)) << shift;
+				let mask = mask << shift;
+
+				as_array_mut::<_, u8, 32>(self, |array| {
+					let element = &mut array[i / elements_in_8];
+					*element &= !mask;
+					*element |= val;
+				});
+			}
+			8 => as_array_mut::<_, u8, 32>(self, |array| {
+				array[i] = u8::num_cast_from(Self::from(val));
+			}),
+			16 => as_array_mut::<_, u16, 16>(self, |array| {
+				array[i] = u16::num_cast_from(Self::from(val));
+			}),
+			32 => as_array_mut::<_, u32, 8>(self, |array| {
+				array[i] = u32::num_cast_from(Self::from(val));
+			}),
+			64 => as_array_mut::<_, u64, 4>(self, |array| {
+				array[i] = u64::num_cast_from(Self::from(val));
+			}),
+			128 => as_array_mut::<_, u128, 2>(self, |array| {
+				array[i] = u128::num_cast_from(Self::from(val));
+			}),
 			_ => panic!("unsupported bit count"),
 		}
 	}
@@ -357,7 +421,7 @@ impl<Scalar: BinaryField> From<PackedPrimitiveType<M256, Scalar>> for __m256i {
 	}
 }
 
-impl<Scalar: BinaryField + WithUnderlier> Broadcast<Scalar> for PackedPrimitiveType<M256, Scalar>
+impl<Scalar: BinaryField> Broadcast<Scalar> for PackedPrimitiveType<M256, Scalar>
 where
 	u128: From<Scalar::Underlier>,
 {

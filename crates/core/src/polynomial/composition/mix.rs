@@ -2,7 +2,7 @@
 
 use crate::polynomial::{CompositionPoly, Error};
 use binius_field::{Field, PackedField, TowerField};
-use std::{fmt::Debug, marker::PhantomData};
+use std::fmt::Debug;
 
 /// A composition polynomial that securely batches several underlying multivariate polynomials.
 ///
@@ -24,17 +24,17 @@ pub struct MixComposition<P: PackedField, IC> {
 	challenge: P::Scalar,
 
 	inner_compositions: IC,
-
-	_p_marker: PhantomData<P>,
 }
 
 pub trait HornerCompositions<P: PackedField> {
-	fn evaluate(
+	fn evaluate(&self, challenge: P::Scalar, query: &[P]) -> Result<Option<P>, Error>;
+
+	fn evaluate_scalar(
 		&self,
 		challenge: P::Scalar,
 		query: &[P::Scalar],
 	) -> Result<Option<P::Scalar>, Error>;
-	fn evaluate_packed(&self, challenge: P::Scalar, query: &[P]) -> Result<Option<P>, Error>;
+
 	fn evaluate_with_inner_evals(
 		&self,
 		challenge: P::Scalar,
@@ -43,15 +43,15 @@ pub trait HornerCompositions<P: PackedField> {
 }
 
 impl<P: PackedField> HornerCompositions<P> for () {
-	fn evaluate(
+	fn evaluate(&self, _challenge: P::Scalar, _query: &[P]) -> Result<Option<P>, Error> {
+		Ok(None)
+	}
+
+	fn evaluate_scalar(
 		&self,
 		_challenge: P::Scalar,
 		_query: &[P::Scalar],
 	) -> Result<Option<P::Scalar>, Error> {
-		Ok(None)
-	}
-
-	fn evaluate_packed(&self, _challenge: P::Scalar, _query: &[P]) -> Result<Option<P>, Error> {
 		Ok(None)
 	}
 
@@ -73,28 +73,28 @@ where
 	C: CompositionPoly<P>,
 	IC: HornerCompositions<P>,
 {
-	fn evaluate(
-		&self,
-		challenge: P::Scalar,
-		query: &[P::Scalar],
-	) -> Result<Option<P::Scalar>, Error> {
+	fn evaluate(&self, challenge: P::Scalar, query: &[P]) -> Result<Option<P>, Error> {
 		let mut acc = self.1.evaluate(challenge, query)?;
 
 		for inner_poly in &self.0 {
-			acc = Some(
-				inner_poly.evaluate(query)? + acc.map_or(P::Scalar::ZERO, |tail| tail * challenge),
-			);
+			acc =
+				Some(inner_poly.evaluate(query)? + acc.map_or(P::zero(), |tail| tail * challenge));
 		}
 
 		Ok(acc)
 	}
 
-	fn evaluate_packed(&self, challenge: P::Scalar, query: &[P]) -> Result<Option<P>, Error> {
-		let mut acc = self.1.evaluate_packed(challenge, query)?;
+	fn evaluate_scalar(
+		&self,
+		challenge: P::Scalar,
+		query: &[P::Scalar],
+	) -> Result<Option<P::Scalar>, Error> {
+		let mut acc = self.1.evaluate_scalar(challenge, query)?;
 
 		for inner_poly in &self.0 {
 			acc = Some(
-				inner_poly.evaluate_packed(query)? + acc.map_or(P::zero(), |tail| tail * challenge),
+				inner_poly.evaluate_scalar(query)?
+					+ acc.map_or(P::Scalar::ZERO, |tail| tail * challenge),
 			);
 		}
 
@@ -124,8 +124,7 @@ where
 
 impl<P, IC> CompositionPoly<P> for MixComposition<P, IC>
 where
-	P: PackedField,
-	P::Scalar: TowerField,
+	P: PackedField<Scalar: TowerField>,
 	IC: HornerCompositions<P> + Clone + Debug + Send + Sync,
 {
 	fn n_vars(&self) -> usize {
@@ -136,17 +135,17 @@ where
 		self.max_individual_degree
 	}
 
-	fn evaluate(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error> {
+	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error> {
+		Ok(self
+			.inner_compositions
+			.evaluate_scalar(self.challenge, query)?
+			.unwrap_or(P::Scalar::zero()))
+	}
+
+	fn evaluate(&self, query: &[P]) -> Result<P, Error> {
 		Ok(self
 			.inner_compositions
 			.evaluate(self.challenge, query)?
-			.unwrap_or(P::Scalar::ZERO))
-	}
-
-	fn evaluate_packed(&self, query: &[P]) -> Result<P, Error> {
-		Ok(self
-			.inner_compositions
-			.evaluate_packed(self.challenge, query)?
 			.unwrap_or(P::zero()))
 	}
 
@@ -165,8 +164,6 @@ pub fn empty_mix_composition<P: PackedField>(
 
 		challenge,
 		inner_compositions: (),
-
-		_p_marker: PhantomData,
 	}
 }
 
@@ -200,8 +197,6 @@ impl<P: PackedField, IC> MixComposition<P, IC> {
 
 			challenge: self.challenge,
 			inner_compositions: (compositions_vec, self.inner_compositions),
-
-			_p_marker: PhantomData,
 		})
 	}
 }

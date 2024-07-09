@@ -1,10 +1,17 @@
 // Copyright 2023 Ulvetanna Inc.
 
-use super::{error::Error, multilinear_query::MultilinearQuery, MultilinearPoly};
-use binius_field::PackedField;
-use std::{borrow::Borrow, fmt::Debug, marker::PhantomData};
+use super::{
+	error::Error, multilinear_query::MultilinearQuery, MultilinearExtension, MultilinearPoly,
+};
+use auto_impl::auto_impl;
+use binius_field::{ExtensionField, PackedField, TowerField};
+use std::{borrow::Borrow, fmt::Debug, marker::PhantomData, sync::Arc};
 
-pub trait MultivariatePoly<F>: Debug + Send + Sync {
+/// A multivariate polynomial over a binary tower field.
+///
+/// The definition `MultivariatePoly` is nearly identical to that of [`CompositionPoly`], except that
+/// `MultivariatePoly` is _object safe_, whereas `CompositionPoly` is not.
+pub trait MultivariatePoly<P>: Debug + Send + Sync {
 	/// The number of variables.
 	fn n_vars(&self) -> usize;
 
@@ -12,10 +19,14 @@ pub trait MultivariatePoly<F>: Debug + Send + Sync {
 	fn degree(&self) -> usize;
 
 	/// Evaluate the polynomial at a point in the extension field.
-	fn evaluate(&self, query: &[F]) -> Result<F, Error>;
+	fn evaluate(&self, query: &[P]) -> Result<P, Error>;
+
+	/// Returns the maximum binary tower level of all constants in the arithmetic expression.
+	fn binary_tower_level(&self) -> usize;
 }
 
 /// A multivariate polynomial that defines a composition of `MultilinearComposite`.
+#[auto_impl(Arc)]
 pub trait CompositionPoly<P>: Debug + Send + Sync
 where
 	P: PackedField,
@@ -26,13 +37,20 @@ where
 	/// Total degree of the polynomial.
 	fn degree(&self) -> usize;
 
-	/// Evaluate the polynomial at a scalar evaluation point.
-	fn evaluate(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error>;
+	/// Evaluates the polynomial over scalars, returning a scalar.
+	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error>;
 
-	/// Evaluate the polynomial at packed evaluation points.
-	fn evaluate_packed(&self, query: &[P]) -> Result<P, Error>;
+	/// Evaluates the polynomial using packed values, where each packed value may contain multiple scalar values.
+	/// The evaluation follows SIMD semantics, meaning that operations are performed
+	/// element-wise across corresponding scalar values in the packed values.
+	///
+	/// For example, given a polynomial represented as `query[0] + query[1]`:
+	/// - The addition operation is applied element-wise between `query[0]` and `query[1]`.
+	/// - Each scalar value in `query[0]` is added to the corresponding scalar value in `query[1]`.
+	/// - There are no operations performed between scalar values within the same packed value.
+	fn evaluate(&self, query: &[P]) -> Result<P, Error>;
 
-	/// Returns the maximum binary tower level of a constant used in the composition
+	/// Returns the maximum binary tower level of all constants in the arithmetic expression.
 	fn binary_tower_level(&self) -> usize;
 }
 
@@ -49,11 +67,14 @@ impl<P: PackedField> CompositionPoly<P> for IdentityCompositionPoly {
 		1
 	}
 
-	fn evaluate(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error> {
-		self.evaluate_packed(query)
+	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error> {
+		if query.len() != 1 {
+			return Err(Error::IncorrectQuerySize { expected: 1 });
+		}
+		Ok(query[0])
 	}
 
-	fn evaluate_packed(&self, query: &[P]) -> Result<P, Error> {
+	fn evaluate(&self, query: &[P]) -> Result<P, Error> {
 		if query.len() != 1 {
 			return Err(Error::IncorrectQuerySize { expected: 1 });
 		}
@@ -79,7 +100,7 @@ impl<P: PackedField> CompositionPoly<P> for IdentityCompositionPoly {
 /// The `BM` type parameter is necessary so that we can handle the case of a `MultilinearComposite`
 /// that contains boxed trait objects, as well as the case where it directly holds some
 /// implementation of `MultilinearPoly`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MultilinearComposite<P, C, M>
 where
 	P: PackedField,
@@ -90,22 +111,6 @@ where
 	// The multilinear polynomials. The length of the vector matches `composition.n_vars()`.
 	pub multilinears: Vec<M>,
 	pub _p_marker: PhantomData<P>,
-}
-
-impl<P, C, M> Clone for MultilinearComposite<P, C, M>
-where
-	P: PackedField,
-	C: Clone,
-	M: MultilinearPoly<P> + Clone,
-{
-	fn clone(&self) -> Self {
-		Self {
-			composition: self.composition.clone(),
-			n_vars: self.n_vars,
-			multilinears: self.multilinears.clone(),
-			_p_marker: PhantomData,
-		}
-	}
 }
 
 impl<P, C, M> MultilinearComposite<P, C, M>
@@ -147,7 +152,7 @@ where
 			.iter()
 			.map(|multilin| multilin.evaluate(query))
 			.collect::<Result<Vec<_>, _>>()?;
-		self.composition.evaluate(&evals)
+		self.composition.evaluate_scalar(&evals)
 	}
 
 	pub fn evaluate_on_hypercube(&self, index: usize) -> Result<P::Scalar, Error> {
@@ -156,11 +161,7 @@ where
 			.iter()
 			.map(|multilin| multilin.evaluate_on_hypercube(index))
 			.collect::<Result<Vec<_>, _>>()?;
-		self.composition.evaluate(&evals)
-	}
-
-	pub fn n_vars(&self) -> usize {
-		self.n_vars
+		self.composition.evaluate_scalar(&evals)
 	}
 
 	pub fn max_individual_degree(&self) -> usize {
@@ -170,6 +171,41 @@ where
 
 	pub fn n_multilinears(&self) -> usize {
 		self.composition.n_vars()
+	}
+}
+
+impl<P, C, M> MultilinearComposite<P, C, M>
+where
+	P: PackedField,
+	M: MultilinearPoly<P>,
+{
+	pub fn n_vars(&self) -> usize {
+		self.n_vars
+	}
+}
+
+impl<'a, F, C> MultilinearComposite<F, C, Arc<dyn MultilinearPoly<F> + Send + Sync + 'a>>
+where
+	F: TowerField,
+	C: CompositionPoly<F>,
+{
+	pub fn from_columns<P>(
+		composition: C,
+		columns: impl IntoIterator<Item = &'a (impl AsRef<[P]> + 'a)>,
+	) -> Result<Self, Error>
+	where
+		P: PackedField,
+		F: ExtensionField<P::Scalar>,
+	{
+		let multilinears = columns
+			.into_iter()
+			.map(|v| {
+				let mle = MultilinearExtension::from_values_slice(v.as_ref())?;
+				Ok(mle.specialize_arc_dyn())
+			})
+			.collect::<Result<Vec<_>, Error>>()?;
+		let n_vars = multilinears[0].n_vars();
+		Self::new(n_vars, composition, multilinears)
 	}
 }
 
