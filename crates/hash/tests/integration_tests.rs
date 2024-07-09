@@ -86,8 +86,8 @@ fn test_force_two_chunk_pads() {
 	// This lets us test when even though you have <64 bytes, padding will force you to have 2
 	// blocks in the finalize function
 	let mut hasher = Groestl256::new();
-	hasher.update(str_to_aes("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
-	let expected = hex!("075afb879c3185a1ee2afab192621e401e62d6d158d7156ce884d40822a8f277");
+	hasher.update(str_to_aes("my message gdfjhghjkfdhgjklfdshgjklfdhgjkfdshkfjsdhgjfdlshgjkfdsghfjdklhgjfkdlghfjdkslhgfdjksgsdfhj    dsdscxcd3232322cc"));
+	let expected = hex!("b779c7e6889b45c9b5b8771f71d9c466e120db621e2ef1d5fe0542affaed4be1");
 	test_hash_eq(hasher.finalize(), expected);
 }
 
