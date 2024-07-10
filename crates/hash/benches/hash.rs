@@ -97,7 +97,7 @@ fn bench_groestl_long_data(c: &mut Criterion) {
     group.bench_function("Groestl256-nonbitsliced", |bench| {
         bench.iter(|| {
             testinput
-                .chunks_exact(16) // comes out to 16 in this instance, covert to chunks_exact instead of par_chunks_exact for sequential comparison 
+                .par_chunks_exact(16) // comes out to 16 in this instance, covert to chunks_exact instead of par_chunks_exact for sequential comparison 
                 .enumerate()
                 .map(|(index, chunk)| {
                     let chunk_bytes = packed_to_bytes(chunk);
@@ -107,7 +107,7 @@ fn bench_groestl_long_data(c: &mut Criterion) {
                 })
                 .collect::<Vec<_>>(); // Collect the results into a Vec
         });
-});
+    });
 
     group.finish();
 }
@@ -150,12 +150,15 @@ fn bench_groestl_bitsliced(c: &mut Criterion) {
 
     group.throughput(Throughput::Bytes((input_items_length * std::mem::size_of::<PackedPrimitiveType>()) as u64));
 	group.bench_function("Groestl256-bitsliced", |bench| {
-		bench.iter(|| {
-			unsafe {
-				binius_groestl_bs_hash(testdigests.as_mut_ptr(), testinput.as_mut_ptr(), input_items_length * size_of_packed_primitive, n_hashes * size_of_each_digest);
-			}
-		}
-	)});
+        bench.iter(|| {
+            // let start_time = std::time::Instant::now();
+            unsafe {
+                binius_groestl_bs_hash(testdigests.as_mut_ptr(), testinput.as_mut_ptr(), input_items_length * size_of_packed_primitive, (input_items_length * size_of_packed_primitive)/n_hashes);
+            }
+            // let elapsed_time = start_time.elapsed();
+            // println!("Elapsed time: {:?}", elapsed_time);
+        }
+    )});
 
 	group.finish()
 }
@@ -179,6 +182,6 @@ fn bench_groestl_bitsliced(c: &mut Criterion) {
 // }
 
 // criterion_group!(hash, bench_groestl_long_data, bench_groestl_bitsliced, bench_groestl);
-criterion_group!(hash,  bench_groestl_long_data, bench_groestl_bitsliced);
+criterion_group!(hash, bench_groestl_bitsliced, bench_groestl_long_data);
 criterion_main!(hash);
 

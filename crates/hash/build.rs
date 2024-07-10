@@ -1,21 +1,29 @@
 use cc;
 fn main() {
     // Specify the C library name and path
-    let library_name = "testrustinput.a";
-    // let build_command = if cfg!(target_os = "macos") {
-    //     "make"
-    // } else {
-    //     "cmake"
-    // };
+    let library_name = "testrustinput";
+    let files = ["src/groestl/custom_groestl/groestl256/hash.c", "src/groestl/custom_groestl/groestl256/bs.c"];
+    let includes = "src/groestl/custom_groestl/groestl256";
 
-    // let _ = std::process::Command::new(build_command)
-    //     .current_dir(library_path)
-    //     .status();
-    cc::Build::new()
-        .files(&["src/groestl/custom_groestl/groestl256/hash.c", "src/groestl/custom_groestl/groestl256/bs.c" ]) // Include both C files
-        .include("src/groestl/custom_groestl/groestl256") // Include the directory containing the headers
+    if cfg!(target_os = "windows") {
+        cc::Build::new()
+        .files(files) // Include both C files
+        // .flag("/O2")
+        // .flag("/ftree-vectorize")
+        .include(includes) // Include the directory containing the headers
         .compile(library_name); // Compile into a static library
-
+    } else {
+        cc::Build::new()
+        .files(files) // Include both C files
+        .flag_if_supported("-O3")
+        .flag_if_supported("-ftree-vectorize")
+        .flag_if_supported("-Wall")
+        .flag("-O2")
+        // .flag("-ftree-vectorize")
+        .include(includes) // Include the directory containing the headers
+        .compile(library_name); // Compile into a static library
+    }
+    
     let library_path = env!("CARGO_MANIFEST_DIR");
     // Print the library path
     println!("XXXXXXXXXXXXXXXXXXXXX Library Path:");
@@ -25,6 +33,8 @@ fn main() {
     // // Link the C library
     println!("cargo:rustc-link-lib=static={}", library_name);
     println!("cargo:rustc-link-search={}", library_path);
+    println!("cargo:rerun-if-changed=build.rs");
+
 
     // Build the C library using make or cmake
     // #[cfg(target_os = "macos")]
