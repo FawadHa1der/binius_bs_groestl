@@ -97,7 +97,7 @@ fn bench_groestl_long_data(c: &mut Criterion) {
     group.bench_function("Groestl256-nonbitsliced", |bench| {
         bench.iter(|| {
             testinput
-                .par_chunks_exact(16) // comes out to 16 in this instance, covert to chunks_exact instead of par_chunks_exact for sequential comparison 
+                .chunks_exact(16) // comes out to 16 in this instance, covert to chunks_exact instead of par_chunks_exact for sequential comparison 
                 .enumerate()
                 .map(|(index, chunk)| {
                     let chunk_bytes = packed_to_bytes(chunk);
