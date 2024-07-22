@@ -1,8 +1,11 @@
 // Copyright 2024 Ulvetanna Inc.
 use binius_field::{
-	BinaryField32b, PackedAESBinaryField32x8b, PackedBinaryField32x8b, PackedField,
+	AESTowerField32b, BinaryField32b, PackedAESBinaryField32x8b, PackedBinaryField32x8b,
+	PackedField,
 };
-use binius_hash::{FixedLenHasherDigest, Groestl256, HashDigest, HasherDigest, Vision32b};
+use binius_hash::{
+	FixedLenHasherDigest, Groestl256, HashDigest, HasherDigest, Vision32b, VisionHasher,
+};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use groestl_crypto::{Digest, Groestl256 as GenericGroestl256};
 use rand::{thread_rng, RngCore};

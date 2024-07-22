@@ -26,22 +26,20 @@ use binius_core::{
 	},
 	protocols::{
 		greedy_evalcheck::{self, GreedyEvalcheckProof, GreedyEvalcheckProveOutput},
-		zerocheck::{
-			self, ZerocheckBatchProof, ZerocheckBatchProveOutput, ZerocheckClaim, ZerocheckProver,
-		},
+		zerocheck::{self, ZerocheckBatchProof, ZerocheckBatchProveOutput, ZerocheckClaim},
 	},
 	witness::MultilinearExtensionIndex,
 };
 use binius_field::{
-	affine_transformation::{PackedTransformationFactory, Transformation},
 	arch::OptimalUnderlier128b,
 	as_packed_field::{PackScalar, PackedType},
+	linear_transformation::{PackedTransformationFactory, Transformation},
 	packed::set_packed_slice,
 	underlier::{UnderlierType, WithUnderlier},
 	AESTowerField128b, AESTowerField8b, BinaryField128b, BinaryField16b, BinaryField1b,
 	BinaryField8b, ExtensionField, Field, PackedAESBinaryField64x8b, PackedBinaryField16x8b,
 	PackedBinaryField1x128b, PackedField, PackedFieldIndexable, TowerField,
-	AES_TO_BINARY_AFFINE_TRANSFORMATION,
+	AES_TO_BINARY_LINEAR_TRANSFORMATION,
 };
 use binius_hash::{Groestl256Core, GroestlHasher};
 use binius_macros::composition_poly;
@@ -537,7 +535,7 @@ where
 	PW8b: PackedField<Scalar = AESTowerField8b> + PackedTransformationFactory<P8b>,
 {
 	let transform = <PW8b as PackedTransformationFactory<P8b>>::make_packed_transformation(
-		AES_TO_BINARY_AFFINE_TRANSFORMATION,
+		AES_TO_BINARY_LINEAR_TRANSFORMATION,
 	);
 
 	let values = poly
@@ -862,28 +860,21 @@ where
 	)?;
 
 	// Zerocheck
-	let zerocheck_domain =
-		domain_factory.create(zerocheck_claim.poly.max_individual_degree() + 1)?;
 	let switchover_fn = |extension_degree| match extension_degree {
 		128 => 5,
 		16 => 4,
 		_ => 1,
 	};
 
-	let zc_challenges = challenger.sample_vec(zerocheck_witness.n_vars() - 1);
-
-	let zerocheck_prover = ZerocheckProver::new(
-		&zerocheck_domain,
-		zerocheck_claim,
-		zerocheck_witness,
-		&zc_challenges,
-		switchover_fn,
-	);
-
 	let ZerocheckBatchProveOutput {
 		evalcheck_claims,
 		proof: zerocheck_proof,
-	} = zerocheck::batch_prove(zerocheck_prover, &mut challenger)?;
+	} = zerocheck::batch_prove(
+		[(zerocheck_claim, zerocheck_witness)],
+		domain_factory.clone(),
+		switchover_fn,
+		&mut challenger,
+	)?;
 
 	// Evalcheck
 	let GreedyEvalcheckProveOutput {

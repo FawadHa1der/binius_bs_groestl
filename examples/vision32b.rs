@@ -20,26 +20,29 @@ use binius_core::{
 			multilinear_extension::MultilinearExtensionTransparent, step_down::StepDown,
 		},
 		CompositionPoly, Error as PolynomialError, EvaluationDomainFactory,
-		IsomorphicEvaluationDomainFactory, MultilinearComposite, MultilinearExtension,
+		IsomorphicEvaluationDomainFactory, MultilinearComposite,
 	},
 	protocols::{
 		greedy_evalcheck::{self, GreedyEvalcheckProof, GreedyEvalcheckProveOutput},
-		zerocheck::{
-			self, ZerocheckBatchProof, ZerocheckBatchProveOutput, ZerocheckClaim, ZerocheckProver,
-		},
+		zerocheck::{self, ZerocheckBatchProof, ZerocheckBatchProveOutput, ZerocheckClaim},
 	},
-	witness::MultilinearWitnessIndex,
+	witness::MultilinearExtensionIndex,
 };
 use binius_field::{
-	affine_transformation::Transformation,
 	arithmetic_traits::{InvertOrZero, Square},
+	as_packed_field::{PackScalar, PackedType},
+	linear_transformation::Transformation,
+	make_aes_to_binary_packed_transformer,
 	packed::get_packed_slice,
-	underlier::WithUnderlier,
-	BinaryField128b, BinaryField32b, BinaryField8b, ExtensionField, Field, PackedBinaryField1x128b,
-	PackedBinaryField4x32b, PackedBinaryField8x32b, PackedField, PackedFieldIndexable, TowerField,
+	underlier::{UnderlierType, WithUnderlier},
+	AESTowerField32b, BinaryField128b, BinaryField32b, BinaryField8b, ExtensionField, Field,
+	PackedAESBinaryField8x32b, PackedBinaryField1x128b, PackedBinaryField8x32b, PackedField,
+	PackedFieldIndexable, TowerField,
 };
-use binius_hash::{GroestlHasher, Vision32bMDS, Vision32bPermutation, INV_PACKED_TRANS};
-use binius_macros::{composition_poly, IterOracles, IterPolys};
+use binius_hash::{
+	GroestlHasher, Vision32MDSTransform, Vision32bPermutation, INV_PACKED_TRANS_AES,
+};
+use binius_macros::{composition_poly, IterOracles};
 use binius_utils::{
 	examples::get_log_trace_size, rayon::adjust_thread_pool, tracing::init_tracing,
 };
@@ -304,20 +307,20 @@ struct TraceOracle {
 	// Public columns
 	state_in: [OracleId; 24],      // Committed
 	round_begin: [OracleId; 24],   // Virtual
-	inv_0: [OracleId; 24],         // Commited
-	prod_0: [OracleId; 24],        // Commited
-	s_box_out_0: [OracleId; 24],   // Commited
-	s_box_pow2_0: [OracleId; 24],  // Commited
-	s_box_pow4_0: [OracleId; 24],  // Commited
+	inv_0: [OracleId; 24],         // Committed
+	prod_0: [OracleId; 24],        // Committed
+	s_box_out_0: [OracleId; 24],   // Committed
+	s_box_pow2_0: [OracleId; 24],  // Committed
+	s_box_pow4_0: [OracleId; 24],  // Committed
 	mds_out_0: [OracleId; 24],     // Virtual
-	round_out_0: [OracleId; 24],   // Commited
-	inv_1: [OracleId; 24],         // Commited
-	prod_1: [OracleId; 24],        // Commited
-	inv_pow2_1: [OracleId; 24],    // Commited
-	inv_pow4_1: [OracleId; 24],    // Commited
+	round_out_0: [OracleId; 24],   // Virtual
+	inv_1: [OracleId; 24],         // Committed
+	prod_1: [OracleId; 24],        // Committed
+	inv_pow2_1: [OracleId; 24],    // Committed
+	inv_pow4_1: [OracleId; 24],    // Committed
 	s_box_out_1: [OracleId; 24],   // Virtual
 	mds_out_1: [OracleId; 24],     // Virtual
-	state_out: [OracleId; 24],     // Commited
+	state_out: [OracleId; 24],     // Committed
 	next_state_in: [OracleId; 24], // Virtual
 
 	// Batch IDs
@@ -386,7 +389,6 @@ impl TraceOracle {
 		let s_box_out_0 = batch_scope.add_multiple::<24>();
 		let s_box_pow2_0 = batch_scope.add_multiple::<24>();
 		let s_box_pow4_0 = batch_scope.add_multiple::<24>();
-		let round_out_0 = batch_scope.add_multiple::<24>();
 		let inv_1 = batch_scope.add_multiple::<24>();
 		let prod_1 = batch_scope.add_multiple::<24>();
 		let inv_pow2_1 = batch_scope.add_multiple::<24>();
@@ -438,6 +440,15 @@ impl TraceOracle {
 				.unwrap()
 		});
 
+		let round_out_0 = array::from_fn(|row| {
+			oracles
+				.add_linear_combination(
+					log_size,
+					[(mds_out_0[row], F::ONE), (even_round_consts[row], F::ONE)],
+				)
+				.unwrap()
+		});
+
 		let next_state_in = state_in.map(|state_in_xy| {
 			oracles
 				.add_shifted(state_in_xy, 1, 3, ShiftVariant::LogicalRight)
@@ -471,69 +482,88 @@ impl TraceOracle {
 	}
 }
 
-#[derive(Debug, IterPolys)]
-struct TraceWitness<P32b: PackedField> {
-	even_round_consts: [Vec<P32b>; 24],
-	odd_round_consts: [Vec<P32b>; 24],
-	round_0_constant: [Vec<P32b>; 24],
-	round_selector: Vec<P32b>,
-	state_in: [Vec<P32b>; 24],      // Committed
-	round_begin: [Vec<P32b>; 24],   // Virtual
-	inv_0: [Vec<P32b>; 24],         // Commited
-	prod_0: [Vec<P32b>; 24],        // Commited
-	s_box_out_0: [Vec<P32b>; 24],   // Commited
-	s_box_pow2_0: [Vec<P32b>; 24],  // Commited
-	s_box_pow4_0: [Vec<P32b>; 24],  // Commited
-	mds_out_0: [Vec<P32b>; 24],     // Virtual
-	round_out_0: [Vec<P32b>; 24],   // Commited
-	inv_1: [Vec<P32b>; 24],         // Commited
-	prod_1: [Vec<P32b>; 24],        // Commited
-	inv_pow2_1: [Vec<P32b>; 24],    // Commited
-	inv_pow4_1: [Vec<P32b>; 24],    // Commited
-	s_box_out_1: [Vec<P32b>; 24],   // Virtual
-	mds_out_1: [Vec<P32b>; 24],     // Virtual
-	state_out: [Vec<P32b>; 24],     // Commited
-	next_state_in: [Vec<P32b>; 24], // Virtual
-}
-
-impl<P32b: PackedField> TraceWitness<P32b> {
-	fn to_index<F>(&self, trace_oracle: &TraceOracle) -> MultilinearWitnessIndex<F>
-	where
-		F: ExtensionField<P32b::Scalar>,
-	{
-		let mut index = MultilinearWitnessIndex::new();
-		for (oracle, witness) in trace_oracle.iter_oracles().zip(self.iter_polys()) {
-			index.set(oracle, witness.specialize_arc_dyn());
-		}
-		index
-	}
-
-	fn commit_polys(&self) -> impl Iterator<Item = MultilinearExtension<P32b, &[P32b]>> {
-		chain!(
-			self.state_in.iter(),
-			self.inv_0.iter(),
-			self.prod_0.iter(),
-			self.s_box_out_0.iter(),
-			self.s_box_pow2_0.iter(),
-			self.s_box_pow4_0.iter(),
-			self.round_out_0.iter(),
-			self.inv_1.iter(),
-			self.prod_1.iter(),
-			self.inv_pow2_1.iter(),
-			self.inv_pow4_1.iter(),
-			self.state_out.iter()
-		)
-		.map(|values| MultilinearExtension::from_values_slice(values.as_slice()).unwrap())
-	}
-}
-
-impl<P32b> TraceWitness<P32b>
+#[derive(Debug)]
+struct TraceWitness<U, F32b>
 where
-	P32b: PackedFieldIndexable<Scalar = BinaryField32b> + Pod,
+	U: UnderlierType + PackScalar<F32b>,
+	F32b: Field,
+{
+	even_round_consts: [Vec<PackedType<U, F32b>>; 24],
+	odd_round_consts: [Vec<PackedType<U, F32b>>; 24],
+	round_0_constant: [Vec<PackedType<U, F32b>>; 24],
+	round_selector: Vec<PackedType<U, F32b>>,
+	state_in: [Vec<PackedType<U, F32b>>; 24],      // Committed
+	round_begin: [Vec<PackedType<U, F32b>>; 24],   // Virtual
+	inv_0: [Vec<PackedType<U, F32b>>; 24],         // Committed
+	prod_0: [Vec<PackedType<U, F32b>>; 24],        // Committed
+	s_box_out_0: [Vec<PackedType<U, F32b>>; 24],   // Committed
+	s_box_pow2_0: [Vec<PackedType<U, F32b>>; 24],  // Committed
+	s_box_pow4_0: [Vec<PackedType<U, F32b>>; 24],  // Committed
+	mds_out_0: [Vec<PackedType<U, F32b>>; 24],     // Virtual
+	round_out_0: [Vec<PackedType<U, F32b>>; 24],   // Virtual
+	inv_1: [Vec<PackedType<U, F32b>>; 24],         // Committed
+	prod_1: [Vec<PackedType<U, F32b>>; 24],        // Committed
+	inv_pow2_1: [Vec<PackedType<U, F32b>>; 24],    // Committed
+	inv_pow4_1: [Vec<PackedType<U, F32b>>; 24],    // Committed
+	s_box_out_1: [Vec<PackedType<U, F32b>>; 24],   // Virtual
+	mds_out_1: [Vec<PackedType<U, F32b>>; 24],     // Virtual
+	state_out: [Vec<PackedType<U, F32b>>; 24],     // Committed
+	next_state_in: [Vec<PackedType<U, F32b>>; 24], // Virtual
+}
+
+impl<U> TraceWitness<U, BinaryField32b>
+where
+	U: UnderlierType + PackScalar<BinaryField32b>,
+{
+	fn to_index<F>(&self, trace_oracle: &TraceOracle) -> Result<MultilinearExtensionIndex<U, F>>
+	where
+		U: PackScalar<F>,
+		F: ExtensionField<BinaryField32b>,
+	{
+		let index = MultilinearExtensionIndex::new().update_packed(iter::zip(
+			trace_oracle.iter_oracles(),
+			chain!(
+				self.even_round_consts.each_ref(),
+				self.odd_round_consts.each_ref(),
+				self.round_0_constant.each_ref(),
+				iter::once(&self.round_selector),
+				self.state_in.each_ref(),
+				self.round_begin.each_ref(),
+				self.inv_0.each_ref(),
+				self.prod_0.each_ref(),
+				self.s_box_out_0.each_ref(),
+				self.s_box_pow2_0.each_ref(),
+				self.s_box_pow4_0.each_ref(),
+				self.mds_out_0.each_ref(),
+				self.round_out_0.each_ref(),
+				self.inv_1.each_ref(),
+				self.prod_1.each_ref(),
+				self.inv_pow2_1.each_ref(),
+				self.inv_pow4_1.each_ref(),
+				self.s_box_out_1.each_ref(),
+				self.mds_out_1.each_ref(),
+				self.state_out.each_ref(),
+				self.next_state_in.each_ref(),
+			)
+			.map(Vec::as_slice),
+		))?;
+		Ok(index)
+	}
+}
+
+impl<U> TraceWitness<U, BinaryField32b>
+where
+	U: UnderlierType + PackScalar<BinaryField32b>,
+	PackedType<U, BinaryField32b>: PackedFieldIndexable + Pod,
 {
 	#[instrument]
-	fn generate_trace(log_size: usize) -> TraceWitness<P32b> {
-		let build_trace_column = || vec![P32b::default(); 1 << (log_size - P32b::LOG_WIDTH)];
+	fn generate_trace(log_size: usize) -> TraceWitness<U, BinaryField32b> {
+		let build_trace_column = || {
+			vec![
+				<PackedType<U, BinaryField32b>>::default();
+				1 << (log_size - <PackedType<U, BinaryField32b>>::LOG_WIDTH)
+			]
+		};
 		let mut witness = TraceWitness {
 			even_round_consts: array::from_fn(|_| build_trace_column()),
 			odd_round_consts: array::from_fn(|_| build_trace_column()),
@@ -590,11 +620,15 @@ where
 		// Helper structs
 		let mut rng = thread_rng();
 		let vision_instance = Vision32bPermutation::default();
-		let mds_trans = Vision32bMDS::default();
+		let mds_trans = Vision32MDSTransform::default();
 		let inv_const_packed = PackedBinaryField8x32b::broadcast(SBOX_INV_CONST);
 		let sbox_fwd_const_packed = PackedBinaryField8x32b::broadcast(SBOX_FWD_CONST);
 		let sbox_trans_packed: [PackedBinaryField8x32b; 3] =
 			array::from_fn(|i| PackedBinaryField8x32b::broadcast(SBOX_FWD_TRANS[i]));
+		let aes_to_bin_packed = make_aes_to_binary_packed_transformer::<
+			PackedAESBinaryField8x32b,
+			PackedBinaryField8x32b,
+		>();
 
 		// Each permutation is 8 round states
 		for perm_i in 0..1 << (log_size - LOG_COMPRESSION_BLOCK) {
@@ -632,10 +666,11 @@ where
 					odd_round_consts[j][i] = BinaryField32b::new(VISION_RC_ODD[j][round_i]);
 				}
 				let sbox_out_packed: [PackedBinaryField8x32b; 3] = array::from_fn(|arr_idx| {
-					let inp = PackedBinaryField8x32b::from_fn(|pack_idx| {
-						x_inverses[pack_idx + arr_idx * 8]
+					let inp = PackedAESBinaryField8x32b::from_fn(|pack_idx| {
+						AESTowerField32b::from(x_inverses[pack_idx + arr_idx * 8])
 					});
-					INV_PACKED_TRANS.transform(&inp) + inv_const_packed
+					aes_to_bin_packed.transform(&INV_PACKED_TRANS_AES.transform(&inp))
+						+ inv_const_packed
 				});
 				for j in 0..24 {
 					let sbox_out: BinaryField32b = get_packed_slice(&sbox_out_packed, j);
@@ -645,12 +680,16 @@ where
 					s_box_pow2_0[j][i] = sbox_pow2;
 					s_box_pow4_0[j][i] = sbox_pow4;
 				}
-				let mut inp_as_packed: [PackedBinaryField8x32b; 3] = array::from_fn(|arr_idx| {
-					PackedBinaryField8x32b::from_fn(|pack_idx| {
-						s_box_out_0[pack_idx + arr_idx * 8][i]
-					})
+				let mut inp_as_packed_aes: [PackedAESBinaryField8x32b; 3] =
+					array::from_fn(|arr_idx| {
+						PackedAESBinaryField8x32b::from_fn(|pack_idx| {
+							AESTowerField32b::from(s_box_out_0[pack_idx + arr_idx * 8][i])
+						})
+					});
+				mds_trans.transform(&mut inp_as_packed_aes);
+				let inp_as_packed: [PackedBinaryField8x32b; 3] = array::from_fn(|arr_idx| {
+					aes_to_bin_packed.transform(&inp_as_packed_aes[arr_idx])
 				});
-				mds_trans.transform(&mut inp_as_packed);
 				for j in 0..24 {
 					let mds_out = get_packed_slice(&inp_as_packed, j);
 					mds_out_0[j][i] = mds_out;
@@ -683,12 +722,16 @@ where
 					s_box_out_1[j][i] = get_packed_slice(&sbox_out, j);
 				}
 
-				let mut inp_as_packed: [PackedBinaryField8x32b; 3] = array::from_fn(|arr_idx| {
-					PackedBinaryField8x32b::from_fn(|pack_idx| {
-						s_box_out_1[pack_idx + arr_idx * 8][i]
-					})
+				let mut inp_as_packed_aes: [PackedAESBinaryField8x32b; 3] =
+					array::from_fn(|arr_idx| {
+						PackedAESBinaryField8x32b::from_fn(|pack_idx| {
+							AESTowerField32b::from(s_box_out_1[pack_idx + arr_idx * 8][i])
+						})
+					});
+				mds_trans.transform(&mut inp_as_packed_aes);
+				let inp_as_packed: [PackedBinaryField8x32b; 3] = array::from_fn(|arr_idx| {
+					aes_to_bin_packed.transform(&inp_as_packed_aes[arr_idx])
 				});
-				mds_trans.transform(&mut inp_as_packed);
 				for j in 0..24 {
 					mds_out_1[j][i] = get_packed_slice(&inp_as_packed, j);
 				}
@@ -720,13 +763,13 @@ where
 	}
 }
 
-fn make_constraints<F32b, FW>(
+fn make_constraints<F32b, PW>(
 	trace_oracle: &TraceOracle,
-	challenge: FW,
-) -> Result<impl CompositionPoly<FW>>
+	challenge: PW::Scalar,
+) -> Result<impl CompositionPoly<PW>>
 where
 	F32b: TowerField + From<BinaryField32b>,
-	FW: TowerField + ExtensionField<F32b>,
+	PW: PackedField<Scalar: TowerField + ExtensionField<F32b>>,
 {
 	let zerocheck_column_ids = trace_oracle.iter_oracles().collect::<Vec<_>>();
 
@@ -855,19 +898,6 @@ where
 		.unwrap()
 	}))?;
 
-	// Round constants check.
-	let mix = mix.include((0..24).map(|x| {
-		index_composition(
-			&zerocheck_column_ids,
-			[
-				trace_oracle.mds_out_0[x],
-				trace_oracle.round_out_0[x],
-				trace_oracle.even_round_consts[x],
-			],
-			SumComposition { n_vars: 3 },
-		)
-		.unwrap()
-	}))?;
 	let mix = mix.include((0..24).map(|x| {
 		index_composition(
 			&zerocheck_column_ids,
@@ -905,26 +935,37 @@ struct Proof<F: Field, PCSComm, PCSProof> {
 }
 
 #[instrument(skip_all)]
-fn prove<F, FW, P32b, PCS, Comm, Challenger>(
+fn prove<U, F, FW, PCS, Comm, Challenger>(
 	oracles: &mut MultilinearOracleSet<F>,
 	trace_oracle: &TraceOracle,
 	pcs: &PCS,
 	mut challenger: Challenger,
-	witness: &TraceWitness<P32b>,
-	domain_factory: impl EvaluationDomainFactory<BinaryField32b>,
+	witness: &TraceWitness<U, BinaryField32b>,
+	domain_factory: impl EvaluationDomainFactory<BinaryField8b>,
 ) -> Result<Proof<F, Comm, PCS::Proof>>
 where
+	U: UnderlierType + PackScalar<BinaryField32b> + PackScalar<FW>,
 	F: TowerField + ExtensionField<BinaryField32b> + From<FW>,
-	FW: TowerField + ExtensionField<BinaryField32b> + From<F>,
-	P32b: PackedField<Scalar = BinaryField32b>,
-	PCS: PolyCommitScheme<P32b, F, Error: Debug, Proof: 'static, Commitment = Comm>,
+	FW: TowerField + ExtensionField<BinaryField32b> + From<F> + ExtensionField<BinaryField8b>,
+	PackedType<U, FW>: PackedFieldIndexable,
+	PCS: PolyCommitScheme<
+		PackedType<U, BinaryField32b>,
+		F,
+		Error: Debug,
+		Proof: 'static,
+		Commitment = Comm,
+	>,
 	Comm: Clone,
 	Challenger: CanObserve<F> + CanObserve<Comm> + CanSample<F> + CanSampleBits<usize>,
 {
-	let mut trace_witness = witness.to_index::<FW>(trace_oracle);
+	let ext_index = witness.to_index::<FW>(trace_oracle)?;
+	let mut trace_witness = ext_index.witness_index();
 
 	// Round 1
-	let trace_commit_polys = witness.commit_polys().collect::<Vec<_>>();
+	let trace_commit_polys = oracles
+		.committed_oracle_ids(trace_oracle.trace_batch_id)
+		.map(|oracle_id| ext_index.get::<BinaryField32b>(oracle_id))
+		.collect::<Result<Vec<_>, _>>()?;
 	let (trace_comm, trace_committed) = pcs.commit(&trace_commit_polys)?;
 	challenger.observe(trace_comm.clone());
 
@@ -956,38 +997,30 @@ where
 	let zerocheck_witness = MultilinearComposite::new(
 		zerocheck_claim.n_vars(),
 		mix_composition_prover,
-		witness
-			.iter_polys()
-			.map(|v| v.specialize_arc_dyn::<FW>())
-			.collect(),
+		trace_oracle
+			.iter_oracles()
+			.map(|oracle_id| ext_index.get_multilin_poly(oracle_id))
+			.collect::<Result<Vec<_>, _>>()?,
 	)?;
 
 	// Zerocheck
-	let zerocheck_domain =
-		domain_factory.create(zerocheck_claim.poly.max_individual_degree() + 1)?;
-
 	let switchover_fn = |_| 1;
-
-	let zc_challenges = challenger.sample_vec(zerocheck_witness.n_vars() - 1);
-
-	let zerocheck_prover = ZerocheckProver::new(
-		&zerocheck_domain,
-		zerocheck_claim,
-		zerocheck_witness,
-		&zc_challenges,
-		switchover_fn,
-	);
 
 	let ZerocheckBatchProveOutput {
 		evalcheck_claims,
 		proof: zerocheck_proof,
-	} = zerocheck::batch_prove(zerocheck_prover, &mut challenger)?;
+	} = zerocheck::batch_prove(
+		[(zerocheck_claim, zerocheck_witness)],
+		domain_factory.clone(),
+		switchover_fn,
+		&mut challenger,
+	)?;
 
 	// Evalcheck
 	let GreedyEvalcheckProveOutput {
 		same_query_claims,
 		proof: evalcheck_proof,
-	} = greedy_evalcheck::prove::<_, _, BinaryField32b, _>(
+	} = greedy_evalcheck::prove::<_, _, _, _>(
 		oracles,
 		&mut trace_witness,
 		evalcheck_claims,
@@ -1090,12 +1123,13 @@ fn main() {
 
 	let mut oracles = MultilinearOracleSet::<BinaryField128b>::new();
 	let trace_oracle = TraceOracle::new(&mut oracles, log_size).unwrap();
+	type U = <PackedBinaryField1x128b as WithUnderlier>::Underlier;
 
 	const SECURITY_BITS: usize = 100;
 	let log_inv_rate = 1;
 	let trace_batch = oracles.committed_batch(trace_oracle.trace_batch_id);
 	let pcs = tensor_pcs::find_proof_size_optimal_pcs::<
-		<PackedBinaryField1x128b as WithUnderlier>::Underlier,
+		U,
 		BinaryField32b,
 		BinaryField32b,
 		BinaryField32b,
@@ -1114,10 +1148,10 @@ fn main() {
 	tracing::info!("Size of PCS opening proof: {}", tensorpcs_size);
 
 	let challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
-	let witness = TraceWitness::<PackedBinaryField4x32b>::generate_trace(log_size);
-	let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField32b>::default();
+	let witness = TraceWitness::<U, _>::generate_trace(log_size);
+	let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField8b>::default();
 
-	let proof = prove::<_, BinaryField128b, _, _, _, _>(
+	let proof = prove::<U, _, BinaryField128b, _, _, _>(
 		&mut oracles,
 		&trace_oracle,
 		&pcs,
