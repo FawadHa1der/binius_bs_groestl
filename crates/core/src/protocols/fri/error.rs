@@ -4,12 +4,14 @@ use binius_ntt::Error as NttError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+	#[error("cannot calculate parameters satisfying the security target")]
+	ParameterError,
 	#[error("conflicting or incorrect constructor argument: {0}")]
 	InvalidArgs(String),
 	#[error("FRI does not support messages with dimension 1")]
 	MessageDimensionIsOne,
-	#[error("attempted to fold more than maximum of {max_rounds} times")]
-	TooManyRoundExecutions { max_rounds: usize },
+	#[error("attempted to fold more than maximum of {max_folds} times")]
+	TooManyFoldExecutions { max_folds: usize },
 	#[error("attempted to finish prover before executing all fold rounds")]
 	EarlyProverFinish,
 	#[error("Reed-Solomon encoding error: {0}")]
@@ -22,8 +24,8 @@ pub enum Error {
 
 #[derive(Debug, thiserror::Error)]
 pub enum VerificationError {
-	#[error("incorrect codeword folding in round {round} at index {index}")]
-	IncorrectFold { round: usize, index: usize },
+	#[error("incorrect codeword folding in query round {query_round} at index {index}")]
+	IncorrectFold { query_round: usize, index: usize },
 	#[error("the size of the query proof is incorrect, expected {expected}")]
 	IncorrectQueryProofLength { expected: usize },
 	#[error("the number of values in round {round} of the query proof is incorrect, expected {coset_size}")]

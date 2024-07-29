@@ -1,15 +1,54 @@
 // Copyright 2024 Ulvetanna Inc.
 
-use super::error::Error;
+use super::{common::FinalMessage, error::Error};
 use crate::{
 	linear_code::{LinearCode, LinearCodeWithExtensionEncoding},
 	merkle_tree::VectorCommitScheme,
-	protocols::fri::common::{fold_pair, QueryProof, QueryRoundProof},
+	protocols::fri::common::{fold_chunk, QueryProof, QueryRoundProof},
 	reed_solomon::reed_solomon::ReedSolomonCode,
 };
 use binius_field::{BinaryField, ExtensionField, PackedExtension, PackedFieldIndexable};
 use rayon::prelude::*;
 use std::iter;
+
+fn fold_codeword<F, FS>(
+	rs_code: &ReedSolomonCode<FS>,
+	codeword: &[F],
+	round: usize,
+	folding_challenges: &[F],
+) -> Vec<F>
+where
+	F: BinaryField + ExtensionField<FS>,
+	FS: BinaryField,
+{
+	// Preconditions
+	assert!(codeword.len() % (1 << folding_challenges.len()) == 0);
+	assert!(round + 1 >= folding_challenges.len());
+	assert!(round < rs_code.log_dim());
+	assert!(!folding_challenges.is_empty());
+
+	let start_round = round + 1 - folding_challenges.len();
+	let chunk_size = 1 << folding_challenges.len();
+
+	// For each chunk of size 2^folding_challenges.len() in the codeword, fold it with the folding challenges
+	codeword
+		.par_chunks(chunk_size)
+		.enumerate()
+		.map_init(
+			|| vec![F::default(); chunk_size],
+			|scratch_buffer, (chunk_index, chunk)| {
+				fold_chunk(
+					rs_code,
+					start_round,
+					chunk_index,
+					chunk,
+					folding_challenges,
+					scratch_buffer,
+				)
+			},
+		)
+		.collect()
+}
 
 #[derive(Debug)]
 pub struct CommitOutput<P, VCSCommitment, VCSCommitted> {
@@ -55,6 +94,11 @@ where
 	})
 }
 
+pub enum FoldRoundOutput<VCSCommitment> {
+	NoCommitment,
+	Commitment(VCSCommitment),
+}
+
 /// A stateful prover for the FRI fold phase.
 pub struct FRIFolder<'a, F, FA, VCS>
 where
@@ -68,6 +112,9 @@ where
 	round_vcss: &'a [VCS],
 	codeword_committed: &'a VCS::Committed,
 	round_committed: Vec<(Vec<F>, VCS::Committed)>,
+	folding_arity: usize,
+	curr_round: usize,
+	unprocessed_challenges: Vec<F>,
 }
 
 impl<'a, F, FA, VCS> FRIFolder<'a, F, FA, VCS>
@@ -84,6 +131,7 @@ where
 		codeword_vcs: &'a VCS,
 		round_vcss: &'a [VCS],
 		committed: &'a VCS::Committed,
+		folding_arity: usize,
 	) -> Result<Self, Error> {
 		if rs_code.len() != codeword_vcs.vector_len() {
 			return Err(Error::InvalidArgs(
@@ -101,19 +149,29 @@ where
 		if rs_code.log_dim() == 0 {
 			return Err(Error::MessageDimensionIsOne);
 		}
-		if round_vcss.len() != rs_code.log_dim() - 1 {
+		let n_rounds = rs_code.log_dim();
+		// TODO: Relax this condition when Early FRI Termination
+		if n_rounds % folding_arity != 0 {
+			return Err(Error::InvalidArgs(format!(
+				"Reed–Solomon code dimension {} must be a multiple of the folding arity {}",
+				n_rounds, folding_arity
+			)));
+		}
+		let n_round_commitments = (n_rounds / folding_arity) - 1;
+		if round_vcss.len() != n_round_commitments {
 			return Err(Error::InvalidArgs(format!(
 				"got {} round vector commitment schemes, expected {}",
 				round_vcss.len(),
-				rs_code.log_dim() - 1
+				n_round_commitments,
 			)));
 		}
 
 		for (round, round_vcs) in round_vcss.iter().enumerate() {
-			if round_vcs.vector_len() != 1 << (rs_code.log_len() - round - 1) {
+			let expected_folded_dimension = rs_code.log_len() - (round + 1) * folding_arity;
+			if round_vcs.vector_len() != 1 << expected_folded_dimension {
 				return Err(Error::InvalidArgs(format!(
 					"round {round} vector commitment length is incorrect, expected {}",
-					1 << (rs_code.log_len() - round - 1)
+					1 << expected_folded_dimension
 				)));
 			}
 		}
@@ -125,6 +183,9 @@ where
 			round_vcss,
 			codeword_committed: committed,
 			round_committed: Vec::with_capacity(round_vcss.len()),
+			folding_arity,
+			curr_round: 0,
+			unprocessed_challenges: Vec::with_capacity(folding_arity),
 		})
 	}
 
@@ -133,70 +194,103 @@ where
 		self.rs_code.log_dim()
 	}
 
-	/// Number of times `execute_fold_round` has been called.
-	pub fn round(&self) -> usize {
-		self.round_committed.len()
+	/// Number of times `execute_fold_round` has been called
+	pub fn curr_round(&self) -> usize {
+		self.curr_round
+	}
+
+	fn prev_codeword(&self) -> &[F] {
+		self.round_committed
+			.last()
+			.map(|(codeword, _)| codeword.as_slice())
+			.unwrap_or(self.codeword)
+	}
+
+	fn is_commitment_round(&self) -> bool {
+		(self.curr_round + 1) % self.folding_arity == 0 && self.curr_round != self.n_rounds() - 1
 	}
 
 	/// Executes the next fold round and returns the folded codeword commitment.
-	pub fn execute_fold_round(&mut self, challenge: F) -> Result<VCS::Commitment, Error> {
-		let round_vcs =
-			self.round_vcss
-				.get(self.round())
-				.ok_or_else(|| Error::TooManyRoundExecutions {
-					max_rounds: self.n_rounds() - 1,
-				})?;
+	///
+	/// As a memory efficient optimization, this method may not actually do the folding, but instead accumulate the
+	/// folding challenge for processing at a later time. This saves us from storing intermediate folded codewords.
+	pub fn execute_fold_round(
+		&mut self,
+		challenge: F,
+	) -> Result<FoldRoundOutput<VCS::Commitment>, Error> {
+		self.unprocessed_challenges.push(challenge);
+		if !self.is_commitment_round() {
+			self.curr_round += 1;
+			return Ok(FoldRoundOutput::NoCommitment);
+		}
 
-		let last_codeword = self
-			.round_committed
-			.last()
-			.map(|(codeword, _)| codeword.as_slice())
-			.unwrap_or(self.codeword);
+		// Fold the last codeword with the accumulated folding challenges.
+		let folded_codeword = fold_codeword(
+			self.rs_code,
+			self.prev_codeword(),
+			self.curr_round,
+			&self.unprocessed_challenges,
+		);
+		self.unprocessed_challenges.clear();
 
-		let folded = last_codeword
-			.par_chunks(2)
-			.enumerate()
-			.map(|(coset_index, coset_values)| {
-				fold_pair(
-					self.rs_code,
-					self.round(),
-					coset_index,
-					(coset_values[0], coset_values[1]),
-					challenge,
-				)
-			})
-			.collect::<Vec<_>>();
+		let round_vcs = self
+			.round_vcss
+			.get(self.round_committed.len())
+			.ok_or_else(|| Error::TooManyFoldExecutions {
+				max_folds: self.round_vcss.len() - 1,
+			})?;
 
 		let (commitment, committed) = round_vcs
-			.commit_batch(&[&folded])
+			.commit_batch(&[&folded_codeword])
 			.map_err(|err| Error::VectorCommit(Box::new(err)))?;
+		self.round_committed.push((folded_codeword, committed));
 
-		self.round_committed.push((folded, committed));
-
-		Ok(commitment)
+		self.curr_round += 1;
+		Ok(FoldRoundOutput::Commitment(commitment))
 	}
 
-	/// Finishes the FRI folding process, folding with the final challenge.
+	/// Finalizes the FRI folding process.
+	///
+	/// This step will process any unprocessed folding challenges to produce the
+	/// final folded codeword. Then it will decode this final folded codeword
+	/// to get the final message. The result is the final message and a query prover instance.
 	///
 	/// This returns the final message and a query prover instance.
-	pub fn finish(self, challenge: F) -> Result<(F, FRIQueryProver<'a, F, VCS>), Error> {
-		if self.round() != self.n_rounds() - 1 {
+	pub fn finalize(mut self) -> Result<(FinalMessage<F>, FRIQueryProver<'a, F, VCS>), Error> {
+		if self.curr_round != self.n_rounds() {
 			return Err(Error::EarlyProverFinish);
 		}
 
-		let last_codeword = self
-			.round_committed
-			.last()
-			.map(|(codeword, _)| codeword.as_slice())
-			.unwrap_or(self.codeword);
+		// TODO: This code will need to be generalized in early FRI termination and handle appropriate decoding.
+		const FINAL_MESSAGE_DIM: usize = 0;
 
-		let final_value = fold_pair(
-			self.rs_code,
-			self.round(),
-			0,
-			(last_codeword[0], last_codeword[1]),
-			challenge,
-		);
+		// NB: The idea behind the following is that we should do the minimal amount of work necessary to
+		// get the final message. Specifically, we do not need a final codeword with rate lower than 1.
+		let final_message = if self.unprocessed_challenges.is_empty() {
+			// In this case, final_codeword is interpreted as taking a prefix of the previous codeword and claiming
+			// this is a codeword for an RS code with rate 1 and dimension FINAL_MESSAGE_DIM.
+			let final_codeword = &self.prev_codeword()[..1 << FINAL_MESSAGE_DIM];
+			// We decode the final codeword to get the final message.
+			final_codeword[0]
+		} else {
+			// In this case, unfolded_codeword is interpreted as taking a prefix of the previous codeword and claiming
+			// this is a codeword for an RS code with dimension FINAL_MESSAGE_DIM + unprocessed_challenges.len()
+			// and rate 1.
+			let unfolded_codeword_len =
+				1 << (self.unprocessed_challenges.len() + FINAL_MESSAGE_DIM);
+			let unfolded_codeword = &self.prev_codeword()[..unfolded_codeword_len];
+			// We then fold this codeword with the unprocessed challenges to get a final codeword
+			// for an RS code with rate 1 and dimension FINAL_MESSAGE_DIM.
+			let final_codeword = fold_codeword(
+				self.rs_code,
+				unfolded_codeword,
+				self.curr_round - 1,
+				&self.unprocessed_challenges,
+			);
+			// We decode this final codeword to get the final message.
+			final_codeword[0]
+		};
+		self.unprocessed_challenges.clear();
 
 		let Self {
 			codeword,
@@ -213,8 +307,9 @@ where
 			round_vcss,
 			codeword_committed,
 			round_committed,
+			log_coset_size: self.folding_arity,
 		};
-		Ok((final_value, query_prover))
+		Ok((final_message, query_prover))
 	}
 }
 
@@ -225,6 +320,7 @@ pub struct FRIQueryProver<'a, F: BinaryField, VCS: VectorCommitScheme<F>> {
 	round_vcss: &'a [VCS],
 	codeword_committed: &'a VCS::Committed,
 	round_committed: Vec<(Vec<F>, VCS::Committed)>,
+	log_coset_size: usize,
 }
 
 impl<'a, F: BinaryField, VCS: VectorCommitScheme<F>> FRIQueryProver<'a, F, VCS> {
@@ -239,29 +335,27 @@ impl<'a, F: BinaryField, VCS: VectorCommitScheme<F>> FRIQueryProver<'a, F, VCS> 
 	///
 	/// * `index` - an index into the original codeword domain
 	pub fn prove_query(&self, index: usize) -> Result<QueryProof<F, VCS::Proof>, Error> {
-		const LOG_COSET_SIZE: usize = 1;
-
 		let mut round_proofs = Vec::with_capacity(self.n_rounds());
 
-		let mut coset_index = index >> LOG_COSET_SIZE;
+		let mut coset_index = index >> self.log_coset_size;
 		round_proofs.push(prove_coset_opening(
 			self.codeword_vcs,
 			self.codeword,
 			self.codeword_committed,
 			coset_index,
-			LOG_COSET_SIZE,
+			self.log_coset_size,
 		)?);
 
 		for (vcs, (codeword, committed)) in
 			iter::zip(self.round_vcss.iter(), self.round_committed.iter())
 		{
-			coset_index >>= LOG_COSET_SIZE;
+			coset_index >>= self.log_coset_size;
 			round_proofs.push(prove_coset_opening(
 				vcs,
 				codeword,
 				committed,
 				coset_index,
-				LOG_COSET_SIZE,
+				self.log_coset_size,
 			)?);
 		}
 
