@@ -1,13 +1,18 @@
 // Copyright 2024 Ulvetanna Inc.
 
 use super::Error;
-use crate::polynomial::{
-	Error as PolynomialError, MultilinearExtensionSpecialized, MultilinearPoly, MultilinearQuery,
+use crate::{
+	polynomial::{
+		Error as PolynomialError, MultilinearExtensionSpecialized, MultilinearPoly,
+		MultilinearQuery,
+	},
+	protocols::utils::deinterleave,
 };
-use binius_field::{Field, PackedField};
-use binius_utils::array_2d::Array2D;
+use binius_field::PackedField;
+use binius_hal::ComputationBackend;
+use binius_utils::{array_2d::Array2D, bail};
 use rayon::prelude::*;
-use std::{cmp::max, collections::HashMap, hash::Hash, ops::Range};
+use std::{cmp::max, collections::HashMap, hash::Hash};
 
 /// An individual multilinear polynomial in a multivariate composite.
 #[derive(Debug, Clone)]
@@ -29,22 +34,30 @@ where
 }
 
 /// Parallel fold state, consisting of scratch area and result accumulator.
-struct ParFoldStates<F: Field> {
+struct ParFoldStates<P: PackedField> {
 	// Evaluations at 0, 1 and domain points, per MLE. Scratch space.
-	evals_0: Array2D<F>,
-	evals_1: Array2D<F>,
-	evals_z: Array2D<F>,
+	evals_0: Array2D<P>,
+	evals_1: Array2D<P>,
+	evals_z: Array2D<P>,
+
+	// Interleaved subcube evals/inner products as returned by eval01.
+	// Double size compared to query (due to having 0 & 1 evals interleaved).
+	// Scratch space.
+	interleaved_evals: Vec<P>,
 
 	// Accumulated sums of evaluations over univariate domain.
-	round_evals: Array2D<F>,
+	round_evals: Array2D<P>,
 }
 
-impl<F: Field> ParFoldStates<F> {
-	fn new(n_multilinears: usize, n_round_evals: usize, n_states: usize) -> Self {
+impl<P: PackedField> ParFoldStates<P> {
+	fn new(n_multilinears: usize, n_round_evals: usize, subcube_vars: usize) -> Self {
+		let n_states = 1 << subcube_vars.saturating_sub(P::LOG_WIDTH);
+		let n_interleaved = 1 << (subcube_vars + 1).saturating_sub(P::LOG_WIDTH);
 		Self {
 			evals_0: Array2D::zeroes(n_states, n_multilinears),
 			evals_1: Array2D::zeroes(n_states, n_multilinears),
 			evals_z: Array2D::zeroes(n_states, n_multilinears),
+			interleaved_evals: vec![P::default(); n_interleaved],
 			round_evals: Array2D::zeroes(n_states, n_round_evals),
 		}
 	}
@@ -70,14 +83,18 @@ pub trait AbstractSumcheckEvaluator<P: PackedField>: Sync {
 	/// * `evals_z`: a scratch buffer of size n for storing multilinear polynomial evaluations at a
 	///              point z
 	/// * `round_evals`: the accumulated evaluations for the round
+	///
+	/// FIXME: this is incorrect - `process_vertex` when called on packed slices essentially processes
+	///        a subcube of size P::WIDTH while taking in a single vertex index and state. It accidentally
+	///        works on singleton fields. Not fixing due to in-progress move to sumcheck v2.
 	fn process_vertex(
 		&self,
 		i: usize,
 		vertex_state: Self::VertexState,
-		evals_0: &[P::Scalar],
-		evals_1: &[P::Scalar],
-		evals_z: &mut [P::Scalar],
-		round_evals: &mut [P::Scalar],
+		evals_0: &[P],
+		evals_1: &[P],
+		evals_z: &mut [P],
+		round_evals: &mut [P],
 	);
 
 	/// Given evaluations of the round polynomial, interpolate and return monomial coefficients
@@ -122,11 +139,12 @@ pub trait AbstractSumcheckEvaluator<P: PackedField>: Sync {
 ///     switchover rounds are numbered relative introduction round.
 ///
 /// [Gruen24]: https://eprint.iacr.org/2024/108
-pub struct CommonProversState<MultilinearId, PW, M>
+pub struct CommonProversState<MultilinearId, PW, M, Backend>
 where
 	MultilinearId: Hash + Eq + Sync,
 	PW: PackedField,
 	M: MultilinearPoly<PW> + Send + Sync,
+	Backend: ComputationBackend,
 {
 	n_vars: usize,
 	switchover_fn: Box<dyn Fn(usize) -> usize>,
@@ -134,15 +152,21 @@ where
 	multilinears: HashMap<MultilinearId, SumcheckMultilinear<PW, M>>,
 	max_query_vars: Option<usize>,
 	queries: Vec<Option<MultilinearQuery<PW>>>,
+	backend: Backend,
 }
 
-impl<MultilinearId, PW, M> CommonProversState<MultilinearId, PW, M>
+impl<MultilinearId, PW, M, Backend> CommonProversState<MultilinearId, PW, M, Backend>
 where
 	MultilinearId: Clone + Hash + Eq + Sync,
 	PW: PackedField,
 	M: MultilinearPoly<PW> + Sync + Send,
+	Backend: ComputationBackend,
 {
-	pub fn new(n_vars: usize, switchover_fn: impl Fn(usize) -> usize + 'static) -> Self {
+	pub fn new(
+		n_vars: usize,
+		switchover_fn: impl Fn(usize) -> usize + 'static,
+		backend: Backend,
+	) -> Self {
 		Self {
 			n_vars,
 			switchover_fn: Box::new(switchover_fn),
@@ -150,6 +174,7 @@ where
 			multilinears: HashMap::new(),
 			max_query_vars: None,
 			queries: Vec::new(),
+			backend,
 		}
 	}
 
@@ -164,11 +189,10 @@ where
 			self.max_query_vars = Some(max(self.max_query_vars.unwrap_or(1), switchover_round));
 
 			if introduction_round + multilinear.n_vars() != self.n_vars {
-				return Err(PolynomialError::IncorrectNumberOfVariables {
+				bail!(PolynomialError::IncorrectNumberOfVariables {
 					expected: self.n_vars - introduction_round,
 					actual: multilinear.n_vars(),
-				}
-				.into());
+				});
 			}
 
 			// TODO Consider bailing out on non-idempotent rewrites?
@@ -236,7 +260,7 @@ where
 
 		// Partial query for folding
 		let single_variable_partial_query =
-			MultilinearQuery::with_full_query(&[prev_rd_challenge])?;
+			MultilinearQuery::with_full_query(&[prev_rd_challenge], self.backend.clone())?;
 
 		// Perform switchover and/or folding
 		let any_transparent_left = multilinears
@@ -377,8 +401,14 @@ where
 				self.calculate_round_coeffs_helper(
 					multilinear_ids,
 					Self::only_transparent,
-					|multilin, indices, evals0, evals1, col| {
-						Self::subcube_inner_product(query, multilin, indices, evals0, evals1, col)
+					|multilin, subcube_vars, subcube_index, evals| {
+						Self::subcube_inner_product(
+							multilin,
+							query,
+							subcube_vars,
+							subcube_index,
+							evals,
+						)
 					},
 					evaluator,
 					vertex_state_iterator,
@@ -400,15 +430,14 @@ where
 			(_, _, Some((_, query))) => self.calculate_round_coeffs_helper(
 				multilinear_ids,
 				|x| x,
-				|sc_multilin, indices, evals0, evals1, col| match sc_multilin {
+				|sc_multilin, subcube_vars, subcube_index, evals| match sc_multilin {
 					SumcheckMultilinear::Transparent { multilinear, .. } => {
 						Self::subcube_inner_product(
-							query,
 							multilinear,
-							indices,
-							evals0,
-							evals1,
-							col,
+							query,
+							subcube_vars,
+							subcube_index,
+							evals,
 						)
 					}
 
@@ -416,10 +445,9 @@ where
 						large_field_folded_multilinear,
 					} => Self::direct_sample(
 						large_field_folded_multilinear,
-						indices,
-						evals0,
-						evals1,
-						col,
+						subcube_vars,
+						subcube_index,
+						evals,
 					),
 				},
 				evaluator,
@@ -440,8 +468,7 @@ where
 		&'b self,
 		multilinear_ids: &[MultilinearId],
 		precomp: impl Fn(&'b SumcheckMultilinear<PW, M>) -> T,
-		eval01: impl Fn(T, Range<usize>, &mut Array2D<PW::Scalar>, &mut Array2D<PW::Scalar>, usize)
-			+ Sync,
+		eval01: impl Fn(T, usize, usize, &mut [PW]) + Sync,
 		evaluator: impl AbstractSumcheckEvaluator<PW, VertexState = VS>,
 		vertex_state_iterator: impl IndexedParallelIterator<Item = VS>,
 		current_round_sum: PW::Scalar,
@@ -463,33 +490,41 @@ where
 			})
 			.collect::<Result<Vec<_>, _>>()?;
 
+		let n_vars = self.n_vars - self.next_round + 1;
 		let n_multilinears = precomps.len();
 		let n_round_evals = evaluator.n_round_evals();
 
-		/// Process batches of vertices in parallel, accumulating the round evaluations.
-		const BATCH_SIZE: usize = 64;
+		// Process batches of vertices in parallel, accumulating the round evaluations.
+		// OFF BY ONE BEWARE
+		const MAX_SUBCUBE_VARS: usize = 5;
+		let subcube_vars = MAX_SUBCUBE_VARS.min(n_vars) - 1;
 
 		let evals = vertex_state_iterator
-			.chunks(BATCH_SIZE)
+			.chunks(1 << subcube_vars.saturating_sub(PW::LOG_WIDTH))
 			.enumerate()
 			.fold(
-				|| ParFoldStates::new(n_multilinears, n_round_evals, BATCH_SIZE),
-				|mut par_fold_states, (vertex, vertex_states)| {
-					let begin = vertex * BATCH_SIZE;
-					let end = begin + vertex_states.len();
+				|| ParFoldStates::new(n_multilinears, n_round_evals, subcube_vars),
+				|mut par_fold_states, (subcube_index, vertex_states)| {
 					for (j, precomp) in precomps.iter().enumerate() {
 						eval01(
 							*precomp,
-							begin..end,
-							&mut par_fold_states.evals_0,
-							&mut par_fold_states.evals_1,
-							j,
+							subcube_vars + 1,
+							subcube_index,
+							&mut par_fold_states.interleaved_evals,
+						);
+
+						deinterleave(subcube_vars, &par_fold_states.interleaved_evals).for_each(
+							|(i, even, odd)| {
+								par_fold_states.evals_0[(i, j)] = even;
+								par_fold_states.evals_1[(i, j)] = odd;
+							},
 						);
 					}
 
+					let subcube_start = subcube_index * vertex_states.len();
 					for (k, vertex_state) in vertex_states.into_iter().enumerate() {
 						evaluator.process_vertex(
-							begin + k,
+							subcube_start + k,
 							vertex_state,
 							par_fold_states.evals_0.get_row(k),
 							par_fold_states.evals_1.get_row(k),
@@ -504,21 +539,24 @@ where
 			.map(|states| states.round_evals.sum_rows())
 			// Simply sum up the fold partitions.
 			.reduce(
-				|| vec![PW::Scalar::ZERO; n_round_evals],
+				|| vec![PW::zero(); n_round_evals],
 				|mut overall_round_evals, partial_round_evals| {
 					overall_round_evals
 						.iter_mut()
 						.zip(partial_round_evals.iter())
-						.for_each(|(f, s)| *f += s);
+						.for_each(|(f, s)| *f += *s);
 					overall_round_evals
 				},
-			);
+			)
+			.iter()
+			.map(|x| x.iter().sum())
+			.collect();
 
 		Ok(evaluator.round_evals_to_coeffs(current_round_sum, evals)?)
 	}
 
 	// Obtain the appropriate switchover multilinear query, relative introduction round.
-	fn get_subset_query(
+	pub(crate) fn get_subset_query(
 		&self,
 		oracle_ids: &[MultilinearId],
 	) -> Option<(usize, &MultilinearQuery<PW>)> {
@@ -549,36 +587,27 @@ where
 	// Note the generic parameter - this method samples small field in first round and
 	// large field post-switchover.
 	#[inline]
-	fn direct_sample<MD>(
+	fn direct_sample<MD: MultilinearPoly<PW>>(
 		multilin: MD,
-		indices: Range<usize>,
-		evals_0: &mut Array2D<PW::Scalar>,
-		evals_1: &mut Array2D<PW::Scalar>,
-		col_index: usize,
-	) where
-		MD: MultilinearPoly<PW>,
-	{
-		for (k, i) in indices.enumerate() {
-			evals_0[(k, col_index)] = multilin
-				.evaluate_on_hypercube(i << 1)
-				.expect("eval 0 within range");
-			evals_1[(k, col_index)] = multilin
-				.evaluate_on_hypercube((i << 1) + 1)
-				.expect("eval 1 within range");
-		}
+		subcube_vars: usize,
+		subcube_index: usize,
+		evals: &mut [PW],
+	) {
+		multilin
+			.subcube_evals(subcube_vars, subcube_index, evals)
+			.expect("indices within range");
 	}
 
 	#[inline]
 	fn subcube_inner_product(
-		query: &MultilinearQuery<PW>,
 		multilin: &M,
-		indices: Range<usize>,
-		evals_0: &mut Array2D<PW::Scalar>,
-		evals_1: &mut Array2D<PW::Scalar>,
-		col_index: usize,
+		query: &MultilinearQuery<PW>,
+		subcube_vars: usize,
+		subcube_index: usize,
+		inner_products: &mut [PW],
 	) {
 		multilin
-			.evaluate_subcube(indices, query, evals_0, evals_1, col_index)
+			.subcube_inner_products(query, subcube_vars, subcube_index, inner_products)
 			.expect("indices within range");
 	}
 

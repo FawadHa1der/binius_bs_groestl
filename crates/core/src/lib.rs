@@ -7,7 +7,7 @@
 #![allow(clippy::suspicious_op_assign_impl)]
 
 pub mod challenger;
-pub mod linalg;
+pub mod composition;
 pub mod linear_code;
 pub mod merkle_tree;
 pub mod oracle;
@@ -16,6 +16,9 @@ pub mod polynomial;
 pub mod protocols;
 #[allow(clippy::module_inception)]
 pub mod reed_solomon;
+pub mod tensor_algebra;
+pub mod transparent;
+pub mod util;
 pub mod witness;
 
 pub use core::iter::Step;

@@ -1,90 +1,55 @@
 // Copyright 2024 Ulvetanna Inc.
 
-use super::error::Error;
 use crate::{
-	oracle::{
-		BatchId, CommittedBatchSpec, CommittedId, CompositePolyOracle, MultilinearOracleSet,
-		MultilinearPolyOracle, OracleId, ShiftVariant,
-	},
-	polynomial::{transparent::step_down::StepDown, CompositionPoly, Error as PolynomialError},
+	oracle::{BatchId, MultilinearOracleSet, MultilinearPolyOracle, OracleId},
+	polynomial::MultilinearPoly,
 	protocols::{
-		msetcheck::{MsetcheckClaim, MsetcheckWitness},
-		zerocheck::{ZerocheckClaim, ZerocheckWitnessTypeErased},
+		gkr_gpa::{GrandProductClaim, GrandProductWitness},
+		lasso::error::Error,
 	},
+	transparent::multilinear_extension::MultilinearExtensionTransparent,
 	witness::{MultilinearExtensionIndex, MultilinearWitness},
 };
 use binius_field::{
 	as_packed_field::{PackScalar, PackedType},
 	underlier::UnderlierType,
-	BinaryField16b, BinaryField32b, Field, PackedField, TowerField,
+	ExtensionField, Field, PackedField, TowerField,
 };
-use getset::{CopyGetters, Getters};
 
-pub trait LassoCount: TowerField {
-	fn overflowing_add(self, rhs: Self) -> (Self, bool);
-	fn shr1(self) -> Self;
+use binius_hal::ComputationBackend;
+use binius_utils::bail;
+use getset::Getters;
+use itertools::izip;
+
+pub struct LassoBatches {
+	pub counts_batch_ids: Vec<BatchId>,
+	pub final_counts_batch_id: BatchId,
+
+	pub counts: Vec<OracleId>,
+	pub final_counts: OracleId,
 }
 
-impl LassoCount for BinaryField32b {
-	fn overflowing_add(self, rhs: BinaryField32b) -> (BinaryField32b, bool) {
-		let (sum, overflow) = u32::from(self).overflowing_add(u32::from(rhs));
-		(BinaryField32b::new(sum), overflow)
-	}
-
-	fn shr1(self) -> BinaryField32b {
-		BinaryField32b::new(u32::from(self) >> 1)
-	}
-}
-
-impl LassoCount for BinaryField16b {
-	fn overflowing_add(self, rhs: BinaryField16b) -> (BinaryField16b, bool) {
-		let (sum, overflow) = u16::from(self).overflowing_add(u16::from(rhs));
-		(BinaryField16b::new(sum), overflow)
-	}
-
-	fn shr1(self) -> BinaryField16b {
-		BinaryField16b::new(u16::from(self) >> 1)
-	}
-}
-
-#[derive(CopyGetters)]
-pub struct LassoBatch {
-	#[get_copy = "pub"]
-	batch_id: BatchId,
-}
-
-impl LassoBatch {
-	pub fn new_in<C: LassoCount, F: TowerField>(
+impl LassoBatches {
+	pub fn new_in<C: TowerField, F: TowerField>(
 		oracles: &mut MultilinearOracleSet<F>,
-		n_vars: usize,
+		u_n_vars: &[usize],
+		lookup_t_n_vars: usize,
 	) -> Self {
-		let batch_id = oracles.add_committed_batch(CommittedBatchSpec {
-			n_vars: n_vars + C::TOWER_LEVEL,
-			n_polys: 3,
-			tower_level: 0,
-		});
+		let (counts_batch_ids, counts): (Vec<_>, Vec<_>) = u_n_vars
+			.iter()
+			.map(|u_n_vars| {
+				let counts_batch_id = oracles.add_committed_batch(*u_n_vars, C::TOWER_LEVEL);
+				(counts_batch_id, oracles.add_committed(counts_batch_id))
+			})
+			.unzip();
 
-		Self { batch_id }
-	}
-
-	pub fn counts_committed_id(&self) -> CommittedId {
-		CommittedId {
-			batch_id: self.batch_id,
-			index: 0,
-		}
-	}
-
-	pub fn carry_out_committed_id(&self) -> CommittedId {
-		CommittedId {
-			batch_id: self.batch_id,
-			index: 1,
-		}
-	}
-
-	pub fn final_counts_committed_id(&self) -> CommittedId {
-		CommittedId {
-			batch_id: self.batch_id,
-			index: 2,
+		let final_counts_batch_id = oracles.add_committed_batch(lookup_t_n_vars, C::TOWER_LEVEL);
+		let final_counts = oracles.add_committed(final_counts_batch_id);
+		Self {
+			counts_batch_ids,
+			final_counts_batch_id,
+			counts,
+			final_counts,
 		}
 	}
 }
@@ -94,25 +59,20 @@ pub struct LassoClaim<F: Field> {
 	/// T polynomial - the table being "looked up"
 	#[get = "pub"]
 	t_oracle: MultilinearPolyOracle<F>,
-	/// U polynomial - each element of U must equal some element of T
+	/// U polynomials - each element of U must equal some element of T
 	#[get = "pub"]
-	u_oracle: MultilinearPolyOracle<F>,
+	u_oracles: Vec<MultilinearPolyOracle<F>>,
 }
 
 impl<F: Field> LassoClaim<F> {
 	pub fn new(
 		t_oracle: MultilinearPolyOracle<F>,
-		u_oracle: MultilinearPolyOracle<F>,
+		u_oracles: Vec<MultilinearPolyOracle<F>>,
 	) -> Result<Self, Error> {
-		if t_oracle.n_vars() != u_oracle.n_vars() {
-			return Err(Error::NumVariablesMismatch);
-		}
-
-		Ok(Self { t_oracle, u_oracle })
-	}
-
-	pub fn n_vars(&self) -> usize {
-		self.t_oracle.n_vars()
+		Ok(Self {
+			t_oracle,
+			u_oracles,
+		})
 	}
 }
 
@@ -121,205 +81,173 @@ pub struct LassoWitness<'a, PW: PackedField, L: AsRef<[usize]>> {
 	#[get = "pub"]
 	t_polynomial: MultilinearWitness<'a, PW>,
 	#[get = "pub"]
-	u_polynomial: MultilinearWitness<'a, PW>,
+	u_polynomials: Vec<MultilinearWitness<'a, PW>>,
 	#[get = "pub"]
-	u_to_t_mapping: L,
+	u_to_t_mappings: Vec<L>,
 }
 
 impl<'a, PW: PackedField, L: AsRef<[usize]>> LassoWitness<'a, PW, L> {
 	pub fn new(
 		t_polynomial: MultilinearWitness<'a, PW>,
-		u_polynomial: MultilinearWitness<'a, PW>,
-		u_to_t_mapping: L,
+		u_polynomials: Vec<MultilinearWitness<'a, PW>>,
+		u_to_t_mappings: Vec<L>,
 	) -> Result<Self, Error> {
-		if t_polynomial.n_vars() != u_polynomial.n_vars() {
-			return Err(Error::NumVariablesMismatch);
+		if u_polynomials.len() != u_to_t_mappings.len() {
+			bail!(Error::MappingsLookerTablesLenMismatch);
+		}
+
+		if u_polynomials
+			.iter()
+			.zip(&u_to_t_mappings)
+			.any(|(poly, mapping)| poly.size() != mapping.as_ref().len())
+		{
+			bail!(Error::ClaimWitnessTablesLenMismatch);
 		}
 
 		let size = t_polynomial.size();
-		if size != u_to_t_mapping.as_ref().len() {
-			return Err(Error::MappingSizeMismatch);
-		}
 
-		if u_to_t_mapping.as_ref().iter().any(|&index| index >= size) {
-			return Err(Error::MappingIndexOutOfBounds);
+		if u_to_t_mappings
+			.iter()
+			.flat_map(|mapping| mapping.as_ref())
+			.any(|&index| index >= size)
+		{
+			bail!(Error::MappingIndexOutOfBounds);
 		}
 
 		Ok(Self {
 			t_polynomial,
-			u_polynomial,
-			u_to_t_mapping,
+			u_polynomials,
+			u_to_t_mappings,
 		})
 	}
-
-	pub fn n_vars(&self) -> usize {
-		self.t_polynomial.n_vars()
-	}
 }
 
-/// Composition for unary carry application: f(x, carry_in, carry_out) := x * carry_in - carry_out
-#[derive(Clone, Debug)]
-pub struct UnaryCarryConstraint;
-
-impl<P: PackedField> CompositionPoly<P> for UnaryCarryConstraint {
-	fn n_vars(&self) -> usize {
-		3
-	}
-
-	fn degree(&self) -> usize {
-		2
-	}
-
-	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, PolynomialError> {
-		if query.len() != 3 {
-			return Err(PolynomialError::IncorrectQuerySize { expected: 3 });
-		}
-
-		Ok(query[0] * query[1] - query[2])
-	}
-
-	fn evaluate(&self, query: &[P]) -> Result<P, PolynomialError> {
-		if query.len() != 3 {
-			return Err(PolynomialError::IncorrectQuerySize { expected: 3 });
-		}
-
-		Ok(query[0] * query[1] - query[2])
-	}
-
-	fn binary_tower_level(&self) -> usize {
-		0
-	}
+#[derive(Debug, Default)]
+pub struct LassoProof<F: Field> {
+	pub left_grand_products: Vec<F>,
+	pub right_grand_products: Vec<F>,
+	pub counts_grand_products: Vec<F>,
 }
 
-pub struct ReducedLassoClaims<F: Field> {
-	pub zerocheck_claim: ZerocheckClaim<F>,
-	pub msetcheck_claim: MsetcheckClaim<F>,
-}
-
-pub struct LassoProveOutput<'a, U: UnderlierType + PackScalar<FW>, F: Field, FW: TowerField> {
-	pub reduced_lasso_claims: ReducedLassoClaims<F>,
-	pub zerocheck_witness: ZerocheckWitnessTypeErased<'a, PackedType<U, FW>, UnaryCarryConstraint>,
-	pub msetcheck_witness: MsetcheckWitness<'a, PackedType<U, FW>>,
+pub struct LassoProveOutput<'a, U: UnderlierType + PackScalar<FW>, FW: TowerField, F: Field> {
+	pub reduced_gpa_claims: Vec<GrandProductClaim<F>>,
+	pub reduced_gpa_witnesses: Vec<GrandProductWitness<'a, PackedType<U, FW>>>,
+	pub lasso_proof: LassoProof<F>,
 	pub witness_index: MultilinearExtensionIndex<'a, U, FW>,
 }
 
-pub(super) struct LassoReducedClaimOracleIds {
-	pub tu_merged_oracle_id: OracleId,
-	pub final_counts_and_counts_oracle_id: OracleId,
-	pub zeros_counts_plus_one_oracle_id: OracleId,
-	pub zeros_oracle_id: OracleId,
-	pub packed_counts_oracle_id: OracleId,
-	pub packed_counts_plus_one_oracle_id: OracleId,
-	pub packed_final_counts_oracle_id: OracleId,
-	pub counts_plus_one_oracle_id: OracleId,
-	pub carry_in_oracle_id: OracleId,
-	pub carry_out_shifted_oracle_id: OracleId,
+pub struct LassoReducedClaimOracleIds {
 	pub ones_repeating_oracle_id: OracleId,
+	pub mixed_t_final_counts_oracle_id: OracleId,
+	pub mixed_t_one_oracle_id: OracleId,
+	pub mixed_u_counts_oracle_ids: Vec<OracleId>,
+	pub mixed_u_counts_plus_one_oracle_ids: Vec<OracleId>,
 }
 
-pub fn reduce_lasso_claim<C: LassoCount, F: TowerField>(
+#[derive(Debug, Default)]
+pub struct GkrClaimOracleIds {
+	pub left: Vec<OracleId>,
+	pub right: Vec<OracleId>,
+	pub counts: Vec<OracleId>,
+}
+
+pub fn reduce_lasso_claim<
+	C: TowerField,
+	F: TowerField + ExtensionField<C> + From<C>,
+	Backend: ComputationBackend + 'static,
+>(
 	oracles: &mut MultilinearOracleSet<F>,
 	lasso_claim: &LassoClaim<F>,
-	lasso_batch: &LassoBatch,
-) -> Result<(ReducedLassoClaims<F>, LassoReducedClaimOracleIds), Error> {
-	let n_vars = lasso_claim.n_vars();
-	let n_vars_gf2 = n_vars + C::TOWER_LEVEL;
+	lasso_batches: &LassoBatches,
+	gamma: F,
+	alpha: F,
+	backend: Backend,
+) -> Result<(GkrClaimOracleIds, LassoReducedClaimOracleIds), Error> {
+	let t_n_vars = lasso_claim.t_oracle.n_vars();
 
-	// Extract Lasso committed column oracles
-	let counts_oracle = oracles.committed_oracle(lasso_batch.counts_committed_id());
-	let carry_out_oracle = oracles.committed_oracle(lasso_batch.carry_out_committed_id());
-	let final_counts_oracle = oracles.committed_oracle(lasso_batch.final_counts_committed_id());
+	let final_counts_oracle = oracles.oracle(lasso_batches.final_counts);
 
-	if counts_oracle.n_vars() != n_vars_gf2
-		|| carry_out_oracle.n_vars() != n_vars_gf2
-		|| final_counts_oracle.n_vars() != n_vars_gf2
-	{
-		return Err(Error::CountsNumVariablesMismatch);
+	if final_counts_oracle.n_vars() != t_n_vars {
+		bail!(Error::CountsNumVariablesMismatch);
 	}
 
-	// Representing a column of ones as a repeating oracle of 10...0
-	let one = StepDown::new(C::TOWER_LEVEL, 1)?;
-	let one_oracle_id = oracles.add_transparent(one)?;
-	let ones_repeating_oracle_id = oracles.add_repeating(one_oracle_id, n_vars)?;
+	let alpha_gen = alpha * C::MULTIPLICATIVE_GENERATOR;
 
-	// carry_in = ([carry_out] << 1) + 1
-	let carry_out_shifted_oracle_id =
-		oracles.add_shifted(carry_out_oracle.id(), 1, C::TOWER_LEVEL, ShiftVariant::LogicalLeft)?;
+	let mut mixed_u_counts_oracle_ids = Vec::new();
+	let mut mixed_u_counts_plus_one_oracle_ids = Vec::new();
 
-	let carry_in_oracle_id = oracles.add_linear_combination(
-		n_vars_gf2,
+	let mut gkr_claim_oracle_ids = GkrClaimOracleIds::default();
+
+	for (counts_oracle_id, u_oracle) in izip!(&lasso_batches.counts, &lasso_claim.u_oracles) {
+		let u_n_vars = u_oracle.n_vars();
+
+		let counts_oracle = oracles.oracle(*counts_oracle_id);
+
+		if counts_oracle.n_vars() != u_n_vars {
+			bail!(Error::CountsNumVariablesMismatch);
+		}
+
+		let mixed_u_counts_oracle_id = oracles.add_linear_combination_with_offset(
+			u_n_vars,
+			gamma,
+			[(u_oracle.id(), F::ONE), (*counts_oracle_id, alpha)],
+		)?;
+
+		mixed_u_counts_oracle_ids.push(mixed_u_counts_oracle_id);
+
+		let mixed_u_counts_plus_one_oracle_id = oracles.add_linear_combination_with_offset(
+			u_n_vars,
+			gamma,
+			[(u_oracle.id(), F::ONE), (*counts_oracle_id, alpha_gen)],
+		)?;
+
+		mixed_u_counts_plus_one_oracle_ids.push(mixed_u_counts_plus_one_oracle_id);
+
+		gkr_claim_oracle_ids.left.push(mixed_u_counts_oracle_id);
+		gkr_claim_oracle_ids
+			.right
+			.push(mixed_u_counts_plus_one_oracle_id);
+		gkr_claim_oracle_ids.counts.push(*counts_oracle_id);
+	}
+
+	let ones_transparent: MultilinearExtensionTransparent<C, F, _> =
+		MultilinearExtensionTransparent::from_values([C::ONE].to_vec(), backend)?;
+
+	let one_oracle_id = oracles.add_transparent(ones_transparent)?;
+
+	let ones_repeating_oracle_id = oracles.add_repeating(one_oracle_id, t_n_vars - C::LOG_WIDTH)?;
+
+	let mixed_t_final_counts_oracle_id = oracles.add_linear_combination_with_offset(
+		t_n_vars,
+		gamma,
 		[
-			(carry_out_shifted_oracle_id, F::ONE),
-			(ones_repeating_oracle_id, F::ONE),
+			(lasso_claim.t_oracle.id(), F::ONE),
+			(lasso_batches.final_counts, alpha),
 		],
 	)?;
-	let carry_in_oracle = oracles.oracle(carry_in_oracle_id);
 
-	// counts_plus_one = [counts] + carry_in
-	let counts_plus_one_oracle_id = oracles.add_linear_combination(
-		n_vars_gf2,
-		[(counts_oracle.id(), F::ONE), (carry_in_oracle_id, F::ONE)],
+	let mixed_t_one_oracle_id = oracles.add_linear_combination_with_offset(
+		t_n_vars,
+		gamma,
+		[
+			(lasso_claim.t_oracle.id(), F::ONE),
+			(ones_repeating_oracle_id, alpha),
+		],
 	)?;
-
-	// Packed oracles for the multiset check
-	let packed_counts_oracle_id = oracles.add_packed(counts_oracle.id(), C::TOWER_LEVEL)?;
-	let packed_final_counts_oracle_id =
-		oracles.add_packed(final_counts_oracle.id(), C::TOWER_LEVEL)?;
-	let packed_counts_plus_one_oracle_id =
-		oracles.add_packed(counts_plus_one_oracle_id, C::TOWER_LEVEL)?;
-
-	// [counts] * carry_in - [carry_out] = 0,
-	let unary_carry_constraint_oracle = CompositePolyOracle::new(
-		n_vars_gf2,
-		vec![counts_oracle, carry_in_oracle, carry_out_oracle],
-		UnaryCarryConstraint,
-	)?;
-
-	let zerocheck_claim = ZerocheckClaim {
-		poly: unary_carry_constraint_oracle,
-	};
-
-	// merge([T], [U])
-	let tu_merged_oracle_id =
-		oracles.add_merged(lasso_claim.t_oracle().id(), lasso_claim.u_oracle().id())?;
-	let tu_merged_oracle = oracles.oracle(tu_merged_oracle_id);
-
-	// merge([final_counts], [counts])
-	let final_counts_and_counts_oracle_id =
-		oracles.add_merged(packed_final_counts_oracle_id, packed_counts_oracle_id)?;
-	let final_counts_and_counts_oracle = oracles.oracle(final_counts_and_counts_oracle_id);
-
-	// A column of zeros
-	let zeros_oracle_id = oracles.add_linear_combination_with_offset(n_vars, F::ZERO, [])?;
-
-	// merge(zeros, counts_plus_one)
-	let zeros_counts_plus_one_oracle_id =
-		oracles.add_merged(zeros_oracle_id, packed_counts_plus_one_oracle_id)?;
-	let zeros_counts_plus_one_oracle = oracles.oracle(zeros_counts_plus_one_oracle_id);
-
-	let msetcheck_claim = MsetcheckClaim::new(
-		[tu_merged_oracle.clone(), final_counts_and_counts_oracle],
-		[tu_merged_oracle, zeros_counts_plus_one_oracle],
-	)?;
-
-	let reduced_lasso_claims = ReducedLassoClaims {
-		zerocheck_claim,
-		msetcheck_claim,
-	};
 
 	let lasso_claim_oracles = LassoReducedClaimOracleIds {
-		tu_merged_oracle_id,
-		final_counts_and_counts_oracle_id,
-		zeros_counts_plus_one_oracle_id,
-		zeros_oracle_id,
-		packed_counts_oracle_id,
-		packed_counts_plus_one_oracle_id,
-		packed_final_counts_oracle_id,
-		counts_plus_one_oracle_id,
-		carry_in_oracle_id,
-		carry_out_shifted_oracle_id,
 		ones_repeating_oracle_id,
+		mixed_t_final_counts_oracle_id,
+		mixed_t_one_oracle_id,
+		mixed_u_counts_oracle_ids,
+		mixed_u_counts_plus_one_oracle_ids,
 	};
 
-	Ok((reduced_lasso_claims, lasso_claim_oracles))
+	gkr_claim_oracle_ids
+		.left
+		.push(mixed_t_final_counts_oracle_id);
+	gkr_claim_oracle_ids.right.push(mixed_t_one_oracle_id);
+	gkr_claim_oracle_ids.counts.push(lasso_batches.final_counts);
+
+	Ok((gkr_claim_oracle_ids, lasso_claim_oracles))
 }

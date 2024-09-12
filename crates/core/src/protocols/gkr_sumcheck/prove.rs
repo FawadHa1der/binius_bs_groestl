@@ -9,23 +9,28 @@ use super::{
 };
 use crate::{
 	polynomial::{
-		extrapolate_line, transparent::eq_ind::EqIndPartialEval, CompositionPoly,
-		Error as PolynomialError, EvaluationDomain, EvaluationDomainFactory, MultilinearExtension,
-		MultilinearPoly,
+		CompositionPoly, Error as PolynomialError, MultilinearExtension, MultilinearPoly,
 	},
-	protocols::abstract_sumcheck::{
-		check_evaluation_domain, validate_rd_challenge, AbstractSumcheckEvaluator,
-		AbstractSumcheckProversState, AbstractSumcheckReductor, AbstractSumcheckWitness,
-		CommonProversState, ReducedClaim,
+	protocols::{
+		abstract_sumcheck::{
+			check_evaluation_domain, validate_rd_challenge, AbstractSumcheckEvaluator,
+			AbstractSumcheckProversState, AbstractSumcheckReductor, AbstractSumcheckWitness,
+			CommonProversState, ReducedClaim,
+		},
+		utils::packed_from_fn_with_offset,
 	},
+	transparent::eq_ind::EqIndPartialEval,
 };
-use binius_field::{packed::get_packed_slice, ExtensionField, Field, PackedField};
+use binius_field::{packed::get_packed_slice, ExtensionField, Field, PackedExtension, PackedField};
+use binius_hal::ComputationBackend;
+use binius_math::{extrapolate_line, EvaluationDomain, EvaluationDomainFactory};
+use binius_utils::bail;
 use getset::Getters;
 use rayon::prelude::*;
 use std::marker::PhantomData;
 use tracing::instrument;
 
-pub struct GkrSumcheckProversState<'a, F, PW, DomainField, EDF, CW, M>
+pub struct GkrSumcheckProversState<'a, F, PW, DomainField, EDF, CW, M, Backend>
 where
 	F: Field,
 	PW: PackedField,
@@ -33,16 +38,17 @@ where
 	EDF: EvaluationDomainFactory<DomainField>,
 	CW: CompositionPoly<PW>,
 	M: MultilinearPoly<PW> + Clone + Send + Sync,
+	Backend: ComputationBackend,
 {
-	common: CommonProversState<(usize, usize), PW, M>,
+	common: CommonProversState<(usize, usize), PW, M, Backend>,
 	evaluation_domain_factory: EDF,
 	gkr_round_challenge: &'a [F],
 	round_eq_ind: MultilinearExtension<PW>,
-	_domain_field_marker: PhantomData<DomainField>,
-	_cw_marker: PhantomData<CW>,
+	_marker: PhantomData<(DomainField, CW)>,
 }
 
-impl<'a, F, PW, DomainField, EDF, CW, M> GkrSumcheckProversState<'a, F, PW, DomainField, EDF, CW, M>
+impl<'a, F, PW, DomainField, EDF, CW, M, Backend>
+	GkrSumcheckProversState<'a, F, PW, DomainField, EDF, CW, M, Backend>
 where
 	F: Field,
 	PW: PackedField<Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
@@ -50,14 +56,16 @@ where
 	EDF: EvaluationDomainFactory<DomainField>,
 	CW: CompositionPoly<PW>,
 	M: MultilinearPoly<PW> + Clone + Send + Sync,
+	Backend: ComputationBackend,
 {
 	pub fn new(
 		n_vars: usize,
 		evaluation_domain_factory: EDF,
 		gkr_round_challenge: &'a [F],
 		switchover_fn: impl Fn(usize) -> usize + 'static,
+		backend: Backend,
 	) -> Result<Self, Error> {
-		let common = CommonProversState::new(n_vars, switchover_fn);
+		let common = CommonProversState::new(n_vars, switchover_fn, backend.clone());
 
 		let pw_scalar_challenges = gkr_round_challenge
 			.iter()
@@ -65,16 +73,15 @@ where
 			.map(|&f| f.into())
 			.collect::<Vec<PW::Scalar>>();
 
-		let round_eq_ind =
-			EqIndPartialEval::new(n_vars - 1, pw_scalar_challenges)?.multilinear_extension()?;
+		let round_eq_ind = EqIndPartialEval::new(n_vars - 1, pw_scalar_challenges)?
+			.multilinear_extension(backend)?;
 
 		Ok(Self {
 			common,
 			evaluation_domain_factory,
 			gkr_round_challenge,
 			round_eq_ind,
-			_domain_field_marker: PhantomData,
-			_cw_marker: PhantomData,
+			_marker: PhantomData,
 		})
 	}
 
@@ -83,8 +90,7 @@ where
 		let new_evals = (0..current_evals.len() >> 1)
 			.into_par_iter()
 			.map(|i| {
-				PW::from_fn(|j| {
-					let index = i * PW::WIDTH + j;
+				packed_from_fn_with_offset::<PW>(i, |index| {
 					let eval0 = get_packed_slice(current_evals, index << 1);
 					let eval1 = get_packed_slice(current_evals, (index << 1) + 1);
 
@@ -98,15 +104,16 @@ where
 	}
 }
 
-impl<'a, F, PW, DomainField, EDF, CW, M> AbstractSumcheckProversState<F>
-	for GkrSumcheckProversState<'a, F, PW, DomainField, EDF, CW, M>
+impl<'a, F, PW, DomainField, EDF, CW, M, Backend> AbstractSumcheckProversState<F>
+	for GkrSumcheckProversState<'a, F, PW, DomainField, EDF, CW, M, Backend>
 where
 	F: Field,
-	PW: PackedField<Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
+	PW: PackedExtension<DomainField, Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
 	DomainField: Field,
 	EDF: EvaluationDomainFactory<DomainField>,
 	CW: CompositionPoly<PW>,
 	M: MultilinearPoly<PW> + Clone + Send + Sync,
+	Backend: ComputationBackend,
 {
 	type Error = Error;
 
@@ -123,14 +130,17 @@ where
 		seq_id: usize,
 	) -> Result<Self::Prover, Error> {
 		if claim.r != self.gkr_round_challenge {
-			return Err(Error::MismatchedGkrChallengeInClaimsBatch);
+			bail!(Error::MismatchedGkrChallengeInClaimsBatch);
 		}
 		let multilinears = witness
 			.multilinears(seq_id, &[])?
 			.into_iter()
 			.collect::<Vec<_>>();
 		self.common.extend(multilinears.clone())?;
-		let domain = self.evaluation_domain_factory.create(claim.degree + 1)?;
+		let domain = self
+			.evaluation_domain_factory
+			.create(claim.degree + 1)
+			.map_err(Error::MathError)?;
 		let multilinear_ids = multilinears
 			.into_iter()
 			.map(|(id, _)| id)
@@ -203,8 +213,8 @@ where
 impl<'a, F, PW, DomainField, CW, M> GkrSumcheckProver<'a, F, PW, DomainField, CW, M>
 where
 	F: Field,
-	PW: PackedField,
-	PW::Scalar: From<F> + Into<F> + ExtensionField<DomainField>,
+	PW: PackedExtension<DomainField, Scalar: ExtensionField<DomainField>>,
+	PW::Scalar: From<F> + Into<F>,
 	DomainField: Field,
 	CW: CompositionPoly<PW>,
 	M: MultilinearPoly<PW> + Clone + Send + Sync,
@@ -220,16 +230,16 @@ where
 		let degree = claim.degree;
 
 		if degree == 0 {
-			return Err(Error::PolynomialDegreeIsZero);
+			bail!(Error::PolynomialDegreeIsZero);
 		}
 		check_evaluation_domain(degree, &domain)?;
 
 		if gkr_round_challenge.len() + 1 < n_vars {
-			return Err(Error::NotEnoughGkrRoundChallenges);
+			bail!(Error::NotEnoughGkrRoundChallenges);
 		}
 
 		if witness.poly.n_vars() != n_vars || n_vars != gkr_round_challenge.len() {
-			return Err(Error::ProverClaimWitnessMismatch);
+			bail!(Error::ProverClaimWitnessMismatch);
 		}
 
 		let composition = witness.poly.composition;
@@ -256,13 +266,13 @@ where
 		Ok(gkr_sumcheck_prover)
 	}
 
-	#[instrument(skip_all, name = "gkr_sumcheck::finalize")]
+	#[instrument(skip_all, name = "gkr_sumcheck::finalize", level = "debug")]
 	fn finalize(mut self, prev_rd_challenge: Option<F>) -> Result<ReducedClaim<F>, Error> {
 		// First round has no challenge, other rounds should have it
 		validate_rd_challenge(prev_rd_challenge, self.round)?;
 
 		if self.round != self.n_vars {
-			return Err(Error::PrematureFinalizeCall);
+			bail!(Error::PrematureFinalizeCall);
 		}
 
 		// Last reduction to obtain eval value at eval_point
@@ -273,12 +283,13 @@ where
 		Ok(self.round_claim.into())
 	}
 
-	fn compute_round_coeffs<EDF>(
+	fn compute_round_coeffs<EDF, Backend>(
 		&self,
-		provers_state: &GkrSumcheckProversState<'a, F, PW, DomainField, EDF, CW, M>,
+		provers_state: &GkrSumcheckProversState<'a, F, PW, DomainField, EDF, CW, M, Backend>,
 	) -> Result<Vec<PW::Scalar>, Error>
 	where
 		EDF: EvaluationDomainFactory<DomainField>,
+		Backend: ComputationBackend,
 	{
 		if self.degree == 1 {
 			return Ok(vec![PW::Scalar::default()]);
@@ -324,20 +335,21 @@ where
 		Ok(round_coeffs)
 	}
 
-	#[instrument(skip_all, name = "gkr_sumcheck::execute_round")]
-	fn execute_round<EDF>(
+	#[instrument(skip_all, name = "gkr_sumcheck::execute_round", level = "debug")]
+	fn execute_round<EDF, Backend>(
 		&mut self,
-		provers_state: &GkrSumcheckProversState<'a, F, PW, DomainField, EDF, CW, M>,
+		provers_state: &GkrSumcheckProversState<'a, F, PW, DomainField, EDF, CW, M, Backend>,
 		prev_rd_challenge: Option<F>,
 	) -> Result<GkrSumcheckRound<F>, Error>
 	where
 		EDF: EvaluationDomainFactory<DomainField>,
+		Backend: ComputationBackend,
 	{
 		// First round has no challenge, other rounds should have it
 		validate_rd_challenge(prev_rd_challenge, self.round)?;
 
 		if self.round >= self.n_vars {
-			return Err(Error::TooManyExecuteRoundCalls);
+			bail!(Error::TooManyExecuteRoundCalls);
 		}
 
 		// Rounds 1..n_vars-1 - Some(..) challenge is given
@@ -366,6 +378,7 @@ where
 
 	fn reduce_claim(&mut self, prev_rd_challenge: F) -> Result<(), Error> {
 		let reductor = GkrSumcheckReductor {
+			max_individual_degree: self.composition.degree(),
 			gkr_challenge_point: self.gkr_round_challenge,
 		};
 		let round_claim = self.round_claim.clone();
@@ -410,7 +423,7 @@ impl<'a, PW, DomainField, C, M> AbstractSumcheckEvaluator<PW>
 	for GkrSumcheckFirstRoundEvaluator<'a, PW, DomainField, C, M>
 where
 	DomainField: Field,
-	PW: PackedField<Scalar: ExtensionField<DomainField>>,
+	PW: PackedExtension<DomainField, Scalar: ExtensionField<DomainField>>,
 	C: CompositionPoly<PW>,
 	M: MultilinearPoly<PW> + Send + Sync,
 {
@@ -425,20 +438,22 @@ where
 		&self,
 		i: usize,
 		_vertex_state: Self::VertexState,
-		evals_0: &[PW::Scalar],
-		evals_1: &[PW::Scalar],
-		evals_z: &mut [PW::Scalar],
-		round_evals: &mut [PW::Scalar],
+		evals_0: &[PW],
+		evals_1: &[PW],
+		evals_z: &mut [PW],
+		round_evals: &mut [PW],
 	) {
-		debug_assert!(i < self.eq_ind.size());
-		let eq_ind_factor = self
-			.eq_ind
-			.evaluate_on_hypercube(i)
-			.unwrap_or(PW::Scalar::ZERO);
-		let poly_mle_one_eval = self
-			.poly_mle
-			.evaluate_on_hypercube(i << 1 | 1)
-			.unwrap_or(PW::Scalar::ZERO);
+		debug_assert!(i * PW::WIDTH < self.eq_ind.size());
+		let eq_ind_factor = packed_from_fn_with_offset::<PW>(i, |j| {
+			self.eq_ind
+				.evaluate_on_hypercube(j)
+				.unwrap_or(PW::Scalar::ZERO)
+		});
+		let poly_mle_one_eval = packed_from_fn_with_offset::<PW>(i, |j| {
+			self.poly_mle
+				.evaluate_on_hypercube(j << 1 | 1)
+				.unwrap_or(PW::Scalar::ZERO)
+		});
 
 		// For X = 1, we can replace evaluating poly(1, i) with evaluating poly_mle(1, i)
 		round_evals[0] += eq_ind_factor * poly_mle_one_eval;
@@ -450,7 +465,7 @@ where
 				.zip(evals_1.iter())
 				.zip(evals_z.iter_mut())
 				.for_each(|((&evals_0_j, &evals_1_j), evals_z_j)| {
-					*evals_z_j = extrapolate_line::<PW::Scalar, DomainField>(
+					*evals_z_j = extrapolate_line::<PW, DomainField>(
 						evals_0_j,
 						evals_1_j,
 						self.domain_points[d],
@@ -459,7 +474,7 @@ where
 
 			let composite_value = self
 				.composition
-				.evaluate_scalar(evals_z)
+				.evaluate(evals_z)
 				.expect("evals_z is initialized with a length of poly.composition.n_vars()");
 
 			round_evals[d - 1] += composite_value * eq_ind_factor;
@@ -509,7 +524,7 @@ impl<'a, PW, DomainField, C> AbstractSumcheckEvaluator<PW>
 	for GkrSumcheckLaterRoundEvaluator<'a, PW, DomainField, C>
 where
 	DomainField: Field,
-	PW: PackedField<Scalar: ExtensionField<DomainField>>,
+	PW: PackedExtension<DomainField, Scalar: ExtensionField<DomainField>>,
 	C: CompositionPoly<PW>,
 {
 	type VertexState = ();
@@ -523,21 +538,22 @@ where
 		&self,
 		i: usize,
 		_vertex_state: Self::VertexState,
-		evals_0: &[PW::Scalar],
-		evals_1: &[PW::Scalar],
-		evals_z: &mut [PW::Scalar],
-		round_evals: &mut [PW::Scalar],
+		evals_0: &[PW],
+		evals_1: &[PW],
+		evals_z: &mut [PW],
+		round_evals: &mut [PW],
 	) {
-		debug_assert!(i < self.eq_ind.size());
-		let eq_ind_factor = self
-			.eq_ind
-			.evaluate_on_hypercube(i)
-			.unwrap_or(PW::Scalar::ZERO);
+		debug_assert!(i * PW::WIDTH < self.eq_ind.size());
+		let eq_ind_factor = packed_from_fn_with_offset::<PW>(i, |j| {
+			self.eq_ind
+				.evaluate_on_hypercube(j)
+				.unwrap_or(PW::Scalar::ZERO)
+		});
 
 		// Process X = 1
 		let composite_value = self
 			.composition
-			.evaluate_scalar(evals_1)
+			.evaluate(evals_1)
 			.expect("evals_1 is initialized with a length of poly.composition.n_vars()");
 
 		round_evals[0] += eq_ind_factor * composite_value;
@@ -549,7 +565,7 @@ where
 				.zip(evals_1.iter())
 				.zip(evals_z.iter_mut())
 				.for_each(|((&evals_0_j, &evals_1_j), evals_z_j)| {
-					*evals_z_j = extrapolate_line::<PW::Scalar, DomainField>(
+					*evals_z_j = extrapolate_line::<PW, DomainField>(
 						evals_0_j,
 						evals_1_j,
 						self.domain_points[d],
@@ -558,7 +574,7 @@ where
 
 			let composite_value = self
 				.composition
-				.evaluate_scalar(evals_z)
+				.evaluate(evals_z)
 				.expect("evals_z is initialized with a length of poly.composition.n_vars()");
 
 			round_evals[d - 1] += composite_value * eq_ind_factor;

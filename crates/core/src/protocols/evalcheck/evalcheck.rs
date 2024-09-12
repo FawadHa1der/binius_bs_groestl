@@ -5,6 +5,7 @@ use crate::oracle::{
 	BatchId, CommittedBatch, CommittedId, CompositePolyOracle, MultilinearPolyOracle,
 };
 use binius_field::Field;
+use binius_utils::bail;
 use tracing::instrument;
 
 #[derive(Debug, Clone)]
@@ -53,6 +54,7 @@ pub enum EvalcheckProof<F: Field> {
 	Composite {
 		subproofs: Vec<(F, EvalcheckProof<F>)>,
 	},
+	ZeroPadded(F, Box<EvalcheckProof<F>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,7 +115,7 @@ impl<F: Field> BatchCommittedEvalClaims<F> {
 	}
 
 	/// Extract a same query claim, if possible (hence the Option in happy path)
-	#[instrument(skip_all, name = "evalcheck::extract_pcs_claim")]
+	#[instrument(skip_all, name = "evalcheck::extract_pcs_claim", level = "debug")]
 	pub fn try_extract_same_query_pcs_claim(
 		&self,
 		batch_id: BatchId,
@@ -147,7 +149,7 @@ impl<F: Field> BatchCommittedEvalClaims<F> {
 
 			// if two claims somehow end pointing into the same slot, check that they don't conflict
 			if opt_other_eval.map_or(false, |other_eval| other_eval != claim.eval) {
-				return Err(Error::ConflictingEvals(batch_id));
+				bail!(Error::ConflictingEvals(batch_id));
 			}
 		}
 

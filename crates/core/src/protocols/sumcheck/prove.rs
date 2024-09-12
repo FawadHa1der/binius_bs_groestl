@@ -1,5 +1,7 @@
 // Copyright 2024 Ulvetanna Inc.
 
+#[cfg(feature = "debug_validate_sumcheck")]
+use super::sumcheck::validate_witness;
 use super::{
 	batch::batch_prove,
 	error::Error,
@@ -10,10 +12,7 @@ use super::{
 use crate::{
 	challenger::{CanObserve, CanSample},
 	oracle::OracleId,
-	polynomial::{
-		extrapolate_line, CompositionPoly, Error as PolynomialError, EvaluationDomain,
-		EvaluationDomainFactory,
-	},
+	polynomial::{CompositionPoly, Error as PolynomialError},
 	protocols::{
 		abstract_sumcheck::{
 			check_evaluation_domain, validate_rd_challenge, AbstractSumcheckClaim,
@@ -23,34 +22,37 @@ use crate::{
 		sumcheck::SumcheckProof,
 	},
 };
-use binius_field::{ExtensionField, Field, PackedField};
+use binius_field::{ExtensionField, Field, PackedExtension, PackedField};
+use binius_hal::ComputationBackend;
+use binius_math::{extrapolate_line, EvaluationDomain, EvaluationDomainFactory};
+use binius_utils::bail;
 use getset::Getters;
 use rayon::prelude::*;
 use std::{fmt::Debug, marker::PhantomData};
 use tracing::instrument;
 
-#[cfg(feature = "debug_validate_sumcheck")]
-use super::sumcheck::validate_witness;
-
 /// Prove a sumcheck to evalcheck reduction.
-pub fn prove<F, PW, DomainField, CH>(
+pub fn prove<F, PW, DomainField, CH, Backend>(
 	claim: &SumcheckClaim<F>,
 	witness: impl AbstractSumcheckWitness<PW, MultilinearId = OracleId>,
 	evaluation_domain_factory: impl EvaluationDomainFactory<DomainField>,
 	switchover_fn: impl Fn(usize) -> usize + 'static,
 	challenger: CH,
+	backend: Backend,
 ) -> Result<SumcheckProveOutput<F>, Error>
 where
 	F: Field,
 	DomainField: Field,
-	PW: PackedField<Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
+	PW: PackedExtension<DomainField, Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
 	CH: CanSample<F> + CanObserve<F>,
+	Backend: ComputationBackend,
 {
-	let batch_proof = batch_prove::<F, PW, DomainField, CH>(
+	let batch_proof = batch_prove::<F, PW, DomainField, CH, Backend>(
 		[(claim.clone(), witness)],
 		evaluation_domain_factory,
 		switchover_fn,
 		challenger,
+		backend,
 	)?;
 
 	Ok(SumcheckProveOutput {
@@ -65,53 +67,53 @@ where
 	})
 }
 
-pub struct SumcheckProversState<F, PW, DomainField, EDF, W>
+pub struct SumcheckProversState<F, PW, DomainField, EDF, W, Backend>
 where
 	F: Field,
 	PW: PackedField,
 	DomainField: Field,
 	EDF: EvaluationDomainFactory<DomainField>,
 	W: AbstractSumcheckWitness<PW>,
+	Backend: ComputationBackend,
 {
-	common: CommonProversState<OracleId, PW, W::Multilinear>,
+	common: CommonProversState<OracleId, PW, W::Multilinear, Backend>,
 	evaluation_domain_factory: EDF,
-	_f_marker: PhantomData<F>,
-	_domain_field_marker: PhantomData<DomainField>,
-	_w_marker: PhantomData<W>,
+	_marker: PhantomData<(F, DomainField, W)>,
 }
 
-impl<F, PW, DomainField, EDF, W> SumcheckProversState<F, PW, DomainField, EDF, W>
+impl<F, PW, DomainField, EDF, W, Backend> SumcheckProversState<F, PW, DomainField, EDF, W, Backend>
 where
 	F: Field,
 	PW: PackedField,
 	DomainField: Field,
 	EDF: EvaluationDomainFactory<DomainField>,
 	W: AbstractSumcheckWitness<PW>,
+	Backend: ComputationBackend,
 {
 	pub fn new(
 		n_vars: usize,
 		evaluation_domain_factory: EDF,
 		switchover_fn: impl Fn(usize) -> usize + 'static,
+		backend: Backend,
 	) -> Self {
-		let common = CommonProversState::new(n_vars, switchover_fn);
+		let common = CommonProversState::new(n_vars, switchover_fn, backend);
 		Self {
 			common,
 			evaluation_domain_factory,
-			_f_marker: PhantomData,
-			_domain_field_marker: PhantomData,
-			_w_marker: PhantomData,
+			_marker: PhantomData,
 		}
 	}
 }
 
-impl<F, PW, DomainField, EDF, W> AbstractSumcheckProversState<F>
-	for SumcheckProversState<F, PW, DomainField, EDF, W>
+impl<F, PW, DomainField, EDF, W, Backend> AbstractSumcheckProversState<F>
+	for SumcheckProversState<F, PW, DomainField, EDF, W, Backend>
 where
 	F: Field,
-	PW: PackedField<Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
+	PW: PackedExtension<DomainField, Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
 	DomainField: Field,
 	EDF: EvaluationDomainFactory<DomainField>,
 	W: AbstractSumcheckWitness<PW, MultilinearId = OracleId>,
+	Backend: ComputationBackend,
 {
 	type Error = Error;
 
@@ -132,7 +134,8 @@ where
 			.extend(witness.multilinears(seq_id, ids.as_slice())?)?;
 		let domain = self
 			.evaluation_domain_factory
-			.create(claim.poly.max_individual_degree() + 1)?;
+			.create(claim.poly.max_individual_degree() + 1)
+			.map_err(Error::MathError)?;
 		let prover = SumcheckProver::new(claim, witness, domain)?;
 		Ok(prover)
 	}
@@ -201,7 +204,7 @@ impl<F, PW, DomainField, W> SumcheckProver<F, PW, DomainField, W>
 where
 	F: Field,
 	DomainField: Field,
-	PW: PackedField<Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
+	PW: PackedExtension<DomainField, Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
 	W: AbstractSumcheckWitness<PW, MultilinearId = OracleId>,
 {
 	/// Start a new sumcheck instance with claim in field `F`. Witness may be given in
@@ -217,7 +220,7 @@ where
 		validate_witness(&claim, &witness)?;
 
 		if claim.poly.max_individual_degree() == 0 {
-			return Err(Error::PolynomialDegreeIsZero);
+			bail!(Error::PolynomialDegreeIsZero);
 		}
 
 		check_evaluation_domain(claim.poly.max_individual_degree(), &domain)?;
@@ -244,13 +247,13 @@ where
 	}
 
 	/// Generic parameters allow to pass a different witness type to the inner Evalcheck claim.
-	#[instrument(skip_all, name = "sumcheck::finalize")]
+	#[instrument(skip_all, name = "sumcheck::finalize", level = "debug")]
 	fn finalize(mut self, prev_rd_challenge: Option<F>) -> Result<ReducedClaim<F>, Error> {
 		// First round has no challenge, other rounds should have it
 		validate_rd_challenge(prev_rd_challenge, self.round)?;
 
 		if self.round != self.claim.n_vars() {
-			return Err(Error::PrematureFinalizeCall);
+			bail!(Error::PrematureFinalizeCall);
 		}
 
 		// Last reduction to obtain eval value at eval_point
@@ -261,20 +264,21 @@ where
 		Ok(self.round_claim.into())
 	}
 
-	#[instrument(skip_all, name = "sumcheck::execute_round")]
-	fn execute_round<EDF>(
+	#[instrument(skip_all, name = "sumcheck::execute_round", level = "debug")]
+	fn execute_round<EDF, Backend>(
 		&mut self,
-		provers_state: &SumcheckProversState<F, PW, DomainField, EDF, W>,
+		provers_state: &SumcheckProversState<F, PW, DomainField, EDF, W, Backend>,
 		prev_rd_challenge: Option<F>,
 	) -> Result<SumcheckRound<F>, Error>
 	where
 		EDF: EvaluationDomainFactory<DomainField>,
+		Backend: ComputationBackend,
 	{
 		// First round has no challenge, other rounds should have it
 		validate_rd_challenge(prev_rd_challenge, self.round)?;
 
 		if self.round >= self.claim.n_vars() {
-			return Err(Error::TooManyExecuteRoundCalls);
+			bail!(Error::TooManyExecuteRoundCalls);
 		}
 
 		// Rounds 1..n_vars-1 - Some(..) challenge is given
@@ -292,8 +296,10 @@ where
 			_p: PhantomData,
 		};
 
-		let rd_vars = self.claim.n_vars() - self.round;
-		let vertex_state_iterator = (0..1 << (rd_vars - 1)).into_par_iter().map(|_i| ());
+		let rd_vars = (self.claim.n_vars() - self.round).saturating_sub(PW::LOG_WIDTH);
+		let vertex_state_iterator = (0..1 << (rd_vars.saturating_sub(1)))
+			.into_par_iter()
+			.map(|_i| ());
 
 		let round_coeffs = provers_state.common.calculate_round_coeffs(
 			self.oracle_ids.as_slice(),
@@ -312,7 +318,10 @@ where
 	}
 
 	fn reduce_claim(&mut self, prev_rd_challenge: F) -> Result<(), Error> {
-		let sumcheck_reductor = SumcheckReductor;
+		let sumcheck_reductor = SumcheckReductor {
+			max_individual_degree: self.claim.max_individual_degree(),
+		};
+
 		let round_claim = self.round_claim.clone();
 		let round_proof = self
 			.last_round_proof
@@ -352,7 +361,7 @@ where
 impl<'a, P, DomainField, C> AbstractSumcheckEvaluator<P>
 	for SumcheckEvaluator<'a, P, DomainField, C>
 where
-	P: PackedField<Scalar: ExtensionField<DomainField>>,
+	P: PackedExtension<DomainField, Scalar: ExtensionField<DomainField>>,
 	DomainField: Field,
 	C: CompositionPoly<P>,
 {
@@ -368,10 +377,10 @@ where
 		&self,
 		_i: usize,
 		_vertex_state: Self::VertexState,
-		evals_0: &[P::Scalar],
-		evals_1: &[P::Scalar],
-		evals_z: &mut [P::Scalar],
-		round_evals: &mut [P::Scalar],
+		evals_0: &[P],
+		evals_1: &[P],
+		evals_z: &mut [P],
+		round_evals: &mut [P],
 	) {
 		// Sumcheck evaluation at a specific point - given an array of 0 & 1 evaluations at some
 		// index, use them to linearly interpolate each MLE value at domain point, and then
@@ -379,7 +388,7 @@ where
 
 		round_evals[0] += self
 			.composition
-			.evaluate_scalar(evals_1)
+			.evaluate(evals_1)
 			.expect("evals_1 is initialized with a length of poly.composition.n_vars()");
 
 		// The rest require interpolation.
@@ -389,8 +398,7 @@ where
 				.zip(evals_1.iter())
 				.zip(evals_z.iter_mut())
 				.for_each(|((&evals_0_j, &evals_1_j), evals_z_j)| {
-					// TODO: Enable small field multiplication.
-					*evals_z_j = extrapolate_line::<P::Scalar, DomainField>(
+					*evals_z_j = extrapolate_line::<P, DomainField>(
 						evals_0_j,
 						evals_1_j,
 						self.domain_points[d],
@@ -399,7 +407,7 @@ where
 
 			round_evals[d - 1] += self
 				.composition
-				.evaluate_scalar(evals_z)
+				.evaluate(evals_z)
 				.expect("evals_z is initialized with a length of poly.composition.n_vars()");
 		}
 	}

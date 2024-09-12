@@ -18,22 +18,17 @@
 
 use anyhow::Result;
 use binius_core::{
-	challenger::{CanObserve, CanSample, CanSampleBits, HashChallenger},
+	challenger::{new_hasher_challenger, CanObserve, CanSample, CanSampleBits},
+	composition::{empty_mix_composition, index_composition},
 	oracle::{BatchId, CompositePolyOracle, MultilinearOracleSet, OracleId, ShiftVariant},
 	poly_commit::{tensor_pcs, PolyCommitScheme},
-	polynomial::{
-		composition::{empty_mix_composition, index_composition},
-		transparent::{
-			multilinear_extension::MultilinearExtensionTransparent, step_down::StepDown,
-		},
-		CompositionPoly, Error as PolynomialError, EvaluationDomainFactory,
-		IsomorphicEvaluationDomainFactory, MultilinearComposite,
-	},
+	polynomial::{CompositionPoly, Error as PolynomialError, MultilinearComposite},
 	protocols::{
 		abstract_sumcheck::standard_switchover_heuristic,
 		greedy_evalcheck::{self, GreedyEvalcheckProof, GreedyEvalcheckProveOutput},
 		zerocheck::{self, ZerocheckBatchProof, ZerocheckBatchProveOutput, ZerocheckClaim},
 	},
+	transparent::{multilinear_extension::MultilinearExtensionTransparent, step_down::StepDown},
 	witness::MultilinearExtensionIndex,
 };
 use binius_field::{
@@ -43,8 +38,10 @@ use binius_field::{
 	BinaryField, BinaryField128b, BinaryField128bPolyval, BinaryField16b, BinaryField1b,
 	ExtensionField, Field, PackedBinaryField128x1b, PackedField, PackedFieldIndexable, TowerField,
 };
+use binius_hal::{make_backend, ComputationBackend};
 use binius_hash::GroestlHasher;
 use binius_macros::{composition_poly, IterOracles};
+use binius_math::{EvaluationDomainFactory, IsomorphicEvaluationDomainFactory};
 use binius_utils::{
 	examples::get_log_trace_size, rayon::adjust_thread_pool, tracing::init_tracing,
 };
@@ -129,16 +126,6 @@ impl<P: PackedField> CompositionPoly<P> for SumComposition {
 		1
 	}
 
-	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, PolynomialError> {
-		if query.len() != self.n_vars {
-			return Err(PolynomialError::IncorrectQuerySize {
-				expected: self.n_vars,
-			});
-		}
-		// Sum of scalar values at the corresponding positions of the packed values.
-		Ok(query.iter().copied().sum())
-	}
-
 	fn evaluate(&self, query: &[P]) -> Result<P, PolynomialError> {
 		if query.len() != self.n_vars {
 			return Err(PolynomialError::IncorrectQuerySize {
@@ -162,24 +149,32 @@ struct FixedOracle {
 }
 
 impl FixedOracle {
-	pub fn new<F: TowerField>(
+	pub fn new<F: TowerField, Backend: ComputationBackend + 'static>(
 		oracles: &mut MultilinearOracleSet<F>,
 		log_size: usize,
+		backend: Backend,
 	) -> Result<Self> {
 		let round_const_values = must_cast_slice::<_, PackedBinaryField64x1b>(&KECCAKF_RC);
-		let round_consts_single =
-			oracles.add_transparent(MultilinearExtensionTransparent::<_, F, _>::from_values(
+		let round_consts_single = oracles.add_named("round_consts_single").transparent(
+			MultilinearExtensionTransparent::<_, F, _, _>::from_values(
 				round_const_values,
-			)?)?;
-		let round_consts =
-			oracles.add_repeating(round_consts_single, log_size - LOG_ROWS_PER_PERMUTATION)?;
+				backend,
+			)?,
+		)?;
+		let round_consts = oracles
+			.add_named("round_consts")
+			.repeating(round_consts_single, log_size - LOG_ROWS_PER_PERMUTATION)?;
 
-		let selector_single = oracles.add_transparent(StepDown::new(
-			LOG_ROWS_PER_PERMUTATION,
-			ROUNDS_PER_PERMUTATION << LOG_ROWS_PER_ROUND,
-		)?)?;
-		let selector =
-			oracles.add_repeating(selector_single, log_size - LOG_ROWS_PER_PERMUTATION)?;
+		let selector_single =
+			oracles
+				.add_named("single_round_selector")
+				.transparent(StepDown::new(
+					LOG_ROWS_PER_PERMUTATION,
+					ROUNDS_PER_PERMUTATION << LOG_ROWS_PER_ROUND,
+				)?)?;
+		let selector = oracles
+			.add_named("round_selector")
+			.repeating(selector_single, log_size - LOG_ROWS_PER_PERMUTATION)?;
 
 		Ok(Self {
 			round_consts,
@@ -204,23 +199,32 @@ struct TraceOracle {
 
 impl TraceOracle {
 	pub fn new<F: TowerField>(oracles: &mut MultilinearOracleSet<F>, log_size: usize) -> Self {
-		let mut batch_scope = oracles.build_committed_batch(log_size, BinaryField1b::TOWER_LEVEL);
-		let state_in_oracle = batch_scope.add_multiple::<25>();
-		let state_out_oracle = batch_scope.add_multiple::<25>();
-		let c_oracle = batch_scope.add_multiple::<5>();
-		let d_oracle = batch_scope.add_multiple::<5>();
-		let batch_id = batch_scope.build();
+		let batch_id = oracles.add_committed_batch(log_size, BinaryField1b::TOWER_LEVEL);
+		let state_in_oracle = oracles
+			.add_named("state_in_oracle")
+			.committed_multiple::<25>(batch_id);
+		let state_out_oracle = oracles
+			.add_named("state_out_oracle")
+			.committed_multiple::<25>(batch_id);
+		let c_oracle = oracles
+			.add_named("c_oracle")
+			.committed_multiple::<5>(batch_id);
+		let d_oracle = oracles
+			.add_named("d_oracle")
+			.committed_multiple::<5>(batch_id);
 
-		let c_shift_oracle = c_oracle.map(|c_x| {
+		let c_shift_oracle = array::from_fn(|x| {
 			oracles
-				.add_shifted(c_x, 1, 6, ShiftVariant::CircularLeft)
+				.add_named(format!("c_shifted_{}", x))
+				.shifted(c_oracle[x], 1, 6, ShiftVariant::CircularLeft)
 				.unwrap()
 		});
 
 		let a_theta_oracle = array::from_fn(|xy| {
 			let x = xy % 5;
 			oracles
-				.add_linear_combination(
+				.add_named(format!("a_theta_{}", xy))
+				.linear_combination(
 					log_size,
 					[(state_in_oracle[xy], F::ONE), (d_oracle[x], F::ONE)],
 				)
@@ -232,7 +236,8 @@ impl TraceOracle {
 				a_theta_oracle[0]
 			} else {
 				oracles
-					.add_shifted(
+					.add_named(format!("b_oracle_{}", xy))
+					.shifted(
 						a_theta_oracle[PI[xy]],
 						RHO[xy] as usize,
 						6,
@@ -242,9 +247,10 @@ impl TraceOracle {
 			}
 		});
 
-		let next_state_in = state_in_oracle.map(|state_in_xy| {
+		let next_state_in = array::from_fn(|xy| {
 			oracles
-				.add_shifted(state_in_xy, 64, 11, ShiftVariant::LogicalRight)
+				.add_named(format!("next_state_in_{}", xy))
+				.shifted(state_in_oracle[xy], 64, 11, ShiftVariant::LogicalRight)
 				.unwrap()
 		});
 
@@ -290,7 +296,7 @@ struct Proof<F: Field, PCSComm, PCSProof> {
 	trace_open_proof: PCSProof,
 }
 
-#[instrument(skip_all)]
+#[instrument(skip_all, level = "debug")]
 fn generate_trace<U, FW>(
 	log_size: usize,
 	fixed_oracle: &FixedOracle,
@@ -430,28 +436,28 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip_all)]
-fn prove<U, F, FW, DomainField, PCS, CH>(
+#[instrument(skip_all, level = "debug")]
+fn prove<U, F, FW, DomainField, PCS, CH, Backend>(
 	log_size: usize,
 	oracles: &mut MultilinearOracleSet<F>,
 	fixed_oracle: &FixedOracle,
 	trace_oracle: &TraceOracle,
 	pcs: &PCS,
 	mut challenger: CH,
-	witness: MultilinearExtensionIndex<U, FW>,
+	mut witness: MultilinearExtensionIndex<U, FW>,
 	domain_factory: impl EvaluationDomainFactory<DomainField>,
+	backend: Backend,
 ) -> Result<Proof<F, PCS::Commitment, PCS::Proof>>
 where
-	U: UnderlierType + PackScalar<BinaryField1b> + PackScalar<FW>,
-	PackedType<U, FW>: PackedFieldIndexable,
+	U: UnderlierType + PackScalar<BinaryField1b> + PackScalar<FW> + PackScalar<DomainField>,
 	F: TowerField + From<FW>,
+	PackedType<U, FW>: PackedFieldIndexable<Scalar = FW>,
 	FW: TowerField + From<F> + ExtensionField<DomainField>,
 	DomainField: TowerField,
 	PCS: PolyCommitScheme<PackedType<U, BinaryField1b>, F, Error: Debug, Proof: 'static>,
 	CH: CanObserve<F> + CanObserve<PCS::Commitment> + CanSample<F> + CanSampleBits<usize>,
+	Backend: ComputationBackend,
 {
-	let mut trace_witness = witness.witness_index();
-
 	// Round 1
 	let trace_commit_polys = oracles
 		.committed_oracle_ids(trace_oracle.batch_id)
@@ -498,19 +504,21 @@ where
 		domain_factory.clone(),
 		switchover_fn,
 		&mut challenger,
+		backend.clone(),
 	)?;
 
 	// Evalcheck
 	let GreedyEvalcheckProveOutput {
 		same_query_claims,
 		proof: evalcheck_proof,
-	} = greedy_evalcheck::prove(
+	} = greedy_evalcheck::prove::<_, PackedType<U, FW>, _, _, _>(
 		oracles,
-		&mut trace_witness,
+		&mut witness,
 		evalcheck_claims,
 		switchover_fn,
 		&mut challenger,
 		domain_factory,
+		backend.clone(),
 	)?;
 
 	assert_eq!(same_query_claims.len(), 1);
@@ -520,11 +528,16 @@ where
 		.expect("length is asserted to be 1");
 	assert_eq!(batch_id, trace_oracle.batch_id);
 
+	let trace_commit_polys = oracles
+		.committed_oracle_ids(trace_oracle.batch_id)
+		.map(|oracle_id| witness.get::<BinaryField1b>(oracle_id))
+		.collect::<Result<Vec<_>, _>>()?;
 	let trace_open_proof = pcs.prove_evaluation(
 		&mut challenger,
 		&trace_committed,
 		&trace_commit_polys,
 		&same_query_claim.eval_point,
+		backend,
 	)?;
 
 	Ok(Proof {
@@ -536,8 +549,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip_all)]
-fn verify<P, F, PCS, CH>(
+#[instrument(skip_all, level = "debug")]
+fn verify<P, F, PCS, CH, Backend>(
 	log_size: usize,
 	oracles: &mut MultilinearOracleSet<F>,
 	fixed_oracle: &FixedOracle,
@@ -545,12 +558,14 @@ fn verify<P, F, PCS, CH>(
 	pcs: &PCS,
 	mut challenger: CH,
 	proof: Proof<F, PCS::Commitment, PCS::Proof>,
+	backend: Backend,
 ) -> Result<()>
 where
 	P: PackedField<Scalar = BinaryField1b>,
 	F: TowerField,
 	PCS: PolyCommitScheme<P, F, Error: Debug, Proof: 'static>,
 	CH: CanObserve<F> + CanObserve<PCS::Commitment> + CanSample<F> + CanSampleBits<usize>,
+	Backend: ComputationBackend,
 {
 	let Proof {
 		trace_comm,
@@ -594,6 +609,7 @@ where
 		&same_query_claim.eval_point,
 		trace_open_proof,
 		&same_query_claim.evals,
+		backend,
 	)?;
 
 	Ok(())
@@ -710,9 +726,12 @@ fn main() {
 	let log_inv_rate = 1;
 
 	type U = <PackedBinaryField128x1b as WithUnderlier>::Underlier;
+	type FW = BinaryField128bPolyval;
+
+	let backend = make_backend();
 
 	let mut oracles = MultilinearOracleSet::new();
-	let fixed_oracle = FixedOracle::new(&mut oracles, log_size).unwrap();
+	let fixed_oracle = FixedOracle::new(&mut oracles, log_size, backend.clone()).unwrap();
 	let trace_oracle = TraceOracle::new(&mut oracles, log_size);
 
 	let trace_batch = oracles.committed_batch(trace_oracle.batch_id);
@@ -734,13 +753,11 @@ fn main() {
 	tracing::info!("Size of hashable Keccak-256 data: {}", data_hashed_256);
 	tracing::info!("Size of PCS opening proof: {}", tensorpcs_size);
 
-	let witness =
-		generate_trace::<U, BinaryField128bPolyval>(log_size, &fixed_oracle, &trace_oracle)
-			.unwrap();
+	let witness = generate_trace::<U, FW>(log_size, &fixed_oracle, &trace_oracle).unwrap();
 
-	let challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+	let challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 	let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField128b>::default();
-	let proof = prove::<_, BinaryField128b, BinaryField128bPolyval, BinaryField128bPolyval, _, _>(
+	let proof = prove::<_, BinaryField128b, FW, FW, _, _, _>(
 		log_size,
 		&mut oracles.clone(),
 		&fixed_oracle,
@@ -749,6 +766,7 @@ fn main() {
 		challenger.clone(),
 		witness,
 		domain_factory,
+		backend.clone(),
 	)
 	.unwrap();
 
@@ -760,6 +778,7 @@ fn main() {
 		&pcs,
 		challenger.clone(),
 		proof,
+		backend,
 	)
 	.unwrap();
 }

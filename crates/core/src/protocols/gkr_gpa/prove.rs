@@ -1,15 +1,13 @@
 // Copyright 2024 Ulvetanna Inc.
 
 use super::{
-	gkr_gpa::{GrandProductBatchProveOutput, LayerClaim, GKR_SUMCHECK_DEGREE},
+	gkr_gpa::{GrandProductBatchProveOutput, LayerClaim},
 	Error, GrandProductBatchProof, GrandProductClaim, GrandProductWitness,
 };
 use crate::{
+	composition::BivariateProduct,
 	oracle::MultilinearPolyOracle,
-	polynomial::{
-		composition::BivariateProduct, extrapolate_line, EvaluationDomainFactory,
-		MultilinearComposite, MultilinearExtension, MultilinearPoly, MultilinearQuery,
-	},
+	polynomial::{MultilinearComposite, MultilinearExtension, MultilinearPoly, MultilinearQuery},
 	protocols::{
 		evalcheck::EvalcheckMultilinearClaim,
 		gkr_gpa::gkr_gpa::BatchLayerProof,
@@ -20,8 +18,13 @@ use crate::{
 	},
 	witness::MultilinearWitness,
 };
-use binius_field::{ExtensionField, Field, PackedField, TowerField};
-use binius_utils::sorting::{stable_sort, unsort};
+use binius_field::{ExtensionField, Field, PackedExtension, PackedField, TowerField};
+use binius_hal::ComputationBackend;
+use binius_math::{extrapolate_line_scalar, EvaluationDomainFactory};
+use binius_utils::{
+	bail,
+	sorting::{stable_sort, unsort},
+};
 use p3_challenger::{CanObserve, CanSample};
 use std::sync::Arc;
 use tracing::instrument;
@@ -33,19 +36,21 @@ type MultilinWitnessPair<'a, P> = (MultilinearWitness<'a, P>, MultilinearWitness
 /// REQUIRES:
 /// * witnesses and claims are of the same length
 /// * The ith witness corresponds to the ith claim
-#[instrument(skip_all, name = "gkr_gpa::batch_prove")]
-pub fn batch_prove<'a, F, PW, DomainField, Challenger>(
+#[instrument(skip_all, name = "gkr_gpa::batch_prove", level = "debug")]
+pub fn batch_prove<'a, F, PW, DomainField, Challenger, Backend>(
 	witnesses: impl IntoIterator<Item = GrandProductWitness<'a, PW>>,
 	claims: impl IntoIterator<Item = GrandProductClaim<F>>,
 	evaluation_domain_factory: impl EvaluationDomainFactory<DomainField>,
 	mut challenger: Challenger,
+	backend: Backend,
 ) -> Result<GrandProductBatchProveOutput<F>, Error>
 where
 	F: TowerField + From<PW::Scalar>,
-	PW: PackedField,
+	PW: PackedExtension<DomainField>,
 	DomainField: Field,
 	PW::Scalar: Field + From<F> + ExtensionField<DomainField>,
 	Challenger: CanSample<F> + CanObserve<F>,
+	Backend: ComputationBackend,
 {
 	//  Ensure witnesses and claims are of the same length, zip them together
 	// 	For each witness-claim pair, create GrandProductProver
@@ -57,14 +62,14 @@ where
 		return Ok(GrandProductBatchProveOutput::default());
 	}
 	if witness_vec.len() != n_claims {
-		return Err(Error::MismatchedWitnessClaimLength);
+		bail!(Error::MismatchedWitnessClaimLength);
 	}
 
 	// Create a vector of GrandProductProverStates
 	let provers_vec = witness_vec
 		.into_iter()
 		.zip(claim_vec.into_iter())
-		.map(|(witness, claim)| GrandProductProverState::new(&claim, witness))
+		.map(|(witness, claim)| GrandProductProverState::new(&claim, witness, backend.clone()))
 		.collect::<Result<Vec<_>, _>>()?;
 
 	let (original_indices, mut sorted_provers) =
@@ -116,6 +121,7 @@ where
 				evaluation_domain_factory.clone(),
 				|_| 1, // TODO better switchover fn
 				&mut challenger,
+				backend.clone(),
 			)?;
 			let sumcheck_challenge = reduced_claims[0].eval_point.clone();
 			(proof, sumcheck_challenge)
@@ -178,16 +184,17 @@ where
 	})
 }
 
-fn process_finished_provers<F, PW>(
+fn process_finished_provers<F, PW, Backend>(
 	n_claims: usize,
 	layer_no: usize,
-	sorted_provers: &mut Vec<GrandProductProverState<'_, F, PW>>,
+	sorted_provers: &mut Vec<GrandProductProverState<'_, F, PW, Backend>>,
 	reverse_sorted_evalcheck_multilinear_claims: &mut Vec<EvalcheckMultilinearClaim<F>>,
 ) -> Result<(), Error>
 where
 	PW: PackedField,
 	F: Field + From<PW::Scalar>,
 	PW::Scalar: Field + From<F>,
+	Backend: ComputationBackend,
 {
 	while !sorted_provers.is_empty() && sorted_provers.last().unwrap().input_vars() == layer_no {
 		debug_assert!(layer_no > 0);
@@ -207,11 +214,12 @@ where
 /// Coordinates the proving of a grand product claim before and after
 /// the sumcheck-based layer reductions.
 #[derive(Debug)]
-struct GrandProductProverState<'a, F, PW>
+struct GrandProductProverState<'a, F, PW, Backend>
 where
 	F: Field + From<PW::Scalar>,
 	PW: PackedField,
 	PW::Scalar: Field + From<F>,
+	Backend: ComputationBackend,
 {
 	// Input polynomial oracle
 	poly: MultilinearPolyOracle<F>,
@@ -223,23 +231,27 @@ where
 	next_layer_halves: Vec<MultilinWitnessPair<'a, PW>>,
 	// The current claim about a layer multilinear of the product circuit
 	current_layer_claim: LayerClaim<F>,
+
+	backend: Backend,
 }
 
-impl<'a, F, PW> GrandProductProverState<'a, F, PW>
+impl<'a, F, PW, Backend> GrandProductProverState<'a, F, PW, Backend>
 where
 	F: Field + From<PW::Scalar>,
 	PW: PackedField,
 	PW::Scalar: Field + From<F>,
+	Backend: ComputationBackend,
 {
 	/// Create a new GrandProductProverState
 	fn new(
 		claim: &GrandProductClaim<F>,
 		witness: GrandProductWitness<'a, PW>,
+		backend: Backend,
 	) -> Result<Self, Error> {
 		let n_vars = claim.poly.n_vars();
 		if n_vars != witness.n_vars() || witness.grand_product_evaluation() != claim.product.into()
 		{
-			return Err(Error::ProverClaimWitnessMismatch);
+			bail!(Error::ProverClaimWitnessMismatch);
 		}
 
 		// Build multilinear polynomials from circuit evaluations
@@ -279,6 +291,7 @@ where
 			next_layer_halves,
 			layers,
 			current_layer_claim: layer_claim,
+			backend,
 		})
 	}
 
@@ -302,7 +315,7 @@ where
 		Error,
 	> {
 		if self.current_layer_no() >= self.input_vars() {
-			return Err(Error::TooManyRounds);
+			bail!(Error::TooManyRounds);
 		}
 
 		// Witness
@@ -321,7 +334,7 @@ where
 		// Claim
 		let claim = GkrSumcheckClaim {
 			n_vars: self.current_layer_no(),
-			degree: GKR_SUMCHECK_DEGREE,
+			degree: BivariateProduct.degree(),
 			sum: self.current_layer_claim.eval,
 			r: self.current_layer_claim.eval_point.clone(),
 		};
@@ -332,7 +345,7 @@ where
 	// Give the (k+1)th layer evaluations at the evaluation points (r'_k, 0) and (r'_k, 1)
 	fn advise_sumcheck_prove(&self, sumcheck_eval_point: &[F]) -> Result<(F, F), Error> {
 		if self.current_layer_no() >= self.input_vars() {
-			return Err(Error::TooManyRounds);
+			bail!(Error::TooManyRounds);
 		}
 
 		let query = sumcheck_eval_point
@@ -340,7 +353,7 @@ where
 			.cloned()
 			.map(Into::into)
 			.collect::<Vec<_>>();
-		let multilinear_query = MultilinearQuery::with_full_query(&query)?;
+		let multilinear_query = MultilinearQuery::with_full_query(&query, self.backend.clone())?;
 
 		let zero_eval = self.next_layer_halves[self.current_layer_no()]
 			.0
@@ -360,10 +373,10 @@ where
 		gkr_challenge: F,
 	) -> Result<(), Error> {
 		if self.current_layer_no() >= self.input_vars() {
-			return Err(Error::TooManyRounds);
+			bail!(Error::TooManyRounds);
 		}
 
-		let new_eval = extrapolate_line(zero_eval, one_eval, gkr_challenge);
+		let new_eval = extrapolate_line_scalar(zero_eval, one_eval, gkr_challenge);
 		let mut layer_challenge = sumcheck_challenge;
 		layer_challenge.push(gkr_challenge);
 
@@ -376,7 +389,7 @@ where
 
 	fn finalize(self) -> Result<EvalcheckMultilinearClaim<F>, Error> {
 		if self.current_layer_no() != self.input_vars() {
-			return Err(Error::PrematureFinalize);
+			bail!(Error::PrematureFinalize);
 		}
 
 		let evalcheck_multilinear_claim = EvalcheckMultilinearClaim {

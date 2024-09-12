@@ -9,7 +9,9 @@ authors.workspace = true
 assert_matches.workspace = true
 auto_impl.workspace = true
 binius_field = { path = "../field" }
+binius_hal = { path = "../hal" }
 binius_hash = { path = "../hash" }
+binius_math = { path = "../math" }
 binius_ntt = { path = "../ntt" }
 binius_utils = { path = "../utils" }
 bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
@@ -23,6 +25,7 @@ p3-symmetric.workspace = true
 p3-util.workspace = true
 rand.workspace = true
 rayon.workspace = true
+stackalloc.workspace = true
 thiserror.workspace = true
 thread_local.workspace = true
 tracing.workspace = true
@@ -53,15 +56,11 @@ name = "multilinear_query"
 harness = false
 
 [[bench]]
-name = "util"
-harness = false
-
-[[bench]]
 name = "zerocheck"
 harness = false
 
 [[bench]]
-name = "gkr_prodcheck"
+name = "prodcheck"
 harness = false
 
 [features]

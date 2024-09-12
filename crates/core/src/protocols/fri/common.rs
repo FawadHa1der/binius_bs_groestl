@@ -1,11 +1,15 @@
 // Copyright 2024 Ulvetanna Inc.
 
 use crate::{
-	linear_code::LinearCode, polynomial::extrapolate_line, protocols::fri::Error,
+	linear_code::LinearCode, merkle_tree::VectorCommitScheme, protocols::fri::Error,
 	reed_solomon::reed_solomon::ReedSolomonCode,
 };
 use binius_field::{BinaryField, ExtensionField, PackedFieldIndexable};
+use binius_math::extrapolate_line_scalar;
 use binius_ntt::AdditiveNTT;
+use binius_utils::bail;
+use itertools::Itertools;
+use p3_util::log2_strict_usize;
 
 /// Calculate fold of `values` at `index` with `r` random coefficient.
 ///
@@ -28,7 +32,7 @@ where
 	let (mut u, mut v) = values;
 	v += u;
 	u += v * t;
-	extrapolate_line(u, v, r)
+	extrapolate_line_scalar(u, v, r)
 }
 
 /// Calculate fold of `values` at a `chunk_index` with random folding challenges.
@@ -85,12 +89,135 @@ where
 	scratch_buffer[0]
 }
 
+fn validate_common_fri_arguments<F, FA, VCS>(
+	committed_rs_code: &ReedSolomonCode<FA>,
+	final_rs_code: &ReedSolomonCode<F>,
+	committed_codeword_vcs: &VCS,
+	round_vcss: &[VCS],
+) -> Result<(), Error>
+where
+	F: BinaryField,
+	FA: BinaryField,
+	VCS: VectorCommitScheme<F>,
+{
+	if committed_rs_code.len() != committed_codeword_vcs.vector_len() {
+		bail!(Error::InvalidArgs(
+			"Reed–Solomon code length must match codeword vector commitment length".to_string(),
+		));
+	}
+
+	// This is a tricky case to handle well.
+	// TODO: Change interfaces to support equality, which implies supporting parameters
+	// where the final codeword is the originally committed codeword.
+	if committed_rs_code.log_dim() <= final_rs_code.log_dim() {
+		bail!(Error::MessageDimensionIsTooSmall);
+	}
+
+	// check that base two log of each round_vcs vector_length is greater than
+	// the code's log_inv_rate and less than log_len.
+	debug_assert!(committed_rs_code.log_dim() >= 1);
+	let upper_bound = 1 << (committed_rs_code.log_len() - 1);
+	let lower_bound = 1 << (committed_rs_code.log_inv_rate() + final_rs_code.log_dim() + 1);
+	if round_vcss.iter().any(|vcs| {
+		let len = vcs.vector_len();
+		len < lower_bound || len > upper_bound
+	}) {
+		bail!(Error::RoundVCSLengthsOutOfRange);
+	}
+
+	// check that each round_vcs has power of two vector_length
+	if round_vcss
+		.iter()
+		.any(|vcs| !vcs.vector_len().is_power_of_two())
+	{
+		bail!(Error::RoundVCSLengthsNotPowerOfTwo);
+	}
+
+	// check that round_vcss vector is sorted in strictly descending order by vector_length
+	if round_vcss
+		.windows(2)
+		.any(|w| w[0].vector_len() <= w[1].vector_len())
+	{
+		bail!(Error::RoundVCSLengthsNotDescending);
+	}
+	Ok(())
+}
+
+/// Calculates the fold_rounds where folded codewords are committed by the FRIFolder.
+/// Also validates consistency of round vector commitment schemes with a Reed-Solomon code for FRI.
+///
+/// The validation checks that:
+/// - The committed Reed-Solomon code length matches the committed codeword vector commitment length.
+/// - The committed Reed-Solomon code has dimension greater than the final Reed-Solomon code.
+/// - The vector lengths of the round vector commitment schemes (vcss) are powers of two.
+/// - The vector lengths of the round vcss are strictly decreasing.
+/// - The vector lengths of the round vcss are in the range (2^(log_inv_rate + final_msg_dim), 2^log_len).
+pub fn calculate_fold_commit_rounds<F, FA, VCS>(
+	committed_rs_code: &ReedSolomonCode<FA>,
+	final_rs_code: &ReedSolomonCode<F>,
+	committed_codeword_vcs: &VCS,
+	round_vcss: &[VCS],
+) -> Result<Vec<usize>, Error>
+where
+	F: BinaryField,
+	FA: BinaryField,
+	VCS: VectorCommitScheme<F>,
+{
+	validate_common_fri_arguments(
+		committed_rs_code,
+		final_rs_code,
+		committed_codeword_vcs,
+		round_vcss,
+	)?;
+
+	let log_len = committed_rs_code.log_len();
+	let commit_rounds = round_vcss
+		.iter()
+		.map(|vcs| log_len - 1 - log2_strict_usize(vcs.vector_len()));
+	Ok(commit_rounds.collect())
+}
+
+/// Calculates the start rounds of each fold chunk call made by the FRIFolder.
+///
+/// REQUIRES:
+/// - fold_commit_rounds is the output of calculate_fold_commit_rounds.
+pub fn calculate_fold_chunk_start_rounds(fold_commit_rounds: &[usize]) -> Vec<usize> {
+	let mut fold_chunk_start_rounds = vec![0; fold_commit_rounds.len() + 1];
+	fold_chunk_start_rounds
+		.iter_mut()
+		.skip(1)
+		.zip(fold_commit_rounds.iter())
+		.for_each(|(fold_chunk_start_round, fold_commit_round)| {
+			*fold_chunk_start_round = fold_commit_round + 1;
+		});
+	fold_chunk_start_rounds
+}
+
+/// Calculates the arity of each fold chunk call made by the FRIFolder.
+///
+/// REQUIRES:
+/// - `fold_chunk_start_rounds` is the output of `calculate_fold_chunk_start_rounds`.
+pub fn calculate_folding_arities(
+	total_fold_rounds: usize,
+	fold_chunk_start_rounds: &[usize],
+) -> Vec<usize> {
+	fold_chunk_start_rounds
+		.iter()
+		.copied()
+		.chain(std::iter::once(total_fold_rounds))
+		.tuple_windows()
+		.map(|(prev_start_round, next_start_round)| next_start_round - prev_start_round)
+		.collect()
+}
+
 /// A proof for a single FRI consistency query.
 pub type QueryProof<F, VCSProof> = Vec<QueryRoundProof<F, VCSProof>>;
 
 /// The type of the final message in the FRI protocol.
-/// TODO: This should be generalized to a Vec<F> when we support early FRI termination.
-pub type FinalMessage<F> = F;
+pub type FinalMessage<F> = Vec<F>;
+
+/// The type of the final codeword in the FRI protocol.
+pub type FinalCodeword<F> = Vec<F>;
 
 /// The values and vector commitment opening proofs for a coset.
 #[derive(Debug, Clone)]

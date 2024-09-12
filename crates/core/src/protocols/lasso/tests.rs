@@ -1,15 +1,16 @@
 // Copyright 2024 Ulvetanna Inc.
 
 use crate::{
-	oracle::{CommittedBatchSpec, CommittedId, MultilinearOracleSet},
+	oracle::MultilinearOracleSet,
 	polynomial::MultilinearExtension,
-	protocols::lasso::{prove, verify, LassoBatch, LassoClaim, LassoWitness},
+	protocols::lasso::{prove, verify, LassoBatches, LassoClaim, LassoWitness},
 	witness::MultilinearExtensionIndex,
 };
 use binius_field::{
 	as_packed_field::PackedType, underlier::WithUnderlier, BinaryField128b, BinaryField16b,
-	BinaryField64b, PackedBinaryField128x1b, PackedFieldIndexable, TowerField,
+	BinaryField64b, Field, PackedBinaryField128x1b, PackedFieldIndexable, TowerField,
 };
+use binius_hal::make_backend;
 
 #[test]
 fn test_prove_verify_interaction() {
@@ -19,6 +20,8 @@ fn test_prove_verify_interaction() {
 	type U = <PackedBinaryField128x1b as WithUnderlier>::Underlier;
 
 	let n_vars = 10;
+
+	let backend = make_backend();
 
 	// Setup witness
 
@@ -53,41 +56,61 @@ fn test_prove_verify_interaction() {
 		.unwrap()
 		.specialize_arc_dyn();
 
-	let witness =
-		LassoWitness::<PackedType<U, F>, _>::new(t_polynomial, u_polynomial, u_to_t_mapping)
-			.unwrap();
+	let witness = LassoWitness::<PackedType<U, F>, _>::new(
+		t_polynomial,
+		[
+			u_polynomial.clone(),
+			u_polynomial.clone(),
+			u_polynomial.clone(),
+		]
+		.to_vec(),
+		[&u_to_t_mapping, &u_to_t_mapping, &u_to_t_mapping].to_vec(),
+	)
+	.unwrap();
 
 	// Setup claim
 	let mut oracles = MultilinearOracleSet::<F>::new();
 
-	let lookup_batch = oracles.add_committed_batch(CommittedBatchSpec {
-		n_vars,
-		n_polys: 2,
-		tower_level: E::TOWER_LEVEL,
-	});
+	let lookup_batch = oracles.add_committed_batch(n_vars, E::TOWER_LEVEL);
+	let [t, u] = oracles.add_committed_multiple(lookup_batch);
 
-	let t_oracle = oracles.committed_oracle(CommittedId {
-		batch_id: lookup_batch,
-		index: 0,
-	});
+	let lasso_batches =
+		LassoBatches::new_in::<C, _>(&mut oracles, &[n_vars, n_vars, n_vars], n_vars);
 
-	let u_oracle = oracles.committed_oracle(CommittedId {
-		batch_id: lookup_batch,
-		index: 1,
-	});
-
-	let lasso_batch = LassoBatch::new_in::<C, _>(&mut oracles, n_vars);
-
-	let claim = LassoClaim::new(t_oracle, u_oracle).unwrap();
+	let claim = LassoClaim::new(
+		oracles.oracle(t),
+		[oracles.oracle(u), oracles.oracle(u), oracles.oracle(u)].to_vec(),
+	)
+	.unwrap();
 
 	// PROVER
 	let witness_index = MultilinearExtensionIndex::new();
 
-	let _prove_output =
-		prove::<C, U, F, F, _>(&mut oracles.clone(), witness_index, &claim, witness, &lasso_batch)
-			.unwrap();
+	let gamma = F::new(137_u128);
 
-	// VERIFIER
-	let _verified_reduced_claim =
-		verify::<C, _>(&mut oracles.clone(), &claim, &lasso_batch).unwrap();
+	let alpha = F::ONE;
+
+	let prove_output = prove::<C, U, F, F, _, _>(
+		&mut oracles.clone(),
+		witness_index,
+		&claim,
+		witness,
+		&lasso_batches,
+		gamma,
+		alpha,
+		backend.clone(),
+	)
+	.unwrap();
+
+	// // VERIFIER
+	let _verified_reduced_claim = verify::<C, _, _>(
+		&mut oracles.clone(),
+		&claim,
+		&lasso_batches,
+		gamma,
+		alpha,
+		prove_output.lasso_proof,
+		backend.clone(),
+	)
+	.unwrap();
 }

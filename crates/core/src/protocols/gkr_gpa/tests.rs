@@ -2,14 +2,19 @@
 
 use super::{GrandProductClaim, GrandProductWitness};
 use crate::{
-	challenger::HashChallenger,
-	oracle::{CommittedBatchSpec, CommittedId, MultilinearOracleSet},
-	polynomial::{IsomorphicEvaluationDomainFactory, MultilinearExtension},
+	challenger::new_hasher_challenger,
+	oracle::MultilinearOracleSet,
+	polynomial::MultilinearExtension,
 	protocols::gkr_gpa::{batch_prove, batch_verify, GrandProductBatchProveOutput},
-	witness::MultilinearWitnessIndex,
+	witness::MultilinearExtensionIndex,
 };
-use binius_field::{BinaryField128b, BinaryField32b, Field, TowerField};
+use binius_field::{
+	as_packed_field::{PackScalar, PackedType},
+	underlier::{UnderlierType, WithUnderlier},
+	BinaryField128b, BinaryField32b, Field, PackedField, TowerField,
+};
 use binius_hash::GroestlHasher;
+use binius_math::IsomorphicEvaluationDomainFactory;
 use rand::{rngs::StdRng, SeedableRng};
 use std::iter::repeat_with;
 
@@ -32,42 +37,46 @@ where
 	.collect::<Vec<_>>()
 }
 
-struct CreateClaimsWitnessesOutput<'a, F: TowerField> {
+struct CreateClaimsWitnessesOutput<
+	'a,
+	U: UnderlierType + PackScalar<F, Packed = P>,
+	P: PackedField<Scalar = F>,
+	F: TowerField,
+> {
 	new_claims: Vec<GrandProductClaim<F>>,
-	new_witnesses: Vec<GrandProductWitness<'a, F>>,
+	new_witnesses: Vec<GrandProductWitness<'a, P>>,
 	oracle_set: MultilinearOracleSet<F>,
-	witness_index: MultilinearWitnessIndex<'a, F>,
+	witness_index: MultilinearExtensionIndex<'a, U, F>,
 	rng: StdRng,
 }
 
-fn create_claims_witnesses_helper<F: TowerField>(
+fn create_claims_witnesses_helper<
+	U: UnderlierType + PackScalar<F, Packed = P>,
+	P: PackedField<Scalar = F>,
+	F: TowerField,
+>(
 	mut rng: StdRng,
 	mut oracle_set: MultilinearOracleSet<F>,
-	mut witness_index: MultilinearWitnessIndex<'_, F>,
+	mut witness_index: MultilinearExtensionIndex<'_, U, F>,
 	n_vars: usize,
 	n_multilins: usize,
-) -> CreateClaimsWitnessesOutput<'_, F> {
+) -> CreateClaimsWitnessesOutput<'_, U, P, F> {
 	if n_vars == 0 || n_multilins == 0 {
 		panic!("Require at least one variable and multilinear polynomial");
 	}
-
-	let batch_id = oracle_set.add_committed_batch(CommittedBatchSpec {
-		n_vars,
-		n_polys: n_multilins,
-		tower_level: F::TOWER_LEVEL,
-	});
-
+	let batch_id = oracle_set.add_committed_batch(n_vars, F::TOWER_LEVEL);
 	let multilin_oracles = (0..n_multilins)
-		.map(|index| oracle_set.committed_oracle(CommittedId { batch_id, index }))
+		.map(|_| {
+			let id = oracle_set.add_committed(batch_id);
+			oracle_set.oracle(id)
+		})
 		.collect::<Vec<_>>();
 
 	let mles_with_product = generate_poly_helper::<F>(&mut rng, n_vars, n_multilins);
-	(0..n_multilins).for_each(|index| {
-		witness_index.set(
-			multilin_oracles[index].id(),
-			mles_with_product[index].0.clone().specialize_arc_dyn(),
-		);
+	let update = (0..n_multilins).map(|index| {
+		(multilin_oracles[index].id(), mles_with_product[index].0.clone().specialize_arc_dyn())
 	});
+	witness_index.update_multilin_poly(update).unwrap();
 
 	let mut new_claims = Vec::with_capacity(n_multilins);
 	let mut new_witnesses = Vec::with_capacity(n_multilins);
@@ -77,9 +86,8 @@ fn create_claims_witnesses_helper<F: TowerField>(
 			product: mles_with_product[index].1,
 		};
 		let witness_poly = witness_index
-			.get(multilin_oracles[index].id())
-			.unwrap()
-			.clone();
+			.get_multilin_poly(multilin_oracles[index].id())
+			.unwrap();
 		let witness = GrandProductWitness::new(witness_poly).unwrap();
 		new_claims.push(claim);
 		new_witnesses.push(witness);
@@ -97,15 +105,18 @@ fn create_claims_witnesses_helper<F: TowerField>(
 #[test]
 fn test_prove_verify_batch() {
 	type F = BinaryField128b;
+	type U = <F as WithUnderlier>::Underlier;
+	type P = PackedType<U, F>;
 	type FS = BinaryField32b;
 	let rng = StdRng::seed_from_u64(0);
 	let oracle_set = MultilinearOracleSet::<F>::new();
-	let witness_index = MultilinearWitnessIndex::<F>::new();
+	let witness_index = MultilinearExtensionIndex::<U, F>::new();
 	let mut claims = Vec::new();
 	let mut witnesses = Vec::new();
-	let prover_challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+	let prover_challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 	let verifier_challenger = prover_challenger.clone();
 	let domain_factory = IsomorphicEvaluationDomainFactory::<FS>::default();
+	let backend = binius_hal::make_backend();
 
 	// Setup
 	let (n_vars, n_multilins) = (5, 2);
@@ -115,7 +126,7 @@ fn test_prove_verify_batch() {
 		oracle_set,
 		witness_index,
 		rng,
-	} = create_claims_witnesses_helper::<F>(rng, oracle_set, witness_index, n_vars, n_multilins);
+	} = create_claims_witnesses_helper::<U, P, F>(rng, oracle_set, witness_index, n_vars, n_multilins);
 	assert_eq!(new_claims.len(), n_multilins);
 	assert_eq!(new_witnesses.len(), n_multilins);
 	claims.extend(new_claims);
@@ -128,7 +139,7 @@ fn test_prove_verify_batch() {
 		oracle_set,
 		witness_index,
 		rng,
-	} = create_claims_witnesses_helper::<F>(rng, oracle_set, witness_index, n_vars, n_multilins);
+	} = create_claims_witnesses_helper::<U, P, F>(rng, oracle_set, witness_index, n_vars, n_multilins);
 	assert_eq!(new_claims.len(), n_multilins);
 	assert_eq!(new_witnesses.len(), n_multilins);
 	claims.extend(new_claims);
@@ -141,7 +152,7 @@ fn test_prove_verify_batch() {
 		oracle_set,
 		witness_index,
 		rng,
-	} = create_claims_witnesses_helper::<F>(rng, oracle_set, witness_index, n_vars, n_multilins);
+	} = create_claims_witnesses_helper::<U, P, F>(rng, oracle_set, witness_index, n_vars, n_multilins);
 	assert_eq!(new_claims.len(), n_multilins);
 	assert_eq!(new_witnesses.len(), n_multilins);
 	claims.extend(new_claims);
@@ -152,8 +163,14 @@ fn test_prove_verify_batch() {
 	let GrandProductBatchProveOutput {
 		evalcheck_multilinear_claims,
 		proof,
-	} = batch_prove::<_, _, FS, _>(witnesses, claims.clone(), domain_factory, prover_challenger)
-		.unwrap();
+	} = batch_prove::<_, _, FS, _, _>(
+		witnesses,
+		claims.clone(),
+		domain_factory,
+		prover_challenger,
+		backend,
+	)
+	.unwrap();
 
 	let verified_evalcheck_multilinear_claims =
 		batch_verify(claims.clone(), proof, verifier_challenger).unwrap();

@@ -2,12 +2,9 @@
 #![feature(step_trait)]
 
 use binius_core::{
-	challenger::HashChallenger,
-	oracle::{CommittedBatchSpec, CommittedId, CompositePolyOracle, MultilinearOracleSet},
-	polynomial::{
-		CompositionPoly, IsomorphicEvaluationDomainFactory, MultilinearComposite,
-		MultilinearExtension, MultilinearPoly,
-	},
+	challenger::new_hasher_challenger,
+	oracle::{CompositePolyOracle, MultilinearOracleSet},
+	polynomial::{CompositionPoly, MultilinearComposite, MultilinearExtension, MultilinearPoly},
 	protocols::{
 		sumcheck::{prove, Error as SumcheckError, SumcheckClaim},
 		test_utils::{transform_poly, TestProductComposition},
@@ -15,9 +12,11 @@ use binius_core::{
 };
 use binius_field::{
 	BinaryField128b, BinaryField128bPolyval, BinaryField1b, BinaryField32b, BinaryField8b,
-	ExtensionField, Field, PackedField, TowerField,
+	ExtensionField, Field, PackedExtension, PackedField, TowerField,
 };
+use binius_hal::make_backend;
 use binius_hash::GroestlHasher;
+use binius_math::IsomorphicEvaluationDomainFactory;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::thread_rng;
 use std::{
@@ -63,7 +62,8 @@ fn sumcheck_128b_with_switchover<P, DomainField>(c: &mut Criterion, id: &str, sw
 where
 	P: PackedField + Debug,
 	DomainField: Field + Step + Debug,
-	BinaryField128b: ExtensionField<P::Scalar> + ExtensionField<DomainField>,
+	BinaryField128b:
+		ExtensionField<P::Scalar> + ExtensionField<DomainField> + PackedExtension<DomainField>,
 {
 	type FTower = BinaryField128b;
 
@@ -71,6 +71,7 @@ where
 	let composition = TestProductComposition::new(n_multilinears);
 
 	let domain_factory = IsomorphicEvaluationDomainFactory::<DomainField>::default();
+	let backend = make_backend();
 
 	let mut rng = thread_rng();
 
@@ -97,15 +98,16 @@ where
 
 			let sumcheck_claim = make_sumcheck_claim(&poly).unwrap();
 			let sumcheck_witness = poly.clone();
-			let prove_challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+			let prove_challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 
 			b.iter(|| {
-				prove::<FTower, FTower, DomainField, _>(
+				prove::<FTower, FTower, DomainField, _, _>(
 					&sumcheck_claim,
 					sumcheck_witness.clone(),
 					domain_factory.clone(),
 					move |_| switchover,
 					prove_challenger.clone(),
+					backend.clone(),
 				)
 			});
 		});
@@ -120,6 +122,7 @@ fn sumcheck_128b_monomial_basis(c: &mut Criterion) {
 	let composition = TestProductComposition::new(n_multilinears);
 
 	let domain_factory = IsomorphicEvaluationDomainFactory::<FTower>::default();
+	let backend = make_backend();
 
 	let mut rng = thread_rng();
 
@@ -165,15 +168,16 @@ fn sumcheck_128b_monomial_basis(c: &mut Criterion) {
 			.unwrap();
 
 			let sumcheck_claim = make_sumcheck_claim(&poly).unwrap();
-			let prove_challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+			let prove_challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 
 			b.iter(|| {
-				prove::<FTower, FPolyval, FPolyval, _>(
+				prove::<FTower, FPolyval, FPolyval, _, _>(
 					&sumcheck_claim,
 					prover_poly.clone(),
 					domain_factory.clone(),
 					|_| 1,
 					prove_challenger.clone(),
+					backend.clone(),
 				)
 			});
 		});
@@ -188,6 +192,7 @@ fn sumcheck_128b_monomial_basis_with_arc(c: &mut Criterion) {
 	let composition = TestProductComposition::new(n_multilinears);
 
 	let domain_factory = IsomorphicEvaluationDomainFactory::<FTower>::default();
+	let backend = make_backend();
 
 	let mut rng = thread_rng();
 
@@ -244,15 +249,16 @@ fn sumcheck_128b_monomial_basis_with_arc(c: &mut Criterion) {
 			> = MultilinearComposite::new(n_vars, composition.clone(), multilinears).unwrap();
 
 			let sumcheck_claim = make_sumcheck_claim(&poly).unwrap();
-			let prove_challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+			let prove_challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 
 			b.iter(|| {
-				prove::<_, FPolyval, FPolyval, _>(
+				prove::<_, FPolyval, FPolyval, _, _>(
 					&sumcheck_claim,
 					prover_poly.clone(),
 					domain_factory.clone(),
 					|_| 1,
 					prove_challenger.clone(),
+					backend.clone(),
 				)
 			});
 		});
@@ -270,14 +276,14 @@ where
 {
 	// Setup poly_oracle
 	let mut oracles = MultilinearOracleSet::new();
-	let batch_id = oracles.add_committed_batch(CommittedBatchSpec {
-		n_vars: poly.n_vars(),
-		n_polys: poly.n_multilinears(),
-		tower_level: F::TOWER_LEVEL,
-	});
+	let batch_id = oracles.add_committed_batch(poly.n_vars(), F::TOWER_LEVEL);
 	let inner = (0..poly.n_multilinears())
-		.map(|index| oracles.committed_oracle(CommittedId { batch_id, index }))
-		.collect::<Vec<_>>();
+		.map(|_| {
+			let id = oracles.add_committed(batch_id);
+			oracles.oracle(id)
+		})
+		.collect();
+
 	let composite_poly =
 		CompositePolyOracle::new(poly.n_vars(), inner, poly.composition.clone()).unwrap();
 

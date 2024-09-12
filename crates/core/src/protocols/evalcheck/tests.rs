@@ -1,12 +1,12 @@
 // Copyright 2024 Ulvetanna Inc.
 
 use crate::{
+	composition::BivariateProduct,
 	oracle::{
-		CommittedBatchSpec, CommittedId, CompositePolyOracle, MultilinearOracleSet,
-		MultilinearPolyOracle, ProjectionVariant, ShiftVariant,
+		CompositePolyOracle, MultilinearOracleSet, MultilinearPolyOracle, ProjectionVariant,
+		ShiftVariant,
 	},
 	polynomial::{
-		composition::BivariateProduct, extrapolate_line, transparent::select_row::SelectRow,
 		CompositionPoly, Error as PolynomialError, MultilinearComposite, MultilinearExtension,
 		MultilinearPoly, MultilinearQuery, MultivariatePoly,
 	},
@@ -14,26 +14,33 @@ use crate::{
 		evalcheck::{EvalcheckClaim, EvalcheckProof, EvalcheckProver, EvalcheckVerifier},
 		sumcheck::SumcheckClaim,
 	},
-	witness::MultilinearWitnessIndex,
+	transparent::select_row::SelectRow,
+	witness::MultilinearExtensionIndex,
 };
 use assert_matches::assert_matches;
 use binius_field::{
 	packed::{get_packed_slice, len_packed_slice, set_packed_slice},
+	underlier::WithUnderlier,
 	BinaryField128b, Field, PackedBinaryField128x1b, PackedBinaryField16x8b,
-	PackedBinaryField4x32b, PackedField, TowerField,
+	PackedBinaryField1x128b, PackedBinaryField4x32b, PackedField, TowerField,
 };
+use binius_hal::make_backend;
+use binius_math::extrapolate_line;
+use binius_utils::bail;
 use bytemuck::cast_slice_mut;
-use itertools::Either;
+use itertools::{Either, Itertools};
 use rand::{rngs::StdRng, SeedableRng};
 use std::iter::repeat_with;
 
-type EF = BinaryField128b;
+type FExtension = BinaryField128b;
+type PExtension = PackedBinaryField1x128b;
+type U = <PExtension as WithUnderlier>::Underlier;
 type PF = PackedBinaryField4x32b;
 
 #[derive(Clone, Debug)]
 struct QuadProduct;
 
-impl CompositionPoly<EF> for QuadProduct {
+impl CompositionPoly<FExtension> for QuadProduct {
 	fn n_vars(&self) -> usize {
 		4
 	}
@@ -42,17 +49,9 @@ impl CompositionPoly<EF> for QuadProduct {
 		4
 	}
 
-	fn evaluate_scalar(&self, query: &[EF]) -> Result<EF, PolynomialError> {
+	fn evaluate(&self, query: &[FExtension]) -> Result<FExtension, PolynomialError> {
 		if query.len() != 4 {
-			return Err(PolynomialError::IncorrectQuerySize { expected: 4 });
-		}
-		let (a, b, c, d) = (query[0], query[1], query[2], query[3]);
-		Ok(a * b * c * d)
-	}
-
-	fn evaluate(&self, query: &[EF]) -> Result<EF, PolynomialError> {
-		if query.len() != 4 {
-			return Err(PolynomialError::IncorrectQuerySize { expected: 4 });
+			bail!(PolynomialError::IncorrectQuerySize { expected: 4 });
 		}
 		let (a, b, c, d) = (query[0], query[1], query[2], query[3]);
 		Ok(a * b * c * d)
@@ -66,6 +65,7 @@ impl CompositionPoly<EF> for QuadProduct {
 #[test]
 fn test_evaluation_point_batching() {
 	let mut rng = StdRng::seed_from_u64(0);
+	let backend = make_backend();
 
 	let log_size = 8;
 	let tower_level = 5;
@@ -77,59 +77,47 @@ fn test_evaluation_point_batching() {
 			.collect();
 		MultilinearExtension::from_values(evals)
 			.unwrap()
-			.specialize::<EF>()
+			.specialize::<PExtension>()
 	})
 	.take(4)
 	.collect::<Vec<_>>();
 
 	// eval point & eval in BF128
-	let eval_point = repeat_with(|| <EF as PackedField>::random(&mut rng))
+	let eval_point = repeat_with(|| <FExtension as Field>::random(&mut rng))
 		.take(log_size)
 		.collect::<Vec<_>>();
 
-	let query = MultilinearQuery::with_full_query(&eval_point).unwrap();
+	let query = MultilinearQuery::with_full_query(&eval_point, backend.clone()).unwrap();
 	let batch_evals = multilins
 		.iter()
 		.map(|multilin| multilin.evaluate(&query).unwrap())
 		.collect::<Vec<_>>();
 
-	let eval = batch_evals.iter().fold(EF::ONE, |acc, cur| acc * cur);
+	let eval = batch_evals
+		.iter()
+		.fold(FExtension::ONE, |acc, cur| acc * cur);
 
 	let mut oracles = MultilinearOracleSet::new();
-	let batch_0_id = oracles.add_committed_batch(CommittedBatchSpec {
-		n_vars: log_size,
-		n_polys: 2,
-		tower_level,
-	});
-	let batch_1_id = oracles.add_committed_batch(CommittedBatchSpec {
-		n_vars: log_size,
-		n_polys: 2,
-		tower_level,
-	});
+
+	let batch_0_id = oracles.add_committed_batch(log_size, tower_level);
+	let [x0, x1] = oracles.add_committed_multiple::<2>(batch_0_id);
+
+	let batch_1_id = oracles.add_committed_batch(log_size, tower_level);
+	let [y0, y1] = oracles.add_committed_multiple::<2>(batch_1_id);
 
 	let suboracles = vec![
-		oracles.committed_oracle(CommittedId {
-			batch_id: batch_0_id,
-			index: 0,
-		}),
-		oracles.committed_oracle(CommittedId {
-			batch_id: batch_1_id,
-			index: 0,
-		}),
-		oracles.committed_oracle(CommittedId {
-			batch_id: batch_0_id,
-			index: 1,
-		}),
-		oracles.committed_oracle(CommittedId {
-			batch_id: batch_1_id,
-			index: 1,
-		}),
+		oracles.oracle(x0),
+		oracles.oracle(y0),
+		oracles.oracle(x1),
+		oracles.oracle(y1),
 	];
 
-	let mut witness_index = MultilinearWitnessIndex::new();
-	for (oracle, multilin) in suboracles.iter().zip(multilins.into_iter()) {
-		witness_index.set(oracle.id(), multilin.upcast_arc_dyn());
-	}
+	let multilins = suboracles
+		.iter()
+		.zip_eq(multilins)
+		.map(|(s, m)| (s.id(), m.upcast_arc_dyn()));
+	let mut witness_index = MultilinearExtensionIndex::<U, FExtension>::new();
+	witness_index.update_multilin_poly(multilins).unwrap();
 
 	let oracle = CompositePolyOracle::new(log_size, suboracles.clone(), QuadProduct).unwrap();
 
@@ -140,8 +128,11 @@ fn test_evaluation_point_batching() {
 		is_random_point: true,
 	};
 
-	let mut prover_oracles = oracles.clone();
-	let mut prover_state = EvalcheckProver::new(&mut prover_oracles, &mut witness_index);
+	let mut prover_state = EvalcheckProver::<FExtension, PExtension, _>::new(
+		&mut oracles,
+		&mut witness_index,
+		backend.clone(),
+	);
 	let proof = prover_state.prove(claim.clone()).unwrap();
 
 	let prove_batch0 = prover_state
@@ -214,15 +205,10 @@ fn test_shifted_evaluation_whole_cube() {
 
 	let n_vars = 8;
 
-	let mut oracles = MultilinearOracleSet::<EF>::new();
+	let mut oracles = MultilinearOracleSet::<FExtension>::new();
+	let batch_id = oracles.add_committed_batch(n_vars, <P as PackedField>::Scalar::TOWER_LEVEL);
+	let poly_id = oracles.add_committed(batch_id);
 
-	let batch_id = oracles.add_committed_batch(CommittedBatchSpec {
-		n_vars,
-		n_polys: 1,
-		tower_level: <P as PackedField>::Scalar::TOWER_LEVEL,
-	});
-
-	let poly_id = oracles.committed_oracle_id(CommittedId { batch_id, index: 0 });
 	let shifted_id = oracles
 		.add_shifted(poly_id, 1, n_vars, ShiftVariant::CircularLeft)
 		.unwrap();
@@ -235,7 +221,7 @@ fn test_shifted_evaluation_whole_cube() {
 	.unwrap();
 
 	let mut rng = StdRng::seed_from_u64(0);
-	let eval_point = repeat_with(|| <EF as Field>::random(&mut rng))
+	let eval_point = repeat_with(|| <FExtension as Field>::random(&mut rng))
 		.take(n_vars)
 		.collect::<Vec<_>>();
 
@@ -254,13 +240,14 @@ fn test_shifted_evaluation_whole_cube() {
 		n_vars,
 		BivariateProduct,
 		vec![
-			poly_witness.to_ref().specialize::<EF>(),
-			shifted_witness.to_ref().specialize::<EF>(),
+			poly_witness.to_ref().specialize::<PExtension>(),
+			shifted_witness.to_ref().specialize::<PExtension>(),
 		],
 	)
 	.unwrap();
 
-	let query = MultilinearQuery::with_full_query(&eval_point).unwrap();
+	let backend = make_backend();
+	let query = MultilinearQuery::with_full_query(&eval_point, backend.clone()).unwrap();
 	let eval = composite_witness.evaluate(&query).unwrap();
 
 	let claim = EvalcheckClaim {
@@ -270,12 +257,19 @@ fn test_shifted_evaluation_whole_cube() {
 		is_random_point: true,
 	};
 
-	let mut witness_index = MultilinearWitnessIndex::new();
+	let mut witness_index = MultilinearExtensionIndex::<U, FExtension>::new();
+	witness_index
+		.update_multilin_poly(vec![
+			(poly_id, poly_witness.to_ref().specialize_arc_dyn::<PExtension>()),
+			(shifted_id, shifted_witness.to_ref().specialize_arc_dyn::<PExtension>()),
+		])
+		.unwrap();
 
-	witness_index.set(poly_id, poly_witness.to_ref().specialize_arc_dyn::<EF>());
-	witness_index.set(shifted_id, shifted_witness.to_ref().specialize_arc_dyn::<EF>());
-
-	let mut prover_state = EvalcheckProver::new(&mut oracles, &mut witness_index);
+	let mut prover_state = EvalcheckProver::<FExtension, PExtension, _>::new(
+		&mut oracles,
+		&mut witness_index,
+		backend.clone(),
+	);
 	let proof = prover_state.prove(claim.clone()).unwrap();
 	assert_eq!(
 		prover_state
@@ -313,15 +307,11 @@ fn test_shifted_evaluation_subcube() {
 
 	let n_vars = 8;
 
-	let mut oracles = MultilinearOracleSet::<EF>::new();
+	let mut oracles = MultilinearOracleSet::<FExtension>::new();
 
-	let batch_id = oracles.add_committed_batch(CommittedBatchSpec {
-		n_vars,
-		n_polys: 1,
-		tower_level: <P as PackedField>::Scalar::TOWER_LEVEL,
-	});
+	let batch_id = oracles.add_committed_batch(n_vars, <P as PackedField>::Scalar::TOWER_LEVEL);
+	let poly_id = oracles.add_committed(batch_id);
 
-	let poly_id = oracles.committed_oracle_id(CommittedId { batch_id, index: 0 });
 	let shifted_id = oracles
 		.add_shifted(poly_id, 3, 4, ShiftVariant::CircularLeft)
 		.unwrap();
@@ -334,7 +324,7 @@ fn test_shifted_evaluation_subcube() {
 	.unwrap();
 
 	let mut rng = StdRng::seed_from_u64(0);
-	let eval_point = repeat_with(|| <EF as Field>::random(&mut rng))
+	let eval_point = repeat_with(|| <FExtension as Field>::random(&mut rng))
 		.take(n_vars)
 		.collect::<Vec<_>>();
 
@@ -355,13 +345,14 @@ fn test_shifted_evaluation_subcube() {
 		n_vars,
 		BivariateProduct,
 		vec![
-			poly_witness.to_ref().specialize::<EF>(),
-			shifted_witness.to_ref().specialize::<EF>(),
+			poly_witness.to_ref().specialize::<FExtension>(),
+			shifted_witness.to_ref().specialize::<FExtension>(),
 		],
 	)
 	.unwrap();
 
-	let query = MultilinearQuery::with_full_query(&eval_point).unwrap();
+	let backend = make_backend();
+	let query = MultilinearQuery::with_full_query(&eval_point, backend.clone()).unwrap();
 	let eval = composite_witness.evaluate(&query).unwrap();
 
 	let claim = EvalcheckClaim {
@@ -371,12 +362,19 @@ fn test_shifted_evaluation_subcube() {
 		is_random_point: true,
 	};
 
-	let mut witness_index = MultilinearWitnessIndex::new();
+	let mut witness_index = MultilinearExtensionIndex::<U, FExtension>::new();
+	witness_index
+		.update_multilin_poly(vec![
+			(poly_id, poly_witness.to_ref().specialize_arc_dyn::<PExtension>()),
+			(shifted_id, shifted_witness.to_ref().specialize_arc_dyn::<PExtension>()),
+		])
+		.unwrap();
 
-	witness_index.set(poly_id, poly_witness.to_ref().specialize_arc_dyn::<EF>());
-	witness_index.set(shifted_id, shifted_witness.to_ref().specialize_arc_dyn::<EF>());
-
-	let mut prover_state = EvalcheckProver::new(&mut oracles, &mut witness_index);
+	let mut prover_state = EvalcheckProver::<FExtension, PExtension, _>::new(
+		&mut oracles,
+		&mut witness_index,
+		backend.clone(),
+	);
 	let proof = prover_state.prove(claim.clone()).unwrap();
 	assert_eq!(
 		prover_state
@@ -405,7 +403,7 @@ fn test_shifted_evaluation_subcube() {
 	} = verifier_state.new_sumcheck_claims().first().unwrap();
 
 	match composite.inner_polys()[0] {
-		MultilinearPolyOracle::Projected(_, ref projected) => {
+		MultilinearPolyOracle::Projected { ref projected, .. } => {
 			assert_eq!(projected.inner().id(), poly_id);
 			assert_eq!(projected.values(), &eval_point[4..]);
 			assert_eq!(projected.projection_variant(), ProjectionVariant::LastVars);
@@ -433,25 +431,25 @@ fn test_evalcheck_linear_combination() {
 	let lin_com_id = oracles
 		.add_linear_combination_with_offset(
 			n_vars,
-			EF::new(1),
+			FExtension::new(1),
 			[
-				(select_row1_oracle_id, EF::new(2)),
-				(select_row2_oracle_id, EF::new(3)),
-				(select_row3_oracle_id, EF::new(4)),
+				(select_row1_oracle_id, FExtension::new(2)),
+				(select_row2_oracle_id, FExtension::new(3)),
+				(select_row3_oracle_id, FExtension::new(4)),
 			],
 		)
 		.unwrap();
 	let lin_com = oracles.oracle(lin_com_id);
 
 	let mut rng = StdRng::seed_from_u64(0);
-	let eval_point = repeat_with(|| <EF as Field>::random(&mut rng))
+	let eval_point = repeat_with(|| <FExtension as Field>::random(&mut rng))
 		.take(n_vars)
 		.collect::<Vec<_>>();
 
-	let eval = select_row1.evaluate(&eval_point).unwrap() * EF::new(2)
-		+ select_row2.evaluate(&eval_point).unwrap() * EF::new(3)
-		+ select_row3.evaluate(&eval_point).unwrap() * EF::new(4)
-		+ EF::new(1);
+	let eval = select_row1.evaluate(&eval_point).unwrap() * FExtension::new(2)
+		+ select_row2.evaluate(&eval_point).unwrap() * FExtension::new(3)
+		+ select_row3.evaluate(&eval_point).unwrap() * FExtension::new(4)
+		+ FExtension::new(1);
 
 	let select_row1_witness = select_row1
 		.multilinear_extension::<PackedBinaryField128x1b>()
@@ -465,10 +463,10 @@ fn test_evalcheck_linear_combination() {
 
 	let lin_com_values = (0..1 << n_vars)
 		.map(|i| {
-			select_row1_witness.evaluate_on_hypercube(i).unwrap() * EF::new(2)
-				+ select_row2_witness.evaluate_on_hypercube(i).unwrap() * EF::new(3)
-				+ select_row3_witness.evaluate_on_hypercube(i).unwrap() * EF::new(4)
-				+ EF::new(1)
+			select_row1_witness.evaluate_on_hypercube(i).unwrap() * FExtension::new(2)
+				+ select_row2_witness.evaluate_on_hypercube(i).unwrap() * FExtension::new(3)
+				+ select_row3_witness.evaluate_on_hypercube(i).unwrap() * FExtension::new(4)
+				+ FExtension::new(1)
 		})
 		.collect();
 	let lin_com_witness = MultilinearExtension::from_values(lin_com_values).unwrap();
@@ -485,13 +483,22 @@ fn test_evalcheck_linear_combination() {
 		is_random_point: true,
 	};
 
-	let mut witness = MultilinearWitnessIndex::<EF>::new();
-	witness.set(select_row1_oracle_id, select_row1_witness.specialize_arc_dyn());
-	witness.set(select_row2_oracle_id, select_row2_witness.specialize_arc_dyn());
-	witness.set(select_row3_oracle_id, select_row3_witness.specialize_arc_dyn());
-	witness.set(lin_com_id, lin_com_witness.specialize_arc_dyn());
+	let mut witness_index = MultilinearExtensionIndex::<U, FExtension>::new();
+	witness_index
+		.update_multilin_poly(vec![
+			(select_row1_oracle_id, select_row1_witness.specialize_arc_dyn()),
+			(select_row2_oracle_id, select_row2_witness.specialize_arc_dyn()),
+			(select_row3_oracle_id, select_row3_witness.specialize_arc_dyn()),
+			(lin_com_id, lin_com_witness.specialize_arc_dyn()),
+		])
+		.unwrap();
 
-	let mut prover_state = EvalcheckProver::new(&mut oracles, &mut witness);
+	let backend = make_backend();
+	let mut prover_state = EvalcheckProver::<FExtension, PExtension, _>::new(
+		&mut oracles,
+		&mut witness_index,
+		backend.clone(),
+	);
 	let proof = prover_state.prove(claim.clone()).unwrap();
 
 	let mut verifier_state = EvalcheckVerifier::new(&mut oracles);
@@ -522,10 +529,8 @@ fn test_evalcheck_repeating() {
 	let repeating_id = oracles.add_repeating(select_row_oracle_id, 2).unwrap();
 	let repeating = oracles.oracle(repeating_id);
 
-	let mut witness_index = MultilinearWitnessIndex::<EF>::new();
-
 	let mut rng = StdRng::seed_from_u64(0);
-	let eval_point = repeat_with(|| <EF as Field>::random(&mut rng))
+	let eval_point = repeat_with(|| <FExtension as Field>::random(&mut rng))
 		.take(n_vars + 2)
 		.collect::<Vec<_>>();
 
@@ -538,9 +543,17 @@ fn test_evalcheck_repeating() {
 		is_random_point: true,
 	};
 
-	witness_index.set(repeating_id, select_row_witness);
+	let mut witness_index = MultilinearExtensionIndex::<U, FExtension>::new();
+	witness_index
+		.update_multilin_poly(vec![(repeating_id, select_row_witness)])
+		.unwrap();
 
-	let mut prover_state = EvalcheckProver::new(&mut oracles, &mut witness_index);
+	let backend = make_backend();
+	let mut prover_state = EvalcheckProver::<FExtension, PExtension, _>::new(
+		&mut oracles,
+		&mut witness_index,
+		backend.clone(),
+	);
 	let proof = prover_state.prove(claim.clone()).unwrap();
 
 	if let EvalcheckProof::Composite { ref subproofs } = proof {
@@ -602,17 +615,17 @@ fn test_evalcheck_merged() {
 		.unwrap();
 	let merged = oracles.oracle(merged_id);
 
-	let mut witness_index = MultilinearWitnessIndex::<EF>::new();
-
-	let select_row1_subwitness = select_row1_subwitness.specialize_arc_dyn();
-	let select_row2_subwitness = select_row2_subwitness.specialize_arc_dyn();
-
-	witness_index.set(select_row1_oracle_id, select_row1_subwitness);
-	witness_index.set(select_row2_oracle_id, select_row2_subwitness);
-	witness_index.set(merged_id, merged_witness.upcast_arc_dyn());
+	let mut witness_index = MultilinearExtensionIndex::<U, FExtension>::new();
+	witness_index
+		.update_multilin_poly(vec![
+			(select_row1_oracle_id, select_row1_subwitness.specialize_arc_dyn()),
+			(select_row2_oracle_id, select_row2_subwitness.specialize_arc_dyn()),
+			(merged_id, merged_witness.upcast_arc_dyn()),
+		])
+		.unwrap();
 
 	let mut rng = StdRng::seed_from_u64(0);
-	let eval_point = repeat_with(|| <EF as Field>::random(&mut rng))
+	let eval_point = repeat_with(|| <FExtension as Field>::random(&mut rng))
 		.take(n_vars + 1)
 		.collect::<Vec<_>>();
 
@@ -628,7 +641,12 @@ fn test_evalcheck_merged() {
 		is_random_point: true,
 	};
 
-	let mut prover_state = EvalcheckProver::new(&mut oracles, &mut witness_index);
+	let backend = make_backend();
+	let mut prover_state = EvalcheckProver::<FExtension, PExtension, _>::new(
+		&mut oracles,
+		&mut witness_index,
+		backend.clone(),
+	);
 	let proof = prover_state.prove(claim.clone()).unwrap();
 
 	if let EvalcheckProof::Composite { ref subproofs } = proof {
@@ -698,17 +716,17 @@ fn test_evalcheck_interleaved() {
 		.unwrap();
 	let interleaved = oracles.oracle(interleaved_id);
 
-	let mut witness_index = MultilinearWitnessIndex::<EF>::new();
-
-	let select_row1_subwitness = select_row1_subwitness.specialize_arc_dyn();
-	let select_row2_subwitness = select_row2_subwitness.specialize_arc_dyn();
-
-	witness_index.set(select_row1_oracle_id, select_row1_subwitness);
-	witness_index.set(select_row2_oracle_id, select_row2_subwitness);
-	witness_index.set(interleaved_id, interleaved_witness.upcast_arc_dyn());
+	let mut witness_index = MultilinearExtensionIndex::<U, FExtension>::new();
+	witness_index
+		.update_multilin_poly(vec![
+			(select_row1_oracle_id, select_row1_subwitness.specialize_arc_dyn()),
+			(select_row2_oracle_id, select_row2_subwitness.specialize_arc_dyn()),
+			(interleaved_id, interleaved_witness.upcast_arc_dyn()),
+		])
+		.unwrap();
 
 	let mut rng = StdRng::seed_from_u64(0);
-	let eval_point = repeat_with(|| <EF as Field>::random(&mut rng))
+	let eval_point = repeat_with(|| <FExtension as Field>::random(&mut rng))
 		.take(n_vars + 1)
 		.collect::<Vec<_>>();
 
@@ -724,12 +742,111 @@ fn test_evalcheck_interleaved() {
 		is_random_point: true,
 	};
 
-	let mut prover_state = EvalcheckProver::new(&mut oracles, &mut witness_index);
+	let backend = make_backend();
+	let mut prover_state = EvalcheckProver::<FExtension, PExtension, _>::new(
+		&mut oracles,
+		&mut witness_index,
+		backend.clone(),
+	);
 	let proof = prover_state.prove(claim.clone()).unwrap();
 
 	if let EvalcheckProof::Composite { ref subproofs } = proof {
 		assert_eq!(subproofs.len(), 1);
 		assert_matches!(subproofs[0].1, EvalcheckProof::Interleaved { .. });
+	} else {
+		panic!("Proof should be Composite.");
+	}
+
+	let mut verifier_state = EvalcheckVerifier::new(&mut oracles);
+	verifier_state.verify(claim, proof).unwrap();
+}
+
+#[test]
+/// Constructs a small ZeroPadded oracle, proves and verifies it.
+fn test_evalcheck_zero_padded() {
+	let inner_n_vars = 7;
+	let n_vars = 10;
+	let row_id = 9;
+
+	let mut oracles = MultilinearOracleSet::new();
+
+	let select_row = SelectRow::new(inner_n_vars, row_id).unwrap();
+
+	let select_row_subwitness = select_row
+		.multilinear_extension::<PackedBinaryField128x1b>()
+		.unwrap();
+
+	let x = select_row_subwitness
+		.clone()
+		.specialize::<PackedBinaryField128x1b>();
+
+	assert!(x.n_vars() >= PackedBinaryField128x1b::LOG_WIDTH);
+
+	let mut values =
+		vec![PackedBinaryField128x1b::zero(); 1 << (n_vars - PackedBinaryField128x1b::LOG_WIDTH)];
+
+	let values_len = values.len();
+
+	let (_, x_values) =
+		values.split_at_mut(values_len - (1 << (x.n_vars() - PackedBinaryField128x1b::LOG_WIDTH)));
+
+	x.subcube_evals(x.n_vars(), 0, x_values).unwrap();
+
+	let zero_padded_poly = MultilinearExtension::from_values(values).unwrap();
+
+	let select_row_oracle_id = oracles.add_transparent(select_row.clone()).unwrap();
+
+	let zero_padded_id = oracles
+		.add_zero_padded(select_row_oracle_id, n_vars)
+		.unwrap();
+
+	let zero_padded = oracles.oracle(zero_padded_id);
+
+	let mut witness_index = MultilinearExtensionIndex::<U, FExtension>::new();
+	witness_index
+		.update_multilin_poly(vec![
+			(select_row_oracle_id, select_row_subwitness.specialize_arc_dyn()),
+			(zero_padded_id, zero_padded_poly.specialize_arc_dyn()),
+		])
+		.unwrap();
+
+	let mut rng = StdRng::seed_from_u64(0);
+
+	let eval_point = repeat_with(|| <FExtension as Field>::random(&mut rng))
+		.take(n_vars)
+		.collect::<Vec<_>>();
+
+	let inner_eval_point = &eval_point[..inner_n_vars];
+	let eval = select_row.evaluate(inner_eval_point).unwrap();
+
+	let mut inner_eval = eval;
+
+	for i in 0..n_vars - inner_n_vars {
+		inner_eval = extrapolate_line::<BinaryField128b, BinaryField128b>(
+			BinaryField128b::zero(),
+			inner_eval,
+			eval_point[inner_n_vars + i],
+		);
+	}
+
+	let claim = EvalcheckClaim {
+		poly: zero_padded.into_composite(),
+		eval_point: eval_point.clone(),
+		eval: inner_eval,
+		is_random_point: true,
+	};
+
+	let backend = make_backend();
+	let mut prover_state = EvalcheckProver::<FExtension, PExtension, _>::new(
+		&mut oracles,
+		&mut witness_index,
+		backend.clone(),
+	);
+	let proof = prover_state.prove(claim.clone()).unwrap();
+
+	if let EvalcheckProof::Composite { ref subproofs } = proof {
+		assert_eq!(subproofs.len(), 1);
+		assert_matches!(subproofs[0].1, EvalcheckProof::ZeroPadded { .. });
 	} else {
 		panic!("Proof should be Composite.");
 	}

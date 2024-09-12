@@ -2,9 +2,9 @@
 
 use crate::{
 	challenger::{CanObserve, CanSample},
+	oracle::{CompositePolyOracle, Error as OracleError},
 	polynomial::{
-		CompositionPoly, Error as PolynomialError, EvaluationDomainFactory, MultilinearExtension,
-		MultivariatePoly,
+		CompositionPoly, Error as PolynomialError, IdentityCompositionPoly, MultilinearExtension,
 	},
 	protocols::{
 		evalcheck::{
@@ -12,8 +12,8 @@ use crate::{
 				non_same_query_pcs_sumcheck_claim, non_same_query_pcs_sumcheck_metas,
 				non_same_query_pcs_sumcheck_witness, BivariateSumcheck, MemoizedQueries,
 			},
-			CommittedEvalClaim, Error as EvalcheckError, EvalcheckClaim, EvalcheckProver,
-			EvalcheckVerifier,
+			CommittedEvalClaim, Error as EvalcheckError, EvalcheckClaim, EvalcheckMultilinearClaim,
+			EvalcheckProver, EvalcheckVerifier,
 		},
 		sumcheck::{
 			batch_prove, Error as SumcheckError, SumcheckBatchProof, SumcheckBatchProveOutput,
@@ -22,75 +22,13 @@ use crate::{
 	},
 };
 use binius_field::{
-	packed::set_packed_slice, BinaryField1b, ExtensionField, Field, PackedField, TowerField,
+	as_packed_field::PackScalar, underlier::WithUnderlier, ExtensionField, Field, PackedExtension,
+	PackedField, TowerField,
 };
+use binius_hal::ComputationBackend;
+use binius_math::EvaluationDomainFactory;
 use std::ops::Deref;
 use tracing::instrument;
-
-// If the macro is not used in the same module, rustc thinks it is unused for some reason
-#[allow(unused_macros, unused_imports)]
-pub mod macros {
-	macro_rules! felts {
-		($f:ident[$($elem:expr),* $(,)?]) => { vec![$($f::from($elem)),*] };
-	}
-	pub(crate) use felts;
-}
-
-pub fn hypercube_evals_from_oracle<F: Field>(oracle: &dyn MultivariatePoly<F>) -> Vec<F> {
-	(0..(1 << oracle.n_vars()))
-		.map(|i| {
-			oracle
-				.evaluate(&decompose_index_to_hypercube_point(oracle.n_vars(), i))
-				.unwrap()
-		})
-		.collect()
-}
-
-pub fn decompose_index_to_hypercube_point<F: Field>(n_vars: usize, index: usize) -> Vec<F> {
-	(0..n_vars)
-		.map(|k| {
-			if (index >> k) % 2 == 1 {
-				F::ONE
-			} else {
-				F::ZERO
-			}
-		})
-		.collect::<Vec<_>>()
-}
-
-pub fn packed_slice<P>(assignments: &[(std::ops::Range<usize>, u8)]) -> Vec<P>
-where
-	P: PackedField<Scalar = BinaryField1b>,
-{
-	assert_eq!(assignments[0].0.start, 0, "First assignment must start at index 0");
-	assert_eq!(
-		assignments[assignments.len() - 1].0.end % P::WIDTH,
-		0,
-		"Last assignment must end at an index divisible by packing width"
-	);
-	for i in 1..assignments.len() {
-		assert_eq!(
-			assignments[i].0.start,
-			assignments[i - 1].0.end,
-			"2 assignments following each other can't be overlapping or have holes in between"
-		);
-	}
-	assignments
-		.iter()
-		.for_each(|(r, _)| assert!(r.end > r.start, "Range must have positive size"));
-	let packed_len = (P::WIDTH - 1
-		+ (assignments.iter().map(|(range, _)| range.end))
-			.max()
-			.unwrap_or(0))
-		/ P::WIDTH;
-	let mut result: Vec<P> = vec![P::default(); packed_len];
-	for (range, value) in assignments.iter() {
-		for i in range.clone() {
-			set_packed_slice(&mut result, i, P::Scalar::from(*value));
-		}
-	}
-	result
-}
 
 #[derive(Clone, Debug)]
 pub struct TestProductComposition {
@@ -115,13 +53,6 @@ where
 		self.arity
 	}
 
-	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, PolynomialError> {
-		let n_vars = self.arity;
-		assert_eq!(query.len(), n_vars);
-		// Product of scalar values at the corresponding positions of the packed values.
-		Ok(query.iter().copied().product())
-	}
-
 	fn evaluate(&self, query: &[P]) -> Result<P, PolynomialError> {
 		let n_vars = self.arity;
 		assert_eq!(query.len(), n_vars);
@@ -132,6 +63,31 @@ where
 	fn binary_tower_level(&self) -> usize {
 		0
 	}
+}
+
+// NB. This is a compatibility hack to bridge the gap between current evalcheck (which operates on composites)
+//     and sumcheck_v2 (which outputs multilinear claims). Each multilinear claim gets simply wrapped into an
+//     identity composition. Once evalcheck refactors land this should get removed.
+pub fn conflate_multilinear_evalchecks<F: Field>(
+	claims: impl IntoIterator<Item = EvalcheckMultilinearClaim<F>>,
+) -> Result<Vec<EvalcheckClaim<F>>, OracleError> {
+	claims
+		.into_iter()
+		.map(|claim| {
+			let poly = CompositePolyOracle::new(
+				claim.poly.n_vars(),
+				vec![claim.poly],
+				IdentityCompositionPoly,
+			)?;
+
+			Ok(EvalcheckClaim {
+				poly,
+				eval_point: claim.eval_point,
+				eval: claim.eval,
+				is_random_point: claim.is_random_point,
+			})
+		})
+		.collect::<Result<Vec<_>, _>>()
 }
 
 pub fn transform_poly<F, OF, Data>(
@@ -149,30 +105,37 @@ where
 
 #[instrument(
 	skip_all,
-	name = "test_utils::prove_bivariate_sumchecks_with_switchover"
+	name = "test_utils::prove_bivariate_sumchecks_with_switchover",
+	level = "debug"
 )]
-pub fn prove_bivariate_sumchecks_with_switchover<'a, F, PW, DomainField, CH>(
+pub fn prove_bivariate_sumchecks_with_switchover<'a, F, PW, DomainField, CH, Backend>(
 	sumchecks: impl IntoIterator<Item = BivariateSumcheck<'a, F, PW>>,
 	challenger: &mut CH,
 	switchover_fn: impl Fn(usize) -> usize + 'static,
 	domain_factory: impl EvaluationDomainFactory<DomainField>,
+	backend: Backend,
 ) -> Result<(SumcheckBatchProof<F>, impl IntoIterator<Item = EvalcheckClaim<F>>), SumcheckError>
 where
 	F: Field + From<PW::Scalar>,
-	PW: PackedField,
+	PW: PackedExtension<DomainField>,
 	PW::Scalar: From<F> + ExtensionField<DomainField>,
 	DomainField: Field,
 	CH: CanObserve<F> + CanSample<F>,
+	Backend: ComputationBackend,
 {
 	let SumcheckBatchProveOutput {
 		proof,
 		evalcheck_claims,
-	} = batch_prove(sumchecks, domain_factory, switchover_fn, challenger)?;
+	} = batch_prove(sumchecks, domain_factory, switchover_fn, challenger, backend)?;
 
 	Ok((proof, evalcheck_claims))
 }
 
-#[instrument(skip_all, name = "test_utils::make_non_same_query_pcs_sumcheck_claims")]
+#[instrument(
+	skip_all,
+	name = "test_utils::make_non_same_query_pcs_sumcheck_claims",
+	level = "debug"
+)]
 pub fn make_non_same_query_pcs_sumcheck_claims<'a, F: TowerField>(
 	verifier: &mut EvalcheckVerifier<'a, F>,
 	committed_eval_claims: &[CommittedEvalClaim<F>],
@@ -181,6 +144,7 @@ pub fn make_non_same_query_pcs_sumcheck_claims<'a, F: TowerField>(
 		verifier.oracles,
 		committed_eval_claims,
 		&mut verifier.batch_committed_eval_claims,
+		None,
 	)?;
 
 	let claims = metas
@@ -191,20 +155,28 @@ pub fn make_non_same_query_pcs_sumcheck_claims<'a, F: TowerField>(
 	Ok(claims)
 }
 
-#[instrument(skip_all, name = "test_utils::make_non_same_query_pcs_sumchecks")]
-pub fn make_non_same_query_pcs_sumchecks<'a, 'b, F, PW>(
-	prover: &mut EvalcheckProver<'a, 'b, F, PW>,
+#[instrument(
+	skip_all,
+	name = "test_utils::make_non_same_query_pcs_sumchecks",
+	level = "debug"
+)]
+pub fn make_non_same_query_pcs_sumchecks<'a, 'b, F, PW, Backend>(
+	prover: &mut EvalcheckProver<'a, 'b, F, PW, Backend>,
 	committed_eval_claims: &[CommittedEvalClaim<F>],
+	backend: Backend,
 ) -> Result<Vec<BivariateSumcheck<'a, F, PW>>, EvalcheckError>
 where
 	F: TowerField + From<PW::Scalar>,
-	PW: PackedField,
-	PW::Scalar: From<F>,
+	PW: PackedField + WithUnderlier,
+	PW::Scalar: TowerField + From<F>,
+	PW::Underlier: PackScalar<PW::Scalar, Packed = PW>,
+	Backend: ComputationBackend,
 {
 	let metas = non_same_query_pcs_sumcheck_metas(
 		prover.oracles,
 		committed_eval_claims,
 		&mut prover.batch_committed_eval_claims,
+		Some(&mut prover.memoized_eq_ind),
 	)?;
 
 	let mut memoized_queries = MemoizedQueries::new();
@@ -217,6 +189,7 @@ where
 				prover.witness_index,
 				&mut memoized_queries,
 				meta,
+				backend.clone(),
 			)?;
 			Ok((claim, witness))
 		})

@@ -29,10 +29,12 @@ pub enum Error {
 	Verification(#[from] VerificationError),
 	#[error("abstract sumcheck failure: {0}")]
 	AbstractSumcheck(#[from] AbstractSumcheckError),
+	#[error("{0}")]
+	MathError(#[from] binius_math::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum VerificationError {
-	#[error("round proof must have at least one coefficient")]
-	NumberOfCoefficients,
+	#[error("number of coefficients in round proof is incorrect, expected {expected}")]
+	NumberOfCoefficients { expected: usize },
 }

@@ -35,6 +35,10 @@ pub enum Error {
 	AbstractSumcheck(#[from] AbstractSumcheckError),
 	#[error("zerocheck naive validation failure: {index}")]
 	NaiveValidation { index: usize },
+	#[error("{0}")]
+	MathError(#[from] binius_math::Error),
+	#[error("{0}")]
+	HalError(#[from] binius_hal::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,8 +49,8 @@ pub enum VerificationError {
 	ExpectedZerocheckChallengeNotFound,
 	#[error("the claimed sum for a sumcheck that came from zerocheck must be zero")]
 	ExpectedClaimedSumToBeZero,
-	#[error("round proof must have at least one coefficient")]
-	NumberOfCoefficients,
+	#[error("number of coefficients in round proof is incorrect, expected {expected}")]
+	NumberOfCoefficients { expected: usize },
 	#[error("incorrect number of rounds")]
 	NumberOfRounds,
 	#[error("IOPolynomial error: {0}")]

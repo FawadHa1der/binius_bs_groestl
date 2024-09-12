@@ -8,12 +8,18 @@ pub enum Error {
 	ParameterError,
 	#[error("conflicting or incorrect constructor argument: {0}")]
 	InvalidArgs(String),
-	#[error("FRI does not support messages with dimension 1")]
-	MessageDimensionIsOne,
+	#[error("FRI message dimension is too small")]
+	MessageDimensionIsTooSmall,
 	#[error("attempted to fold more than maximum of {max_folds} times")]
 	TooManyFoldExecutions { max_folds: usize },
 	#[error("attempted to finish prover before executing all fold rounds")]
 	EarlyProverFinish,
+	#[error("round VCS vector_length values must be strictly decreasing")]
+	RoundVCSLengthsNotDescending,
+	#[error("log round VCS vector_length must be in range between log_inv_rate and log_len")]
+	RoundVCSLengthsOutOfRange,
+	#[error("round VCS vector_length must be a power of two")]
+	RoundVCSLengthsNotPowerOfTwo,
 	#[error("Reed-Solomon encoding error: {0}")]
 	EncodeError(#[from] NttError),
 	#[error("vector commit error: {0}")]

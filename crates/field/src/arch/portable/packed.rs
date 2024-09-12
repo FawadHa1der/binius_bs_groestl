@@ -12,7 +12,7 @@ use crate::{
 	underlier::{NumCast, UnderlierType, UnderlierWithBitOps, WithUnderlier, U1, U2, U4},
 	BinaryField, PackedField,
 };
-use binius_utils::checked_arithmetics::checked_div;
+use binius_utils::checked_arithmetics::checked_int_div;
 use bytemuck::{Pod, TransparentWrapper, Zeroable};
 use rand::RngCore;
 use std::{
@@ -108,7 +108,7 @@ where
 	Self: PackedField,
 {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let width = checked_div(U::BITS, Scalar::N_BITS);
+		let width = checked_int_div(U::BITS, Scalar::N_BITS);
 		let values: Vec<_> = self.iter().collect();
 		write!(f, "Packed{}x{}({:?})", width, Scalar::N_BITS, values)
 	}
@@ -363,6 +363,8 @@ macro_rules! impl_ops_for_zero_height {
 			#[allow(clippy::suspicious_arithmetic_impl)]
 			#[inline]
 			fn mul(self, b: Self) -> Self {
+				crate::tracing::trace_multiplication!($name);
+
 				(self.to_underlier() & b.to_underlier()).into()
 			}
 		}

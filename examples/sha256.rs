@@ -16,23 +16,17 @@
 
 use anyhow::Result;
 use binius_core::{
-	challenger::{CanObserve, CanSample, CanSampleBits, HashChallenger},
-	oracle::{
-		BatchId, CommittedBatchBuildScope, CompositePolyOracle, MultilinearOracleSet, OracleId,
-		ShiftVariant,
-	},
+	challenger::{new_hasher_challenger, CanObserve, CanSample, CanSampleBits},
+	composition::{empty_mix_composition, index_composition, IndexComposition},
+	oracle::{BatchId, CompositePolyOracle, MultilinearOracleSet, OracleId, ShiftVariant},
 	poly_commit::{tensor_pcs, PolyCommitScheme},
-	polynomial::{
-		composition::{empty_mix_composition, index_composition, IndexComposition},
-		transparent::multilinear_extension::MultilinearExtensionTransparent,
-		CompositionPoly, EvaluationDomainFactory, IsomorphicEvaluationDomainFactory,
-		MultilinearComposite, MultilinearExtension,
-	},
+	polynomial::{CompositionPoly, MultilinearComposite, MultilinearExtension},
 	protocols::{
 		abstract_sumcheck::standard_switchover_heuristic,
 		greedy_evalcheck::{self, GreedyEvalcheckProof, GreedyEvalcheckProveOutput},
 		zerocheck::{self, ZerocheckBatchProof, ZerocheckBatchProveOutput, ZerocheckClaim},
 	},
+	transparent::multilinear_extension::MultilinearExtensionTransparent,
 	witness::MultilinearExtensionIndex,
 };
 use binius_field::{
@@ -42,8 +36,10 @@ use binius_field::{
 	BinaryField, BinaryField128b, BinaryField128bPolyval, BinaryField16b, BinaryField1b,
 	ExtensionField, Field, PackedBinaryField128x1b, PackedField, PackedFieldIndexable, TowerField,
 };
+use binius_hal::{make_backend, ComputationBackend};
 use binius_hash::GroestlHasher;
 use binius_macros::composition_poly;
+use binius_math::{EvaluationDomainFactory, IsomorphicEvaluationDomainFactory};
 use binius_utils::{
 	checked_arithmetics::checked_log_2, examples::get_log_trace_size, rayon::adjust_thread_pool,
 	tracing::init_tracing,
@@ -200,7 +196,7 @@ where
 	}
 }
 
-#[instrument(skip_all)]
+#[instrument(skip_all, level = "debug")]
 fn generate_trace<U, FW>(
 	log_size: usize,
 	trace_oracle: &TraceOracle,
@@ -459,10 +455,15 @@ struct U32ArraySumSubOracle<const N: usize> {
 }
 
 impl<const N: usize> U32ArraySumSubOracle<N> {
-	pub fn new<F: TowerField>(batch_scope: &mut CommittedBatchBuildScope<F>) -> Self {
-		let z_out = batch_scope.add_multiple();
-		let cout = batch_scope.add_multiple();
-		let cin = [OracleId::MAX; N];
+	pub fn new<F: TowerField>(oracles: &mut MultilinearOracleSet<F>, batch_id: BatchId) -> Self {
+		let z_out = oracles.add_named("z_out").committed_multiple(batch_id);
+		let cout = oracles.add_named("cout").committed_multiple(batch_id);
+		let cin = cout.map(|x| {
+			oracles
+				.add_named("cin")
+				.shifted(x, 1, 5, ShiftVariant::LogicalLeft)
+				.unwrap()
+		});
 		Self { z_out, cout, cin }
 	}
 
@@ -472,14 +473,6 @@ impl<const N: usize> U32ArraySumSubOracle<N> {
 
 	pub fn val(&self) -> OracleId {
 		self.z_out[N - 1]
-	}
-
-	pub fn fill_cin<F: TowerField>(&mut self, oracles: &mut MultilinearOracleSet<F>) {
-		for i in 0..N {
-			self.cin[i] = oracles
-				.add_shifted(self.cout[i], 1, 5, ShiftVariant::LogicalLeft)
-				.unwrap();
-		}
 	}
 }
 
@@ -548,19 +541,22 @@ impl TraceOracle {
 		oracles_arr
 	}
 
-	fn gen_u32const_oracle_id<F: TowerField>(
+	fn gen_u32const_oracle_id<F: TowerField, Backend: ComputationBackend + 'static>(
 		log_size: usize,
 		oracles: &mut MultilinearOracleSet<F>,
 		x: u32,
+		backend: Backend,
 	) -> OracleId {
 		let x_unpacked = must_cast::<_, PackedBinaryField32x1b>(x);
 
+		let specialized = MultilinearExtension::from_values_generic(vec![x_unpacked])
+			.unwrap()
+			.specialize::<F>();
 		let id = oracles
-			.add_transparent(MultilinearExtensionTransparent(
-				MultilinearExtension::from_values_generic(vec![x_unpacked])
-					.unwrap()
-					.specialize::<F>(),
-			))
+			.add_transparent(
+				MultilinearExtensionTransparent::from_specialized(specialized, backend)
+					.expect("must be able to specialize"),
+			)
 			.unwrap();
 
 		oracles
@@ -568,48 +564,33 @@ impl TraceOracle {
 			.unwrap()
 	}
 
-	pub fn new<F: TowerField>(oracles: &mut MultilinearOracleSet<F>, log_size: usize) -> Self {
-		let mut batch_scope = oracles.build_committed_batch(log_size, BinaryField1b::TOWER_LEVEL);
-		let w = batch_scope.add_multiple::<16>();
+	pub fn new<F: TowerField, Backend: ComputationBackend + 'static>(
+		oracles: &mut MultilinearOracleSet<F>,
+		log_size: usize,
+		backend: Backend,
+	) -> Self {
+		let batch_id = oracles.add_committed_batch(log_size, BinaryField1b::TOWER_LEVEL);
+		let w = oracles
+			.add_named("omega")
+			.committed_multiple::<16>(batch_id);
 
-		let mut extended_w = array::from_fn(|_| U32ArraySumSubOracle::new(&mut batch_scope));
+		let extended_w = array::from_fn(|_| U32ArraySumSubOracle::new(oracles, batch_id));
 
-		let ch = batch_scope.add_multiple::<64>();
+		let ch = oracles.add_named("ch").committed_multiple::<64>(batch_id);
 
-		let mut temp1 = array::from_fn(|_| U32ArraySumSubOracle::new(&mut batch_scope));
+		let temp1 = array::from_fn(|_| U32ArraySumSubOracle::new(oracles, batch_id));
 
-		let maj = batch_scope.add_multiple::<64>();
+		let maj = oracles.add_named("maj").committed_multiple::<64>(batch_id);
 
-		let mut temp2 = array::from_fn(|_| U32ArraySumSubOracle::new(&mut batch_scope));
+		let temp2 = array::from_fn(|_| U32ArraySumSubOracle::new(oracles, batch_id));
 
-		let mut d_add_temp1 = array::from_fn(|_| U32ArraySumSubOracle::new(&mut batch_scope));
+		let d_add_temp1 = array::from_fn(|_| U32ArraySumSubOracle::new(oracles, batch_id));
 
-		let mut temp1_add_temp2 = array::from_fn(|_| U32ArraySumSubOracle::new(&mut batch_scope));
+		let temp1_add_temp2 = array::from_fn(|_| U32ArraySumSubOracle::new(oracles, batch_id));
 
-		let mut output_add = array::from_fn(|_| U32ArraySumSubOracle::new(&mut batch_scope));
+		let output_add = array::from_fn(|_| U32ArraySumSubOracle::new(oracles, batch_id));
 
-		let h_in = batch_scope.add_multiple();
-		let batch_id = batch_scope.build();
-
-		// Define carry in oracles for all U32ArraySumSubOracles
-		extended_w
-			.iter_mut()
-			.for_each(|u32_oracle| u32_oracle.fill_cin(oracles));
-		temp1
-			.iter_mut()
-			.for_each(|u32_oracle| u32_oracle.fill_cin(oracles));
-		temp2
-			.iter_mut()
-			.for_each(|u32_oracle| u32_oracle.fill_cin(oracles));
-		d_add_temp1
-			.iter_mut()
-			.for_each(|u32_oracle| u32_oracle.fill_cin(oracles));
-		temp1_add_temp2
-			.iter_mut()
-			.for_each(|u32_oracle| u32_oracle.fill_cin(oracles));
-		output_add
-			.iter_mut()
-			.for_each(|u32_oracle| u32_oracle.fill_cin(oracles));
+		let h_in = oracles.add_named("h_in").committed_multiple(batch_id);
 
 		let get_w =
 			|extended_w: &[U32ArraySumSubOracle<3>], w: &[OracleId], i: OracleId| -> usize {
@@ -647,8 +628,9 @@ impl TraceOracle {
 		}
 
 		// Define round constant oracles
-		let k =
-			array::from_fn(|i| Self::gen_u32const_oracle_id(log_size, oracles, ROUND_CONSTS_K[i]));
+		let k = array::from_fn(|i| {
+			Self::gen_u32const_oracle_id(log_size, oracles, ROUND_CONSTS_K[i], backend.clone())
+		});
 
 		// Initialize state oracles
 		let mut h: [[OracleId; 8]; 65] = array::from_fn(|_| [OracleId::MAX; 8]);
@@ -905,27 +887,27 @@ struct Proof<F: Field, PCSComm, PCSProof> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip_all)]
-fn prove<U, F, FW, DomainField, PCS, CH>(
+#[instrument(skip_all, level = "debug")]
+fn prove<U, F, FW, DomainField, PCS, CH, Backend>(
 	log_size: usize,
 	oracles: &mut MultilinearOracleSet<F>,
 	trace_oracle: &TraceOracle,
 	pcs: &PCS,
 	mut challenger: CH,
-	witness: &MultilinearExtensionIndex<U, FW>,
+	mut witness: MultilinearExtensionIndex<U, FW>,
 	domain_factory: impl EvaluationDomainFactory<DomainField>,
+	backend: Backend,
 ) -> Result<Proof<F, PCS::Commitment, PCS::Proof>>
 where
-	U: UnderlierType + PackScalar<BinaryField1b> + PackScalar<FW>,
+	U: UnderlierType + PackScalar<BinaryField1b> + PackScalar<FW> + PackScalar<DomainField>,
 	PackedType<U, FW>: PackedFieldIndexable,
 	F: TowerField + From<FW>,
 	FW: TowerField + From<F> + ExtensionField<DomainField>,
 	DomainField: TowerField,
 	PCS: PolyCommitScheme<PackedType<U, BinaryField1b>, F, Error: Debug, Proof: 'static>,
 	CH: CanObserve<F> + CanObserve<PCS::Commitment> + CanSample<F> + CanSampleBits<usize>,
+	Backend: ComputationBackend,
 {
-	let mut trace_witness = witness.witness_index();
-
 	// Round 1
 	let trace_commit_polys = oracles
 		.committed_oracle_ids(trace_oracle.batch_id)
@@ -970,19 +952,21 @@ where
 		domain_factory.clone(),
 		switchover_fn,
 		&mut challenger,
+		backend.clone(),
 	)?;
 
 	// Evalcheck
 	let GreedyEvalcheckProveOutput {
 		same_query_claims,
 		proof: evalcheck_proof,
-	} = greedy_evalcheck::prove(
+	} = greedy_evalcheck::prove::<_, PackedType<U, FW>, _, _, _>(
 		oracles,
-		&mut trace_witness,
+		&mut witness,
 		evalcheck_claims,
 		switchover_fn,
 		&mut challenger,
 		domain_factory,
+		backend.clone(),
 	)?;
 
 	assert_eq!(same_query_claims.len(), 1);
@@ -992,11 +976,17 @@ where
 		.expect("length is asserted to be 1");
 	assert_eq!(batch_id, trace_oracle.batch_id);
 
+	let trace_commit_polys = oracles
+		.committed_oracle_ids(trace_oracle.batch_id)
+		.map(|oracle_id| witness.get::<BinaryField1b>(oracle_id))
+		.collect::<Result<Vec<_>, _>>()?;
+
 	let trace_open_proof = pcs.prove_evaluation(
 		&mut challenger,
 		&trace_committed,
 		&trace_commit_polys,
 		&same_query_claim.eval_point,
+		backend,
 	)?;
 
 	Ok(Proof {
@@ -1008,20 +998,22 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip_all)]
-fn verify<P, F, PCS, CH>(
+#[instrument(skip_all, level = "debug")]
+fn verify<P, F, PCS, CH, Backend>(
 	log_size: usize,
 	oracles: &mut MultilinearOracleSet<F>,
 	trace_oracle: &TraceOracle,
 	pcs: &PCS,
 	mut challenger: CH,
 	proof: Proof<F, PCS::Commitment, PCS::Proof>,
+	backend: Backend,
 ) -> Result<()>
 where
 	P: PackedField<Scalar = BinaryField1b>,
 	F: TowerField,
 	PCS: PolyCommitScheme<P, F, Error: Debug, Proof: 'static>,
 	CH: CanObserve<F> + CanObserve<PCS::Commitment> + CanSample<F> + CanSampleBits<usize>,
+	Backend: ComputationBackend,
 {
 	let Proof {
 		trace_comm,
@@ -1063,6 +1055,7 @@ where
 		&same_query_claim.eval_point,
 		trace_open_proof,
 		&same_query_claim.evals,
+		backend,
 	)?;
 
 	Ok(())
@@ -1081,9 +1074,10 @@ fn main() {
 
 	let log_size = get_log_trace_size().unwrap_or(10);
 	let log_inv_rate = 1;
+	let backend = make_backend();
 
 	let mut oracles = MultilinearOracleSet::new();
-	let trace = TraceOracle::new(&mut oracles, log_size);
+	let trace = TraceOracle::new(&mut oracles, log_size, backend.clone());
 
 	let trace_batch = oracles.committed_batch(trace.batch_id);
 
@@ -1103,21 +1097,24 @@ fn main() {
 	tracing::info!("Size of hashable SHA-256 data: {}", data_hashed_256);
 	tracing::info!("Size of PCS proof: {}", tensorpcs_size);
 
-	let challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+	let challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 
 	let witness = generate_trace::<U, BinaryField128bPolyval>(log_size, &trace).unwrap();
 	let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField128b>::default();
 
-	let proof = prove::<_, BinaryField128b, BinaryField128bPolyval, BinaryField128bPolyval, _, _>(
-		log_size,
-		&mut oracles.clone(),
-		&trace,
-		&pcs,
-		challenger.clone(),
-		&witness,
-		domain_factory,
-	)
-	.unwrap();
+	let proof =
+		prove::<_, BinaryField128b, BinaryField128bPolyval, BinaryField128bPolyval, _, _, _>(
+			log_size,
+			&mut oracles.clone(),
+			&trace,
+			&pcs,
+			challenger.clone(),
+			witness,
+			domain_factory,
+			backend.clone(),
+		)
+		.unwrap();
 
-	verify(log_size, &mut oracles.clone(), &trace, &pcs, challenger.clone(), proof).unwrap();
+	verify(log_size, &mut oracles.clone(), &trace, &pcs, challenger.clone(), proof, backend)
+		.unwrap();
 }

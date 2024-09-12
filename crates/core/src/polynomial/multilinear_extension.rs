@@ -1,25 +1,19 @@
 // Copyright 2023 Ulvetanna Inc.
 
 use super::{error::Error, multilinear::MultilinearPoly, multilinear_query::MultilinearQuery};
-use crate::polynomial::util::PackingDeref;
+use crate::util::PackingDeref;
 use binius_field::{
 	as_packed_field::{AsSinglePacked, PackScalar, PackedType},
-	packed::{get_packed_slice, iter_packed_slice, set_packed_slice_unchecked},
+	packed::{get_packed_slice, iter_packed_slice, set_packed_slice, set_packed_slice_unchecked},
 	underlier::UnderlierType,
 	util::inner_product_par,
 	ExtensionField, Field, PackedField,
 };
-use binius_utils::array_2d::Array2D;
+use binius_utils::bail;
 use bytemuck::zeroed_vec;
 use p3_util::log2_strict_usize;
 use rayon::prelude::*;
-use std::{
-	cmp::min,
-	fmt::Debug,
-	marker::PhantomData,
-	ops::{Deref, Range},
-	sync::Arc,
-};
+use std::{cmp::min, fmt::Debug, marker::PhantomData, ops::Deref, sync::Arc};
 
 /// A multilinear polynomial represented by its evaluations over the boolean hypercube.
 ///
@@ -39,7 +33,7 @@ impl<P: PackedField> MultilinearExtension<P> {
 	pub fn zeros(n_vars: usize) -> Result<Self, Error> {
 		assert!(P::WIDTH.is_power_of_two());
 		if n_vars < log2_strict_usize(P::WIDTH) {
-			return Err(Error::ArgumentRangeError {
+			bail!(Error::ArgumentRangeError {
 				arg: "n_vars".to_string(),
 				range: log2_strict_usize(P::WIDTH)..32,
 			});
@@ -59,7 +53,7 @@ impl<P: PackedField> MultilinearExtension<P> {
 impl<P: PackedField, Data: Deref<Target = [P]>> MultilinearExtension<P, Data> {
 	pub fn from_values_generic(v: Data) -> Result<Self, Error> {
 		if !v.len().is_power_of_two() {
-			return Err(Error::PowerOfTwoLengthRequired);
+			bail!(Error::PowerOfTwoLengthRequired);
 		}
 		let mu = log2(v.len() * P::WIDTH);
 		Ok(Self { mu, evals: v })
@@ -68,6 +62,7 @@ impl<P: PackedField, Data: Deref<Target = [P]>> MultilinearExtension<P, Data> {
 
 impl<U, F, Data> MultilinearExtension<PackedType<U, F>, PackingDeref<U, F, Data>>
 where
+	// TODO: Add U: Divisible<u8>.
 	U: UnderlierType + PackScalar<F>,
 	F: Field,
 	Data: Deref<Target = [U]>,
@@ -80,7 +75,7 @@ where
 impl<'a, P: PackedField> MultilinearExtension<P, &'a [P]> {
 	pub fn from_values_slice(v: &'a [P]) -> Result<Self, Error> {
 		if !v.len().is_power_of_two() {
-			return Err(Error::PowerOfTwoLengthRequired);
+			bail!(Error::PowerOfTwoLengthRequired);
 		}
 		let mu = log2(v.len() * P::WIDTH);
 		Ok(Self { mu, evals: v })
@@ -137,7 +132,7 @@ where
 		PE: PackedField<Scalar = FE>,
 	{
 		if self.mu != query.n_vars() {
-			return Err(Error::IncorrectQuerySize { expected: self.mu });
+			bail!(Error::IncorrectQuerySize { expected: self.mu });
 		}
 		Ok(inner_product_par(query.expansion(), &self.evals))
 	}
@@ -160,7 +155,7 @@ where
 		PE::Scalar: ExtensionField<P::Scalar>,
 	{
 		if self.mu < query.n_vars() {
-			return Err(Error::IncorrectQuerySize { expected: self.mu });
+			bail!(Error::IncorrectQuerySize { expected: self.mu });
 		}
 
 		let query_expansion = query.expansion();
@@ -211,7 +206,7 @@ where
 		PE::Scalar: ExtensionField<P::Scalar>,
 	{
 		if self.mu < query.n_vars() {
-			return Err(Error::IncorrectQuerySize { expected: self.mu });
+			bail!(Error::IncorrectQuerySize { expected: self.mu });
 		}
 
 		let mut result =
@@ -239,10 +234,10 @@ where
 		PE::Scalar: ExtensionField<P::Scalar>,
 	{
 		if self.mu < query.n_vars() {
-			return Err(Error::IncorrectQuerySize { expected: self.mu });
+			bail!(Error::IncorrectQuerySize { expected: self.mu });
 		}
 		if out.len() != 1 << ((self.mu - query.n_vars()).saturating_sub(PE::LOG_WIDTH)) {
-			return Err(Error::IncorrectOutputPolynomialSize {
+			bail!(Error::IncorrectOutputPolynomialSize {
 				expected: self.mu - query.n_vars(),
 			});
 		}
@@ -430,170 +425,92 @@ where
 			.map(MultilinearExtensionSpecialized::from)
 	}
 
-	fn evaluate_subcube(
+	fn subcube_inner_products(
 		&self,
-		indices: Range<usize>,
 		query: &MultilinearQuery<PE>,
-		evals_0: &mut Array2D<PE::Scalar>,
-		evals_1: &mut Array2D<PE::Scalar>,
-		col_index: usize,
+		subcube_vars: usize,
+		subcube_index: usize,
+		inner_products: &mut [PE],
 	) -> Result<(), Error> {
-		let n_vars = query.n_vars();
-		if n_vars > self.n_vars() {
-			return Err(Error::ArgumentRangeError {
-				arg: "n_vars".into(),
-				range: 0..self.n_vars() + 1,
+		let query_n_vars = query.n_vars();
+		if query_n_vars + subcube_vars > self.n_vars() {
+			bail!(Error::ArgumentRangeError {
+				arg: "query.n_vars() + subcube_vars".into(),
+				range: 0..self.n_vars(),
 			});
 		}
 
-		let max_index = 1 << (self.n_vars() - n_vars);
-		if indices.end >= max_index {
-			return Err(Error::ArgumentRangeError {
-				arg: "index".into(),
+		let max_index = 1 << (self.n_vars() - query_n_vars - subcube_vars);
+		if subcube_index >= max_index {
+			bail!(Error::ArgumentRangeError {
+				arg: "subcube_index".into(),
 				range: 0..max_index,
 			});
 		}
-		// Ths condition is implied by the previous check and the self state invariant, but we need imlicitly
-		// check it to make safe the unsafe operations below.
-		assert!(
-			((2 * indices.clone().last().unwrap_or_default() + 1) << n_vars)
-				< self.0.evals().len() * P::WIDTH
-		);
 
-		if indices.len() > evals_0.rows() {
-			return Err(Error::ArgumentRangeError {
-				arg: "evals_0.rows()".into(),
-				range: 0..indices.len() + 1,
+		let correct_len = 1 << subcube_vars.saturating_sub(PE::LOG_WIDTH);
+		if inner_products.len() != correct_len {
+			bail!(Error::ArgumentRangeError {
+				arg: "evals.len()".to_string(),
+				range: correct_len..correct_len + 1,
 			});
 		}
 
-		if indices.len() > evals_1.rows() {
-			return Err(Error::ArgumentRangeError {
-				arg: "evals_1.rows()".into(),
-				range: 0..indices.len() + 1,
-			});
-		}
-
-		if col_index >= evals_0.cols() {
-			return Err(Error::ArgumentRangeError {
-				arg: "col_index".into(),
-				range: 0..evals_0.cols(),
-			});
-		}
-
-		if col_index >= evals_1.cols() {
-			return Err(Error::ArgumentRangeError {
-				arg: "col_index".into(),
-				range: 0..evals_1.cols(),
-			});
-		}
-
-		let expansion = query.expansion();
-		if expansion.len() * PE::WIDTH < 1 << n_vars {
-			return Err(Error::ArgumentRangeError {
-				arg: "query.len()".into(),
-				range: (1 << n_vars) / PE::WIDTH..usize::MAX,
-			});
-		}
-
-		// Both of the branches below execute the same logic, but the first branch is optimized for the case
-		// when the number of `self.0.evals` element used for the every iteration is less than `P::WIDTH`.
-		// The first branch appears to be on a hot path, that's why all the unsafe operations are used there.
-		if n_vars < P::LOG_WIDTH {
-			for (i, k) in indices.enumerate() {
-				let mut eval0 = PE::Scalar::ZERO;
-				let mut eval1 = PE::Scalar::ZERO;
-
-				let odd_index = (2 * k) << n_vars;
-				let odd_offset = odd_index % P::WIDTH;
-				let even_index = (2 * k + 1) << n_vars;
-				// Safety:
-				// ((2 * indices.clone().last().unwrap_or_default() + 1 ) << n_vars) < self.0.evals().len() * P::WIDTH
-				let eval_odd = unsafe { self.0.evals.get_unchecked(odd_index / P::WIDTH) };
-				let eval_even = unsafe { self.0.evals.get_unchecked(even_index / P::WIDTH) };
-				let even_offset = even_index % P::WIDTH;
-				for j in 0..1 << n_vars {
-					// Safety: expansion.len() * PE::WIDTH >= 1 << n_vars
-					let query = unsafe {
-						expansion
-							.get_unchecked(j / PE::WIDTH)
-							.get_unchecked(j % PE::WIDTH)
-					};
-
-					// Safety:
-					// `n_vars` < `P::LOG_WIDTH` implies that all elements within the indices odd_index..(odd_index + 1 << n_vars)
-					// are contained within the same packed field element.
-					let eval_odd = unsafe { eval_odd.get_unchecked(odd_offset + j) };
-					// Safety:
-					// `n_vars` < `P::LOG_WIDTH` implies that all elements within the indices even_index..(even_index + 1 << n_vars)
-					// are contained within the same packed field element.
-					let eval_even = unsafe { eval_even.get_unchecked(even_offset + j) };
-
-					eval0 += query * eval_odd;
-					eval1 += query * eval_even;
-				}
-
-				// Safety:
-				// - `i` is within the range of `0..indices.len()`, which is the range of `0..evals_0.rows()` and `0..evals_1.rows()`
-				// - `col_index` is within the range of `0..evals_0.cols()` and `0..evals_1.cols()`
-				unsafe {
-					*evals_0.get_unchecked_mut(i, col_index) = eval0;
-					*evals_1.get_unchecked_mut(i, col_index) = eval1;
-				}
+		// REVIEW: not spending effort to optimize this as the future of switchover
+		//         is somewhat unclear in light of univariate skip
+		let subcube_start = subcube_index << (query_n_vars + subcube_vars);
+		for scalar_index in 0..1 << subcube_vars {
+			let evals_start = subcube_start + (scalar_index << query_n_vars);
+			let mut inner_product = PE::Scalar::ZERO;
+			for i in 0..1 << query_n_vars {
+				inner_product += get_packed_slice(query.expansion(), i)
+					* get_packed_slice(self.0.evals(), evals_start + i);
 			}
-		} else {
-			for (i, k) in indices.enumerate() {
-				let mut eval0 = PE::Scalar::ZERO;
-				let mut eval1 = PE::Scalar::ZERO;
 
-				let evals_odd = &self.0.evals[(((2 * k) << n_vars) / P::WIDTH)..];
-				let evals_even = &self.0.evals[(((2 * k + 1) << n_vars) / P::WIDTH)..];
-
-				for j in 0..1 << n_vars {
-					let query = expansion[j / PE::WIDTH].get(j % PE::WIDTH);
-					let eval_odd = evals_odd[j / P::WIDTH].get(j % P::WIDTH);
-					let eval_even = evals_even[j / P::WIDTH].get(j % P::WIDTH);
-
-					eval0 += query * eval_odd;
-					eval1 += query * eval_even;
-				}
-
-				evals_0[(i, col_index)] = eval0;
-				evals_1[(i, col_index)] = eval1;
-			}
+			set_packed_slice(inner_products, scalar_index, inner_product);
 		}
 
 		Ok(())
 	}
 
-	fn subcube_evals(&self, vars: usize, index: usize, dst: &mut [PE]) -> Result<(), Error> {
-		if vars > self.n_vars() {
-			return Err(Error::ArgumentRangeError {
-				arg: "vars".to_string(),
+	fn subcube_evals(
+		&self,
+		subcube_vars: usize,
+		subcube_index: usize,
+		evals: &mut [PE],
+	) -> Result<(), Error> {
+		if subcube_vars > self.n_vars() {
+			bail!(Error::ArgumentRangeError {
+				arg: "subcube_vars".to_string(),
 				range: 0..self.n_vars() + 1,
 			});
 		}
-		// TODO: Handle the case when 1 << vars < PE::WIDTH
-		if dst.len() * PE::WIDTH != 1 << vars {
-			return Err(Error::ArgumentRangeError {
-				arg: "dst.len()".to_string(),
-				range: (1 << vars) / PE::WIDTH..(1 << vars) / PE::WIDTH + 1,
-			});
-		}
-		if index >= 1 << (self.n_vars() - vars) {
-			return Err(Error::ArgumentRangeError {
-				arg: "index".to_string(),
-				range: 0..(1 << (self.n_vars() - vars)),
+
+		let correct_len = 1 << subcube_vars.saturating_sub(PE::LOG_WIDTH);
+		if evals.len() != correct_len {
+			bail!(Error::ArgumentRangeError {
+				arg: "evals.len()".to_string(),
+				range: correct_len..correct_len + 1,
 			});
 		}
 
-		let evals = &self.0.evals()[(index << vars) / P::WIDTH..((index + 1) << vars) / P::WIDTH];
-		for i in 0..1 << vars {
-			let scalar = get_packed_slice(evals, i).into();
+		let max_index = 1 << (self.n_vars() - subcube_vars);
+		if subcube_index >= max_index {
+			bail!(Error::ArgumentRangeError {
+				arg: "subcube_index".to_string(),
+				range: 0..max_index,
+			});
+		}
 
-			// Safety: 'i < 1 << vars' and 'dst.len() * PE::WIDTH == 1 << vars'
+		// TODO: subcubes with subcube_vars greater or equal to P::LOG_WIDTH are always aligned,
+		//       no need to access individual scalars when we can copy entire packed fields.
+		let subcube_start = subcube_index << subcube_vars;
+		for i in 0..1 << subcube_vars {
+			let scalar = get_packed_slice(self.0.evals(), subcube_start + i).into();
+
+			// Safety: 'i < 1 << subcube_vars' and 'evals.len() == correct_len'
 			unsafe {
-				set_packed_slice_unchecked(dst, i, scalar);
+				set_packed_slice_unchecked(evals, i, scalar);
 			}
 		}
 		Ok(())
@@ -647,6 +564,7 @@ mod tests {
 		BinaryField128b, BinaryField16b as F, BinaryField32b, PackedBinaryField4x32b,
 		PackedBinaryField8x16b as P,
 	};
+	use binius_hal::make_backend;
 
 	#[test]
 	fn test_expand_query_impls_consistent() {
@@ -654,7 +572,8 @@ mod tests {
 		let q = repeat_with(|| Field::random(&mut rng))
 			.take(8)
 			.collect::<Vec<F>>();
-		let result1 = MultilinearQuery::<P>::with_full_query(&q).unwrap();
+		let backend = make_backend();
+		let result1 = MultilinearQuery::<P>::with_full_query(&q, backend).unwrap();
 		let result2 = expand_query_naive(&q).unwrap();
 		assert_eq!(iter_packed_slice(result1.expansion()).collect_vec(), result2);
 	}
@@ -668,11 +587,13 @@ mod tests {
 			.for_each(|(i, val)| *val = F::new(i as u16));
 
 		let poly = MultilinearExtension::from_values(values).unwrap();
+		let backend = make_backend();
 		for i in 0..64 {
 			let q = (0..6)
 				.map(|j| if (i >> j) & 1 != 0 { F::ONE } else { F::ZERO })
 				.collect::<Vec<_>>();
-			let multilin_query = MultilinearQuery::<P>::with_full_query(&q).unwrap();
+			let multilin_query =
+				MultilinearQuery::<P>::with_full_query(&q, backend.clone()).unwrap();
 			let result = poly.evaluate(&multilin_query).unwrap();
 			assert_eq!(result, F::new(i));
 		}
@@ -690,16 +611,22 @@ mod tests {
 
 		let mut partial_result = poly;
 		let mut index = q.len();
+		let backend = make_backend();
 		for split_vars in splits[0..splits.len() - 1].iter() {
 			partial_result = partial_result
 				.evaluate_partial_high(
-					&MultilinearQuery::with_full_query(&q[index - split_vars..index]).unwrap(),
+					&MultilinearQuery::with_full_query(
+						&q[index - split_vars..index],
+						backend.clone(),
+					)
+					.unwrap(),
 				)
 				.unwrap();
 			index -= split_vars;
 		}
 
-		let multilin_query = MultilinearQuery::<P>::with_full_query(&q[..index]).unwrap();
+		let multilin_query =
+			MultilinearQuery::<P>::with_full_query(&q[..index], backend.clone()).unwrap();
 		partial_result.evaluate(&multilin_query).unwrap()
 	}
 
@@ -713,7 +640,8 @@ mod tests {
 		let q = repeat_with(|| Field::random(&mut rng))
 			.take(8)
 			.collect::<Vec<F>>();
-		let multilin_query = MultilinearQuery::<P>::with_full_query(&q).unwrap();
+		let backend = make_backend();
+		let multilin_query = MultilinearQuery::<P>::with_full_query(&q, backend).unwrap();
 		let result1 = poly.evaluate(&multilin_query).unwrap();
 		let result2 = evaluate_split(poly, &q, &[2, 3, 3]);
 		assert_eq!(result1, result2);
@@ -729,16 +657,20 @@ mod tests {
 		let q = repeat_with(|| Field::random(&mut rng))
 			.take(8)
 			.collect::<Vec<BinaryField128b>>();
-		let multilin_query = MultilinearQuery::<BinaryField128b>::with_full_query(&q).unwrap();
+		let backend = make_backend();
+		let multilin_query =
+			MultilinearQuery::<BinaryField128b>::with_full_query(&q, backend.clone()).unwrap();
 
 		let expected = poly.evaluate(&multilin_query).unwrap();
 
 		// The final split has a number of coefficients less than the packing width
-		let query_hi = MultilinearQuery::<BinaryField128b>::with_full_query(&q[1..]).unwrap();
+		let query_hi =
+			MultilinearQuery::<BinaryField128b>::with_full_query(&q[1..], backend.clone()).unwrap();
 		let partial_eval = poly.evaluate_partial_high(&query_hi).unwrap();
 		assert!(partial_eval.n_vars() < P::LOG_WIDTH);
 
-		let query_lo = MultilinearQuery::<BinaryField128b>::with_full_query(&q[..1]).unwrap();
+		let query_lo =
+			MultilinearQuery::<BinaryField128b>::with_full_query(&q[..1], backend).unwrap();
 		let eval = partial_eval.evaluate(&query_lo).unwrap();
 		assert_eq!(eval, expected);
 	}
@@ -757,18 +689,17 @@ mod tests {
 		let q = repeat_with(|| <BinaryField128b as PackedField>::random(&mut rng))
 			.take(6)
 			.collect::<Vec<_>>();
-		let query = MultilinearQuery::with_full_query(&q).unwrap();
+		let backend = make_backend();
+		let query = MultilinearQuery::with_full_query(&q, backend.clone()).unwrap();
 
 		let partial_low = poly.evaluate_partial_low(&query).unwrap();
 
-		let mut m0 = Array2D::new(1 << 3, 1);
-		let mut m1 = Array2D::new(1 << 3, 1);
-		poly.evaluate_subcube(0..(1 << 3), &query, &mut m0, &mut m1, 0)
+		let mut inner_products = vec![BinaryField128b::ZERO; 16];
+		poly.subcube_inner_products(&query, 4, 0, inner_products.as_mut_slice())
 			.unwrap();
 
-		for idx in 0..(1 << 3) {
-			assert_eq!(m0[(idx, 0)], partial_low.evaluate_on_hypercube(2 * idx).unwrap(),);
-			assert_eq!(m1[(idx, 0)], partial_low.evaluate_on_hypercube(2 * idx + 1).unwrap(),);
+		for (idx, inner_product) in inner_products.into_iter().enumerate() {
+			assert_eq!(inner_product, partial_low.evaluate_on_hypercube(idx).unwrap(),);
 		}
 	}
 
@@ -784,15 +715,15 @@ mod tests {
 		let q = repeat_with(|| <BinaryField128b as PackedField>::random(&mut rng))
 			.take(1)
 			.collect::<Vec<_>>();
-		let query = MultilinearQuery::with_full_query(&q).unwrap();
+		let backend = make_backend();
+		let query = MultilinearQuery::with_full_query(&q, backend.clone()).unwrap();
 
-		let mut m0 = Array2D::new(1, 2);
-		let mut m1 = Array2D::new(1, 2);
-		poly.evaluate_subcube(0..1, &query, &mut m0, &mut m1, 1)
+		let mut inner_products = vec![BinaryField128b::ZERO; 2];
+		poly.subcube_inner_products(&query, 1, 0, inner_products.as_mut_slice())
 			.unwrap();
 
-		assert_eq!(m0[(0, 1)], BinaryField128b::new(2));
-		assert_eq!(m1[(0, 1)], BinaryField128b::new(9));
+		assert_eq!(inner_products[0], BinaryField128b::new(2));
+		assert_eq!(inner_products[1], BinaryField128b::new(9));
 	}
 
 	#[test]
@@ -808,7 +739,8 @@ mod tests {
 			.take(me.n_vars())
 			.collect::<Vec<_>>();
 
-		let query = MultilinearQuery::with_full_query(&q).unwrap();
+		let backend = make_backend();
+		let query = MultilinearQuery::with_full_query(&q, backend.clone()).unwrap();
 
 		let eval = me
 			.evaluate::<<PackedBinaryField4x32b as PackedField>::Scalar, PackedBinaryField4x32b>(

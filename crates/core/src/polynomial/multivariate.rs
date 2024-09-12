@@ -4,7 +4,9 @@ use super::{
 	error::Error, multilinear_query::MultilinearQuery, MultilinearExtension, MultilinearPoly,
 };
 use auto_impl::auto_impl;
-use binius_field::{ExtensionField, PackedField, TowerField};
+use binius_field::{ExtensionField, Field, PackedField, TowerField};
+use binius_utils::bail;
+use stackalloc::stackalloc_with_default;
 use std::{borrow::Borrow, fmt::Debug, marker::PhantomData, sync::Arc};
 
 /// A multivariate polynomial over a binary tower field.
@@ -37,9 +39,6 @@ where
 	/// Total degree of the polynomial.
 	fn degree(&self) -> usize;
 
-	/// Evaluates the polynomial over scalars, returning a scalar.
-	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error>;
-
 	/// Evaluates the polynomial using packed values, where each packed value may contain multiple scalar values.
 	/// The evaluation follows SIMD semantics, meaning that operations are performed
 	/// element-wise across corresponding scalar values in the packed values.
@@ -52,6 +51,39 @@ where
 
 	/// Returns the maximum binary tower level of all constants in the arithmetic expression.
 	fn binary_tower_level(&self) -> usize;
+
+	/// Batch evaluation that admits non-strided argument layout.
+	/// `sparse_batch_query` is a slice of slice references of equal length, which furthermore should equal
+	/// the length of `evals` parameter.
+	///
+	/// Evaluation follows SIMD semantics as in `evaluate`:
+	/// - `evals[j] := composition([sparse_batch_query[i][j] forall i]) forall j`
+	/// - no crosstalk between evaluations
+	///
+	/// This method has a default implementation.
+	fn sparse_batch_evaluate(
+		&self,
+		sparse_batch_query: &[&[P]],
+		evals: &mut [P],
+	) -> Result<(), Error> {
+		let row_len = sparse_batch_query.first().map_or(0, |row| row.len());
+
+		if evals.len() != row_len || sparse_batch_query.iter().any(|row| row.len() != row_len) {
+			return Err(Error::SparseBatchEvaluateSizeMismatch);
+		}
+
+		stackalloc_with_default(sparse_batch_query.len(), |query| {
+			for (column, eval) in evals.iter_mut().enumerate() {
+				for (query_elem, sparse_batch_query_row) in query.iter_mut().zip(sparse_batch_query)
+				{
+					*query_elem = sparse_batch_query_row[column];
+				}
+
+				*eval = self.evaluate(query)?;
+			}
+			Ok(())
+		})
+	}
 }
 
 /// Identity composition function $g(X) = X$.
@@ -67,22 +99,63 @@ impl<P: PackedField> CompositionPoly<P> for IdentityCompositionPoly {
 		1
 	}
 
-	fn evaluate_scalar(&self, query: &[P::Scalar]) -> Result<P::Scalar, Error> {
-		if query.len() != 1 {
-			return Err(Error::IncorrectQuerySize { expected: 1 });
-		}
-		Ok(query[0])
-	}
-
 	fn evaluate(&self, query: &[P]) -> Result<P, Error> {
 		if query.len() != 1 {
-			return Err(Error::IncorrectQuerySize { expected: 1 });
+			bail!(Error::IncorrectQuerySize { expected: 1 });
 		}
 		Ok(query[0])
 	}
 
 	fn binary_tower_level(&self) -> usize {
 		0
+	}
+}
+
+/// An adapter that constructs a [`CompositionPoly`] for a field from a [`CompositionPoly`] for a
+/// packing of that field.
+///
+/// This is not intended for use in performance-critical code sections.
+#[derive(Debug, Clone)]
+pub struct CompositionScalarAdapter<P, Composition> {
+	composition: Composition,
+	_marker: PhantomData<P>,
+}
+
+impl<P, Composition> CompositionScalarAdapter<P, Composition>
+where
+	P: PackedField,
+	Composition: CompositionPoly<P>,
+{
+	pub fn new(composition: Composition) -> Self {
+		Self {
+			composition,
+			_marker: PhantomData,
+		}
+	}
+}
+
+impl<F, P, Composition> CompositionPoly<F> for CompositionScalarAdapter<P, Composition>
+where
+	F: Field,
+	P: PackedField<Scalar = F>,
+	Composition: CompositionPoly<P>,
+{
+	fn n_vars(&self) -> usize {
+		self.composition.n_vars()
+	}
+
+	fn degree(&self) -> usize {
+		self.composition.degree()
+	}
+
+	fn evaluate(&self, query: &[F]) -> Result<F, Error> {
+		let packed_query = query.iter().cloned().map(P::set_single).collect::<Vec<_>>();
+		let packed_result = self.composition.evaluate(&packed_query)?;
+		Ok(packed_result.get(0))
+	}
+
+	fn binary_tower_level(&self) -> usize {
+		self.composition.binary_tower_level()
 	}
 }
 
@@ -110,7 +183,7 @@ where
 	n_vars: usize,
 	// The multilinear polynomials. The length of the vector matches `composition.n_vars()`.
 	pub multilinears: Vec<M>,
-	pub _p_marker: PhantomData<P>,
+	pub _marker: PhantomData<P>,
 }
 
 impl<P, C, M> MultilinearComposite<P, C, M>
@@ -126,7 +199,7 @@ where
 				composition.n_vars(),
 				multilinears.len()
 			);
-			return Err(Error::MultilinearCompositeValidation(err_str));
+			bail!(Error::MultilinearCompositeValidation(err_str));
 		}
 		for multilin in multilinears.iter().map(Borrow::borrow) {
 			if multilin.n_vars() != n_vars {
@@ -135,14 +208,14 @@ where
 					multilin.n_vars(),
 					n_vars
 				);
-				return Err(Error::MultilinearCompositeValidation(err_str));
+				bail!(Error::MultilinearCompositeValidation(err_str));
 			}
 		}
 		Ok(Self {
 			n_vars,
 			composition,
 			multilinears,
-			_p_marker: PhantomData,
+			_marker: PhantomData,
 		})
 	}
 
@@ -150,18 +223,19 @@ where
 		let evals = self
 			.multilinears
 			.iter()
-			.map(|multilin| multilin.evaluate(query))
+			.map(|multilin| Ok::<P, Error>(P::set_single(multilin.evaluate(query)?)))
 			.collect::<Result<Vec<_>, _>>()?;
-		self.composition.evaluate_scalar(&evals)
+		Ok(self.composition.evaluate(&evals)?.get(0))
 	}
 
 	pub fn evaluate_on_hypercube(&self, index: usize) -> Result<P::Scalar, Error> {
 		let evals = self
 			.multilinears
 			.iter()
-			.map(|multilin| multilin.evaluate_on_hypercube(index))
+			.map(|multilin| Ok::<P, Error>(P::set_single(multilin.evaluate_on_hypercube(index)?)))
 			.collect::<Result<Vec<_>, _>>()?;
-		self.composition.evaluate_scalar(&evals)
+
+		Ok(self.composition.evaluate(&evals)?.get(0))
 	}
 
 	pub fn max_individual_degree(&self) -> usize {
@@ -185,7 +259,7 @@ where
 			n_vars: self.n_vars,
 			composition: Arc::new(self.composition),
 			multilinears: self.multilinears,
-			_p_marker: PhantomData,
+			_marker: PhantomData,
 		}
 	}
 }
@@ -244,7 +318,7 @@ where
 			composition: self.composition.clone(),
 			n_vars: self.n_vars - query.n_vars(),
 			multilinears: new_multilinears,
-			_p_marker: PhantomData,
+			_marker: PhantomData,
 		})
 	}
 }

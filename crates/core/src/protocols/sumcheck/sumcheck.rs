@@ -3,7 +3,7 @@
 use super::{Error, VerificationError};
 use crate::{
 	oracle::{CompositePolyOracle, OracleId},
-	polynomial::{evaluate_univariate, MultilinearComposite},
+	polynomial::MultilinearComposite,
 	protocols::{
 		abstract_sumcheck::{
 			AbstractSumcheckClaim, AbstractSumcheckProof, AbstractSumcheckReductor,
@@ -13,6 +13,8 @@ use crate::{
 	},
 };
 use binius_field::{Field, PackedField};
+use binius_math::evaluate_univariate;
+use binius_utils::bail;
 
 pub type SumcheckRound<F> = AbstractSumcheckRound<F>;
 pub type SumcheckProof<F> = AbstractSumcheckProof<F>;
@@ -34,6 +36,10 @@ impl<F: Field> AbstractSumcheckClaim<F> for SumcheckClaim<F> {
 		self.poly.n_vars()
 	}
 
+	fn max_individual_degree(&self) -> usize {
+		self.poly.max_individual_degree()
+	}
+
 	fn sum(&self) -> F {
 		self.sum
 	}
@@ -44,10 +50,26 @@ pub type SumcheckWitness<P, C, M> = MultilinearComposite<P, C, M>;
 
 pub type SumcheckRoundClaim<F> = AbstractSumcheckRoundClaim<F>;
 
-pub struct SumcheckReductor;
+pub struct SumcheckReductor {
+	pub max_individual_degree: usize,
+}
 
 impl<F: Field> AbstractSumcheckReductor<F> for SumcheckReductor {
 	type Error = Error;
+
+	fn validate_round_proof_shape(
+		&self,
+		_round: usize,
+		proof: &AbstractSumcheckRound<F>,
+	) -> Result<(), Self::Error> {
+		if proof.coeffs.len() != self.max_individual_degree {
+			return Err(VerificationError::NumberOfCoefficients {
+				expected: self.max_individual_degree,
+			}
+			.into());
+		}
+		Ok(())
+	}
 
 	fn reduce_round_claim(
 		&self,
@@ -71,9 +93,6 @@ fn reduce_intermediate_round_claim_helper<F: Field>(
 	} = claim;
 
 	let SumcheckRound { mut coeffs } = proof;
-	if coeffs.is_empty() {
-		return Err(VerificationError::NumberOfCoefficients.into());
-	}
 
 	// The prover has sent coefficients for the purported ith round polynomial
 	// * $r_i(X) = \sum_{j=0}^d a_j * X^j$
@@ -93,7 +112,8 @@ fn reduce_intermediate_round_claim_helper<F: Field>(
 	// Not sending the whole round polynomial is an optimization.
 	// In the unoptimized version of the protocol, the verifier will halt and reject
 	// if given a round polynomial that does not satisfy the above identity.
-	let last_coeff = current_round_sum - coeffs[0] - coeffs.iter().sum::<F>();
+	let first_coeff = coeffs.first().copied().unwrap_or(F::ZERO);
+	let last_coeff = current_round_sum - first_coeff - coeffs.iter().sum::<F>();
 	coeffs.push(last_coeff);
 	let new_round_sum = evaluate_univariate(&coeffs, challenge);
 
@@ -127,6 +147,6 @@ where
 	if sum? == claim.sum().into() {
 		Ok(())
 	} else {
-		Err(Error::NaiveValidation)
+		bail!(Error::NaiveValidation)
 	}
 }

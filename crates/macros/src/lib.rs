@@ -1,6 +1,7 @@
 // Copyright 2024 Ulvetanna Inc.
 
 extern crate proc_macro;
+mod arith_circuit_poly;
 mod composition_poly;
 
 use proc_macro::TokenStream;
@@ -8,7 +9,7 @@ use quote::{quote, ToTokens};
 use std::collections::BTreeSet;
 use syn::{parse_macro_input, Data, DeriveInput, Fields};
 
-use crate::composition_poly::CompositionPolyItem;
+use crate::{arith_circuit_poly::ArithCircuitPolyItem, composition_poly::CompositionPolyItem};
 
 /// Useful for concisely creating structs that implement CompositionPoly.
 /// This currently only supports creating composition polynomials of tower level 0.
@@ -35,6 +36,13 @@ use crate::composition_poly::CompositionPolyItem;
 #[proc_macro]
 pub fn composition_poly(input: TokenStream) -> TokenStream {
 	parse_macro_input!(input as CompositionPolyItem)
+		.into_token_stream()
+		.into()
+}
+
+#[proc_macro]
+pub fn arith_circuit_poly(input: TokenStream) -> TokenStream {
+	parse_macro_input!(input as ArithCircuitPolyItem)
 		.into_token_stream()
 		.into()
 }

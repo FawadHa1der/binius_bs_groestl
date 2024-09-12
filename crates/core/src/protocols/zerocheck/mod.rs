@@ -4,8 +4,10 @@
 //!
 //! [DP23]: https://eprint.iacr.org/2023/1784
 
+mod backend;
 mod batch;
 mod error;
+mod evaluator;
 mod prove;
 #[cfg(test)]
 mod tests;

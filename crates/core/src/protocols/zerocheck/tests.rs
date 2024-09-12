@@ -1,17 +1,10 @@
 // Copyright 2024 Ulvetanna Inc.
 
-use std::{cmp::max, iter::repeat_with};
-
+use super::ZerocheckWitnessTypeErased;
 use crate::{
-	challenger::HashChallenger,
-	oracle::{
-		CommittedBatchSpec, CommittedId, CompositePolyOracle, MultilinearOracleSet,
-		MultilinearPolyOracle,
-	},
-	polynomial::{
-		IsomorphicEvaluationDomainFactory, MultilinearComposite, MultilinearExtension,
-		MultilinearQuery,
-	},
+	challenger::new_hasher_challenger,
+	oracle::{CompositePolyOracle, MultilinearOracleSet},
+	polynomial::{MultilinearComposite, MultilinearExtension, MultilinearQuery},
 	protocols::{
 		test_utils::TestProductComposition,
 		zerocheck::{
@@ -19,32 +12,38 @@ use crate::{
 			ZerocheckClaim,
 		},
 	},
-	witness::MultilinearWitnessIndex,
+	witness::MultilinearExtensionIndex,
 };
-use binius_field::{BinaryField128b, BinaryField32b, ExtensionField, Field, TowerField};
+use binius_field::{
+	as_packed_field::{PackScalar, PackedType},
+	underlier::{UnderlierType, WithUnderlier},
+	BinaryField128b, BinaryField32b, ExtensionField, Field, PackedBinaryField4x128b, PackedField,
+	TowerField,
+};
+use binius_hal::make_backend;
 use binius_hash::GroestlHasher;
+use binius_math::IsomorphicEvaluationDomainFactory;
 use p3_util::log2_ceil_usize;
 use rand::{rngs::StdRng, SeedableRng};
 use rayon::current_num_threads;
+use std::{cmp::max, iter::repeat_with};
 
-use super::ZerocheckWitnessTypeErased;
-
-fn generate_poly_helper<F>(
+fn generate_poly_helper<P>(
 	rng: &mut StdRng,
 	n_vars: usize,
 	n_multilinears: usize,
-) -> Vec<MultilinearExtension<F>>
+) -> Vec<MultilinearExtension<P>>
 where
-	F: Field,
+	P: PackedField,
 {
 	let multilinears = (0..n_multilinears)
 		.map(|j| {
 			let values = (0..(1 << n_vars))
 				.map(|i| {
 					if i % n_multilinears != j {
-						Field::random(&mut *rng)
+						PackedField::random(&mut *rng)
 					} else {
-						Field::ZERO
+						PackedField::zero()
 					}
 				})
 				.collect();
@@ -55,15 +54,15 @@ where
 	// Sanity check that the sum is zero
 	let sum = (0..1 << n_vars)
 		.map(|i| {
-			let mut prod = F::ONE;
+			let mut prod = P::one();
 			(0..n_multilinears).for_each(|j| {
 				prod *= multilinears[j].packed_evaluate_on_hypercube(i).unwrap();
 			});
 			prod
 		})
-		.sum::<F>();
+		.sum::<P>();
 
-	if sum != F::ZERO {
+	if sum != P::zero() {
 		panic!("Zerocheck sum is not zero");
 	}
 
@@ -95,14 +94,15 @@ fn test_prove_verify_interaction_helper(
 
 	// Setup ZC Claim
 	let mut oracles = MultilinearOracleSet::new();
-	let batch_id = oracles.add_committed_batch(CommittedBatchSpec {
-		n_vars,
-		n_polys: n_multilinears,
-		tower_level: F::TOWER_LEVEL,
-	});
+
+	let batch_id = oracles.add_committed_batch(n_vars, F::TOWER_LEVEL);
 	let h = (0..n_multilinears)
-		.map(|i| oracles.committed_oracle(CommittedId { batch_id, index: i }))
+		.map(|_| {
+			let id = oracles.add_committed(batch_id);
+			oracles.oracle(id)
+		})
 		.collect();
+
 	let composite_poly =
 		CompositePolyOracle::new(n_vars, h, TestProductComposition::new(n_multilinears)).unwrap();
 
@@ -112,19 +112,21 @@ fn test_prove_verify_interaction_helper(
 
 	// Zerocheck
 	let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField32b>::default();
-	let mut prover_challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+	let mut prover_challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 	let mut verifier_challenger = prover_challenger.clone();
 	let switchover_fn = move |_| switchover_rd;
+	let backend = make_backend();
 
 	let ZerocheckProveOutput {
 		evalcheck_claim,
 		zerocheck_proof,
-	} = zerocheck::prove::<_, _, BinaryField32b, _>(
+	} = zerocheck::prove::<_, _, BinaryField32b, _, _>(
 		&zc_claim,
 		zc_witness.clone(),
 		domain_factory,
 		switchover_fn,
 		&mut prover_challenger,
+		backend.clone(),
 	)
 	.expect("failed to prove zerocheck");
 
@@ -140,7 +142,7 @@ fn test_prove_verify_interaction_helper(
 
 	// Verify that the evalcheck claim is correct
 	let eval_point = &verified_evalcheck_claim.eval_point;
-	let multilin_query = MultilinearQuery::with_full_query(eval_point).unwrap();
+	let multilin_query = MultilinearQuery::with_full_query(eval_point, backend).unwrap();
 	let actual = zc_witness.evaluate(&multilin_query).unwrap();
 	assert_eq!(actual, verified_evalcheck_claim.eval);
 }
@@ -167,11 +169,11 @@ fn test_zerocheck_prove_verify_interaction_pigeonhole_cores() {
 	}
 }
 
-struct CreateClaimsWitnessesOutput<'a, F: TowerField> {
+struct CreateClaimsWitnessesOutput<'a, U: UnderlierType + PackScalar<F>, F: TowerField> {
 	new_claims: Vec<ZerocheckClaim<F>>,
-	new_witnesses: Vec<ZerocheckWitnessTypeErased<'a, F, TestProductComposition>>,
+	new_witnesses: Vec<ZerocheckWitnessTypeErased<'a, PackedType<U, F>, TestProductComposition>>,
 	oracle_set: MultilinearOracleSet<F>,
-	witness_index: MultilinearWitnessIndex<'a, F>,
+	witness_index: MultilinearExtensionIndex<'a, U, F>,
 	rng: StdRng,
 }
 
@@ -183,32 +185,31 @@ struct CreateClaimsWitnessesOutput<'a, F: TowerField> {
 // This function then creates n_composites multivariate polynomials where the ith polynomial is
 // the product of the first (n_shared_multilins + i) multilinear polynomials.
 // These are then used as the underlying polynomials for the zerocheck claims and witnesses.
-fn create_claims_witnesses_helper<F, FE>(
+fn create_claims_witnesses_helper<U, F, FE>(
 	mut rng: StdRng,
 	mut oracle_set: MultilinearOracleSet<FE>,
-	mut witness_index: MultilinearWitnessIndex<'_, FE>,
+	mut witness_index: MultilinearExtensionIndex<'_, U, FE>,
 	n_vars: usize,
 	n_shared_multilins: usize,
 	n_composites: usize,
-) -> CreateClaimsWitnessesOutput<'_, FE>
+) -> CreateClaimsWitnessesOutput<'_, U, FE>
 where
 	F: TowerField,
 	FE: TowerField + ExtensionField<F>,
+	U: UnderlierType + PackScalar<FE>,
 {
 	if n_shared_multilins == 0 || n_composites == 0 {
 		panic!("Require at least one multilinear and composite polynomial");
 	}
 
 	let n_polys = n_shared_multilins + n_composites - 1;
-	let batch_id = oracle_set.add_committed_batch(CommittedBatchSpec {
-		n_vars,
-		n_polys,
-		tower_level: F::TOWER_LEVEL,
-	});
-
+	let batch_id = oracle_set.add_committed_batch(n_vars, F::TOWER_LEVEL);
 	let multilin_oracles = (0..n_polys)
-		.map(|index| oracle_set.committed_oracle(CommittedId { batch_id, index }))
-		.collect::<Vec<MultilinearPolyOracle<FE>>>();
+		.map(|_| {
+			let oracle_id = oracle_set.add_committed(batch_id);
+			oracle_set.oracle(oracle_id)
+		})
+		.collect::<Vec<_>>();
 
 	let mut multilins = generate_poly_helper::<F>(&mut rng, n_vars, n_shared_multilins);
 	for _ in n_shared_multilins..n_polys {
@@ -221,9 +222,9 @@ where
 		multilins.push(random_multilin);
 	}
 
-	(0..n_polys).for_each(|i| {
-		witness_index.set(multilin_oracles[i].id(), multilins[i].clone().specialize_arc_dyn());
-	});
+	let multilins =
+		(0..n_polys).map(|i| (multilin_oracles[i].id(), multilins[i].clone().specialize_arc_dyn()));
+	witness_index.update_multilin_poly(multilins).unwrap();
 
 	let mut new_claims = Vec::with_capacity(n_composites);
 	let mut new_witnesses = Vec::with_capacity(n_composites);
@@ -243,7 +244,12 @@ where
 			composite_oracle
 				.inner_polys()
 				.into_iter()
-				.map(|multilin_oracle| witness_index.get(multilin_oracle.id()).unwrap().clone())
+				.map(|multilin_oracle| {
+					witness_index
+						.get_multilin_poly(multilin_oracle.id())
+						.unwrap()
+						.clone()
+				})
 				.collect(),
 		)
 		.unwrap();
@@ -272,13 +278,16 @@ where
 fn test_prove_verify_batch() {
 	type F = BinaryField32b;
 	type FE = BinaryField128b;
+	type PE = PackedBinaryField4x128b;
+	type U = <PE as WithUnderlier>::Underlier;
 	let rng = StdRng::seed_from_u64(0);
 	let oracle_set = MultilinearOracleSet::<FE>::new();
-	let witness_index = MultilinearWitnessIndex::<FE>::new();
+	let witness_index = MultilinearExtensionIndex::<U, FE>::new();
 	let mut claims = Vec::new();
 	let mut witnesses = Vec::new();
 	let mut max_n_vars = 0;
-	let prover_challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+
+	let prover_challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 	let verifier_challenger = prover_challenger.clone();
 
 	// Create zerocheck witnesses and claims on 4 variables
@@ -292,7 +301,7 @@ fn test_prove_verify_batch() {
 		oracle_set,
 		witness_index,
 		rng,
-	} = create_claims_witnesses_helper::<F, FE>(
+	} = create_claims_witnesses_helper::<U, F, FE>(
 		rng,
 		oracle_set,
 		witness_index,
@@ -315,7 +324,7 @@ fn test_prove_verify_batch() {
 		oracle_set,
 		witness_index,
 		rng,
-	} = create_claims_witnesses_helper::<F, FE>(
+	} = create_claims_witnesses_helper::<U, F, FE>(
 		rng,
 		oracle_set,
 		witness_index,
@@ -333,11 +342,13 @@ fn test_prove_verify_batch() {
 	assert_eq!(claims.len(), witnesses.len());
 	let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField32b>::default();
 	let claim_witness_iter = claims.clone().into_iter().zip(witnesses);
-	let prove_output = batch_prove::<_, _, BinaryField32b, _>(
+	let backend = make_backend();
+	let prove_output = batch_prove::<_, _, BinaryField32b, _, _>(
 		claim_witness_iter,
 		domain_factory,
 		|_| 3,
 		prover_challenger,
+		backend,
 	)
 	.unwrap();
 	let proof = prove_output.proof;
@@ -345,4 +356,82 @@ fn test_prove_verify_batch() {
 
 	let _evalcheck_claims =
 		batch_verify(claims.iter().cloned(), proof, verifier_challenger).unwrap();
+}
+
+#[test]
+fn test_prove_verify_packed() {
+	type F = BinaryField32b;
+	type PE = PackedBinaryField4x128b;
+	let mut rng = StdRng::seed_from_u64(0);
+
+	let n_vars = 4;
+	let n_multilinears = 5;
+	let switchover_rd = 3;
+
+	// Setup ZC Witness
+	let multilins = generate_poly_helper::<F>(&mut rng, n_vars, n_multilinears);
+	let zc_multilins = multilins
+		.into_iter()
+		.map(|m| m.specialize_arc_dyn())
+		.collect();
+	let zc_witness = MultilinearComposite::<PE, _, _>::new(
+		n_vars,
+		TestProductComposition::new(n_multilinears),
+		zc_multilins,
+	)
+	.unwrap();
+
+	// Setup ZC Claim
+	let mut oracles = MultilinearOracleSet::new();
+
+	let batch_id = oracles.add_committed_batch(n_vars, F::TOWER_LEVEL);
+	let h = (0..n_multilinears)
+		.map(|_| {
+			let id = oracles.add_committed(batch_id);
+			oracles.oracle(id)
+		})
+		.collect();
+
+	let composite_poly =
+		CompositePolyOracle::new(n_vars, h, TestProductComposition::new(n_multilinears)).unwrap();
+
+	let zc_claim = ZerocheckClaim {
+		poly: composite_poly,
+	};
+
+	// Zerocheck
+	let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField32b>::default();
+	let mut prover_challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
+	let mut verifier_challenger = prover_challenger.clone();
+	let switchover_fn = move |_| switchover_rd;
+	let backend = make_backend();
+
+	let ZerocheckProveOutput {
+		evalcheck_claim,
+		zerocheck_proof,
+	} = zerocheck::prove::<_, PE, BinaryField32b, _, _>(
+		&zc_claim,
+		zc_witness.clone(),
+		domain_factory,
+		switchover_fn,
+		&mut prover_challenger,
+		backend.clone(),
+	)
+	.expect("failed to prove zerocheck");
+
+	let verified_evalcheck_claim = verify(&zc_claim, zerocheck_proof, &mut verifier_challenger)
+		.expect("failed to verify zerocheck");
+
+	// Check consistency between prover and verifier view of reduced evalcheck claim
+	assert_eq!(evalcheck_claim.eval, verified_evalcheck_claim.eval);
+	assert_eq!(evalcheck_claim.eval_point, verified_evalcheck_claim.eval_point);
+	assert_eq!(evalcheck_claim.poly.n_vars(), n_vars);
+	assert!(evalcheck_claim.is_random_point);
+	assert_eq!(verified_evalcheck_claim.poly.n_vars(), n_vars);
+
+	// Verify that the evalcheck claim is correct
+	let eval_point = &verified_evalcheck_claim.eval_point;
+	let multilin_query = MultilinearQuery::with_full_query(eval_point, backend).unwrap();
+	let actual = zc_witness.evaluate(&multilin_query).unwrap();
+	assert_eq!(actual, verified_evalcheck_claim.eval);
 }

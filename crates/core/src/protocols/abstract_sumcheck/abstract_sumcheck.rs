@@ -3,11 +3,13 @@
 use super::{Error, VerificationError};
 use crate::{
 	oracle::{CompositePolyOracle, OracleId},
-	polynomial::{CompositionPoly, EvaluationDomain, MultilinearComposite, MultilinearPoly},
+	polynomial::{CompositionPoly, MultilinearComposite, MultilinearPoly},
 	protocols::evalcheck::EvalcheckClaim,
 };
 use auto_impl::auto_impl;
 use binius_field::{Field, PackedField};
+use binius_math::EvaluationDomain;
+use binius_utils::bail;
 use std::hash::Hash;
 
 #[derive(Debug, Clone)]
@@ -50,6 +52,13 @@ impl<F: Field> From<AbstractSumcheckRoundClaim<F>> for ReducedClaim<F> {
 pub trait AbstractSumcheckReductor<F: Field> {
 	type Error: std::error::Error + From<Error>;
 
+	/// Verify that the round proof contains the correct amount of information.
+	fn validate_round_proof_shape(
+		&self,
+		round: usize,
+		proof: &AbstractSumcheckRound<F>,
+	) -> Result<(), Self::Error>;
+
 	/// Reduce a round claim to a round claim for the next round
 	///
 	/// Arguments:
@@ -66,9 +75,19 @@ pub trait AbstractSumcheckReductor<F: Field> {
 	) -> Result<AbstractSumcheckRoundClaim<F>, Self::Error>;
 }
 
-#[auto_impl(&)]
+/// A sumcheck protocol claim.
+///
+/// A claim implicitly refers to a multivariate polynomial with a number of variables $\nu$, where
+/// the degree of each individual variable is bounded by $d$.
 pub trait AbstractSumcheckClaim<F: Field> {
+	/// Returns the number of variables $\nu$ of the multivariate polynomial.
 	fn n_vars(&self) -> usize;
+
+	/// Returns the maximum individual degree $d$ of all variables.
+	fn max_individual_degree(&self) -> usize;
+
+	/// Returns the claimed sum of the polynomial values over the $\nu$-dimensional boolean
+	/// hypercube.
 	fn sum(&self) -> F;
 }
 
@@ -154,7 +173,7 @@ where
 		claim_multilinear_ids: &[OracleId],
 	) -> Result<impl IntoIterator<Item = (OracleId, M)>, Error> {
 		if claim_multilinear_ids.len() != self.multilinears.len() {
-			return Err(Error::ProverClaimWitnessMismatch);
+			bail!(Error::ProverClaimWitnessMismatch);
 		}
 
 		Ok(claim_multilinear_ids
@@ -175,7 +194,7 @@ pub fn check_evaluation_domain<F: Field>(
 		|| domain.points()[0] != F::ZERO
 		|| domain.points()[1] != F::ONE
 	{
-		return Err(Error::EvaluationDomainMismatch);
+		bail!(Error::EvaluationDomainMismatch);
 	}
 	Ok(())
 }
@@ -186,9 +205,9 @@ pub fn validate_rd_challenge<F: Field>(
 	round: usize,
 ) -> Result<(), Error> {
 	if round == 0 && prev_rd_challenge.is_some() {
-		return Err(Error::PreviousRoundChallengePresent);
+		bail!(Error::PreviousRoundChallengePresent);
 	} else if round > 0 && prev_rd_challenge.is_none() {
-		return Err(Error::PreviousRoundChallengeAbsent);
+		bail!(Error::PreviousRoundChallengeAbsent);
 	}
 
 	Ok(())

@@ -13,7 +13,6 @@ use super::{error::Error, prove::SumcheckProversState, sumcheck::SumcheckReducto
 use crate::{
 	challenger::{CanObserve, CanSample},
 	oracle::OracleId,
-	polynomial::EvaluationDomainFactory,
 	protocols::{
 		abstract_sumcheck::{
 			self, finalize_evalcheck_claim, AbstractSumcheckBatchProof,
@@ -22,7 +21,9 @@ use crate::{
 		evalcheck::EvalcheckClaim,
 	},
 };
-use binius_field::{ExtensionField, Field, PackedField};
+use binius_field::{ExtensionField, Field, PackedExtension};
+use binius_hal::ComputationBackend;
+use binius_math::EvaluationDomainFactory;
 
 pub type SumcheckBatchProof<F> = AbstractSumcheckBatchProof<F>;
 
@@ -35,20 +36,21 @@ pub struct SumcheckBatchProveOutput<F: Field> {
 /// Prove a batched sumcheck instance.
 ///
 /// See module documentation for details.
-pub fn batch_prove<F, PW, DomainField, CH>(
+pub fn batch_prove<F, PW, DomainField, CH, Backend>(
 	sumchecks: impl IntoIterator<
 		Item = (SumcheckClaim<F>, impl AbstractSumcheckWitness<PW, MultilinearId = OracleId>),
 	>,
 	evaluation_domain_factory: impl EvaluationDomainFactory<DomainField>,
 	switchover_fn: impl Fn(usize) -> usize + 'static,
 	challenger: CH,
+	backend: Backend,
 ) -> Result<SumcheckBatchProveOutput<F>, Error>
 where
 	F: Field,
 	DomainField: Field,
-	PW: PackedField<Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
-
+	PW: PackedExtension<DomainField, Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
 	CH: CanSample<F> + CanObserve<F>,
+	Backend: ComputationBackend,
 {
 	let sumchecks = sumchecks.into_iter().collect::<Vec<_>>();
 	let n_vars = sumchecks
@@ -57,10 +59,11 @@ where
 		.max()
 		.unwrap_or(0);
 
-	let mut provers_state = SumcheckProversState::<F, PW, DomainField, _, _>::new(
+	let mut provers_state = SumcheckProversState::<F, PW, DomainField, _, _, _>::new(
 		n_vars,
 		evaluation_domain_factory,
 		switchover_fn,
+		backend,
 	);
 
 	let oracles = sumchecks
@@ -97,9 +100,16 @@ where
 	F: Field,
 	CH: CanSample<F> + CanObserve<F>,
 {
-	let sumcheck_reductor = SumcheckReductor;
-
 	let claims_vec = claims.into_iter().collect::<Vec<_>>();
+	let max_individual_degree = claims_vec
+		.iter()
+		.map(|claim| claim.max_individual_degree())
+		.max()
+		.unwrap_or(0);
+
+	let sumcheck_reductor = SumcheckReductor {
+		max_individual_degree,
+	};
 
 	let reduced_claims =
 		abstract_sumcheck::batch_verify(claims_vec.clone(), proof, sumcheck_reductor, challenger)?;

@@ -1,13 +1,13 @@
 // Copyright 2024 Ulvetanna Inc.
 
+use crate::polynomial::{CompositionPoly, MultilinearComposite, MultilinearPoly};
 use binius_field::{Field, PackedField};
+use binius_math::evaluate_univariate;
+use binius_utils::bail;
 
-use crate::{
-	polynomial::{evaluate_univariate, CompositionPoly, MultilinearComposite, MultilinearPoly},
-	protocols::abstract_sumcheck::{
-		AbstractSumcheckClaim, AbstractSumcheckReductor, AbstractSumcheckRound,
-		AbstractSumcheckRoundClaim, AbstractSumcheckWitness, Error as AbstractSumcheckError,
-	},
+use crate::protocols::abstract_sumcheck::{
+	AbstractSumcheckClaim, AbstractSumcheckReductor, AbstractSumcheckRound,
+	AbstractSumcheckRoundClaim, AbstractSumcheckWitness, Error as AbstractSumcheckError,
 };
 
 use super::{Error, VerificationError};
@@ -34,6 +34,10 @@ pub struct GkrSumcheckClaim<F: Field> {
 impl<F: Field> AbstractSumcheckClaim<F> for GkrSumcheckClaim<F> {
 	fn n_vars(&self) -> usize {
 		self.n_vars
+	}
+
+	fn max_individual_degree(&self) -> usize {
+		self.degree
 	}
 
 	fn sum(&self) -> F {
@@ -97,11 +101,26 @@ pub type GkrSumcheckRound<F> = AbstractSumcheckRound<F>;
 pub type GkrSumcheckRoundClaim<F> = AbstractSumcheckRoundClaim<F>;
 
 pub struct GkrSumcheckReductor<'a, F> {
+	pub max_individual_degree: usize,
 	pub gkr_challenge_point: &'a [F],
 }
 
 impl<'a, F: Field> AbstractSumcheckReductor<F> for GkrSumcheckReductor<'a, F> {
 	type Error = Error;
+
+	fn validate_round_proof_shape(
+		&self,
+		_round: usize,
+		proof: &AbstractSumcheckRound<F>,
+	) -> Result<(), Self::Error> {
+		if proof.coeffs.len() != self.max_individual_degree {
+			return Err(VerificationError::NumberOfCoefficients {
+				expected: self.max_individual_degree,
+			}
+			.into());
+		}
+		Ok(())
+	}
 
 	fn reduce_round_claim(
 		&self,
@@ -111,7 +130,7 @@ impl<'a, F: Field> AbstractSumcheckReductor<F> for GkrSumcheckReductor<'a, F> {
 		round_proof: AbstractSumcheckRound<F>,
 	) -> Result<AbstractSumcheckRoundClaim<F>, Self::Error> {
 		if round != claim.partial_point.len() {
-			return Err(Error::RoundArgumentRoundClaimMismatch);
+			bail!(Error::RoundArgumentRoundClaimMismatch);
 		}
 		let alpha_i = self.gkr_challenge_point[round];
 		reduce_round_claim_helper(claim, challenge, round_proof, alpha_i)
@@ -149,10 +168,6 @@ fn reduce_round_claim_helper<F: Field>(
 	// In the unoptimized version of the protocol, the verifier will halt and reject
 	// if given a round polynomial that does not satisfy the required identities.
 	// For more information, see Section 3 of https://eprint.iacr.org/2024/108
-
-	if coeffs.is_empty() {
-		return Err(VerificationError::NumberOfCoefficients.into());
-	}
 
 	// The verifier has not been given $a_0$.
 	// The identity that must hold is:

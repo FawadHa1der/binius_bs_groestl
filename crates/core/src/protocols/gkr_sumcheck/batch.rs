@@ -1,16 +1,18 @@
 // Copyright 2024 Ulvetanna Inc.
 
-use binius_field::{ExtensionField, Field, PackedField};
-use p3_challenger::{CanObserve, CanSample};
-use tracing::instrument;
-
 use crate::{
-	polynomial::{CompositionPoly, EvaluationDomainFactory, MultilinearPoly},
+	polynomial::{CompositionPoly, MultilinearPoly},
 	protocols::abstract_sumcheck::{
 		self, AbstractSumcheckBatchProof, AbstractSumcheckBatchProveOutput, AbstractSumcheckClaim,
 		ReducedClaim,
 	},
 };
+use binius_field::{ExtensionField, Field, PackedExtension};
+use binius_hal::ComputationBackend;
+use binius_math::EvaluationDomainFactory;
+use binius_utils::bail;
+use p3_challenger::{CanObserve, CanSample};
+use tracing::instrument;
 
 use super::{
 	gkr_sumcheck::{GkrSumcheckClaim, GkrSumcheckReductor, GkrSumcheckWitness},
@@ -24,20 +26,22 @@ pub type GkrSumcheckBatchProveOutput<F> = AbstractSumcheckBatchProveOutput<F>;
 /// Prove a batched GkrSumcheck instance.
 ///
 /// See module documentation for details.
-#[instrument(skip_all, name = "gkr_sumcheck::batch_prove")]
-pub fn batch_prove<F, PW, DomainField, CW, M, CH>(
+#[instrument(skip_all, name = "gkr_sumcheck::batch_prove", level = "debug")]
+pub fn batch_prove<F, PW, DomainField, CW, M, CH, Backend>(
 	gkr_sumchecks: impl IntoIterator<Item = (GkrSumcheckClaim<F>, GkrSumcheckWitness<PW, CW, M>)>,
 	evaluation_domain_factory: impl EvaluationDomainFactory<DomainField>,
 	switchover_fn: impl Fn(usize) -> usize + 'static,
 	challenger: CH,
+	backend: Backend,
 ) -> Result<GkrSumcheckBatchProveOutput<F>, Error>
 where
 	F: Field,
 	DomainField: Field,
-	PW: PackedField<Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
+	PW: PackedExtension<DomainField, Scalar: From<F> + Into<F> + ExtensionField<DomainField>>,
 	CW: CompositionPoly<PW>,
 	M: MultilinearPoly<PW> + Clone + Send + Sync,
 	CH: CanObserve<F> + CanSample<F>,
+	Backend: ComputationBackend,
 {
 	let gkr_sumchecks = gkr_sumchecks.into_iter().collect::<Vec<_>>();
 	let n_vars = gkr_sumchecks
@@ -51,11 +55,12 @@ where
 		.map(|(claim, _)| claim.r.clone())
 		.ok_or(Error::EmptyClaimsArray)?;
 
-	let mut provers_state = GkrSumcheckProversState::<F, PW, DomainField, _, _, _>::new(
+	let mut provers_state = GkrSumcheckProversState::<F, PW, DomainField, _, _, _, _>::new(
 		n_vars,
 		evaluation_domain_factory,
 		gkr_round_challenge.as_slice(),
 		switchover_fn,
+		backend,
 	)?;
 
 	abstract_sumcheck::batch_prove(gkr_sumchecks, &mut provers_state, challenger)
@@ -64,7 +69,7 @@ where
 /// Verify a batched GkrSumcheck instance.
 ///
 /// See module documentation for details.
-#[instrument(skip_all, name = "gkr_sumcheck::batch_verify")]
+#[instrument(skip_all, name = "gkr_sumcheck::batch_verify", level = "debug")]
 pub fn batch_verify<F, CH>(
 	claims: impl IntoIterator<Item = GkrSumcheckClaim<F>>,
 	proof: GkrSumcheckBatchProof<F>,
@@ -76,7 +81,7 @@ where
 {
 	let claims_vec = claims.into_iter().collect::<Vec<_>>();
 	if claims_vec.is_empty() {
-		return Err(Error::EmptyClaimsArray);
+		bail!(Error::EmptyClaimsArray);
 	}
 
 	let gkr_challenge_point = claims_vec[0].r.clone();
@@ -86,10 +91,17 @@ where
 		.iter()
 		.all(|claim| claim.r == gkr_challenge_point)
 	{
-		return Err(Error::MismatchedGkrChallengeInClaimsBatch);
+		bail!(Error::MismatchedGkrChallengeInClaimsBatch);
 	}
 
+	let max_individual_degree = claims_vec
+		.iter()
+		.map(|claim| claim.max_individual_degree())
+		.max()
+		.unwrap_or(0);
+
 	let reductor = GkrSumcheckReductor {
+		max_individual_degree,
 		gkr_challenge_point: &gkr_challenge_point,
 	};
 

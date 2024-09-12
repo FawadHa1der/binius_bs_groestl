@@ -8,7 +8,7 @@ use super::{
 use crate::{
 	challenger::{CanObserve, CanSample},
 	protocols::{
-		abstract_sumcheck::{self, finalize_evalcheck_claim},
+		abstract_sumcheck::{self, finalize_evalcheck_claim, AbstractSumcheckClaim},
 		evalcheck::EvalcheckClaim,
 	},
 };
@@ -16,7 +16,7 @@ use binius_field::Field;
 use tracing::instrument;
 
 /// Verify a sumcheck to evalcheck reduction.
-#[instrument(skip_all, name = "sumcheck::verify")]
+#[instrument(skip_all, name = "sumcheck::verify", level = "debug")]
 pub fn verify<F, CH>(
 	claim: &SumcheckClaim<F>,
 	proof: SumcheckProof<F>,
@@ -32,7 +32,9 @@ where
 		return Err(VerificationError::NumberOfRounds.into());
 	}
 
-	let reductor = SumcheckReductor;
+	let reductor = SumcheckReductor {
+		max_individual_degree: claim.max_individual_degree(),
+	};
 	let reduced_claim = abstract_sumcheck::verify(claim, proof, reductor, challenger)?;
 
 	finalize_evalcheck_claim(&claim.poly, reduced_claim).map_err(Into::into)

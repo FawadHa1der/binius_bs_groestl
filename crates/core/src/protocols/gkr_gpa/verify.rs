@@ -5,21 +5,24 @@ use super::{
 	Error, GrandProductClaim, VerificationError,
 };
 use crate::{
-	polynomial::extrapolate_line,
+	composition::BivariateProduct,
 	protocols::{
 		evalcheck::EvalcheckMultilinearClaim,
-		gkr_gpa::gkr_gpa::GKR_SUMCHECK_DEGREE,
 		gkr_sumcheck::{self, GkrSumcheckClaim},
 	},
 };
 use binius_field::{Field, TowerField};
-use binius_utils::sorting::{stable_sort, unsort};
+use binius_math::extrapolate_line_scalar;
+use binius_utils::{
+	bail,
+	sorting::{stable_sort, unsort},
+};
 use itertools::izip;
 use p3_challenger::{CanObserve, CanSample};
 use tracing::instrument;
 
 /// Verifies batch reduction turning each GrandProductClaim into an EvalcheckMultilinearClaim
-#[instrument(skip_all, name = "gkr_gpa::batch_verify")]
+#[instrument(skip_all, name = "gkr_gpa::batch_verify", level = "debug")]
 pub fn batch_verify<F, Challenger>(
 	claims: impl IntoIterator<Item = GrandProductClaim<F>>,
 	proof: GrandProductBatchProof<F>,
@@ -39,7 +42,7 @@ where
 		.ok_or(Error::EmptyClaimsArray)?;
 
 	if max_n_vars != batch_layer_proofs.len() {
-		return Err(Error::MismatchedClaimsAndProofs);
+		bail!(Error::MismatchedClaimsAndProofs);
 	}
 
 	// Create LayerClaims for each of the claims
@@ -145,7 +148,7 @@ where
 		.iter()
 		.all(|claim| claim.eval_point == curr_layer_challenge)
 	{
-		return Err(Error::MismatchedEvalPointLength);
+		bail!(Error::MismatchedEvalPointLength);
 	}
 
 	// Verify the gkr sumcheck batch proof and receive the corresponding reduced claims
@@ -153,7 +156,7 @@ where
 		sum: claim.eval,
 		r: claim.eval_point.clone(),
 		n_vars: claim.eval_point.len(),
-		degree: GKR_SUMCHECK_DEGREE,
+		degree: BivariateProduct.degree(),
 	});
 	let reduced_claims =
 		gkr_sumcheck::batch_verify(gkr_sumcheck_claims, gkr_sumcheck_batch_proof, &mut challenger)?;
@@ -168,7 +171,7 @@ where
 		.all(|(&zero_eval, &one_eval, eval)| zero_eval * one_eval == eval);
 
 	if !is_zero_one_eval_advice_valid {
-		return Err(Error::InvalidZeroOneEvalAdvice);
+		bail!(Error::InvalidZeroOneEvalAdvice);
 	}
 
 	// Create the new (k+1)th layer LayerClaims for each grand product circuit
@@ -182,7 +185,7 @@ where
 		.into_iter()
 		.zip(one_evals)
 		.map(|(zero_eval, one_eval)| {
-			let new_eval = extrapolate_line(zero_eval, one_eval, gkr_challenge);
+			let new_eval = extrapolate_line_scalar(zero_eval, one_eval, gkr_challenge);
 			LayerClaim {
 				eval_point: new_layer_challenge.clone(),
 				eval: new_eval,

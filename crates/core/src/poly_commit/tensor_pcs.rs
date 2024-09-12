@@ -1,6 +1,5 @@
 // Copyright 2023 Ulvetanna Inc.
 
-use super::error::{Error, VerificationError};
 use crate::{
 	challenger::{CanObserve, CanSample, CanSampleBits},
 	linear_code::LinearCode,
@@ -20,14 +19,16 @@ use binius_field::{
 	BinaryField, BinaryField8b, ExtensionField, Field, PackedExtension, PackedField,
 	PackedFieldIndexable,
 };
+use binius_hal::ComputationBackend;
 use binius_hash::{
 	GroestlDigest, GroestlDigestCompression, GroestlHasher, HashDigest, HasherDigest,
 };
 use binius_ntt::NTTOptions;
-use p3_matrix::{dense::RowMajorMatrix, MatrixRowSlices};
+use binius_utils::bail;
+use p3_matrix::{dense::RowMajorMatrix, Matrix};
 use p3_util::{log2_ceil_usize, log2_strict_usize};
 use rayon::prelude::*;
-use std::{iter::repeat_with, marker::PhantomData, mem, ops::Deref};
+use std::{cmp::min, iter::repeat_with, marker::PhantomData, mem, ops::Deref};
 use tracing::instrument;
 
 /// Creates a new multilinear from a batch of multilinears and a mixing challenge
@@ -50,7 +51,7 @@ where
 {
 	for t_prime_i in t_primes {
 		if t_prime_i.n_vars() != n_vars {
-			return Err(Error::IncorrectPolynomialSize { expected: n_vars });
+			bail!(Error::IncorrectPolynomialSize { expected: n_vars });
 		}
 	}
 
@@ -182,11 +183,17 @@ impl<U, F, FA, FI, FE, LC>
 			return Err(Error::CodeLengthPowerOfTwoRequired);
 		}
 		let log_len = log2_strict_usize(code.len());
+		// Compute optimal cap height
+		let cap_height = calculate_optimal_cap_height(log_len, n_test_queries);
 		Self::new(
 			log_rows,
 			code,
 			n_test_queries,
-			MerkleTreeVCS::new(log_len, GroestlDigestCompression::<BinaryField8b>::default()),
+			MerkleTreeVCS::new(
+				log_len,
+				cap_height,
+				GroestlDigestCompression::<BinaryField8b>::default(),
+			),
 		)
 	}
 }
@@ -216,7 +223,7 @@ where
 		self.log_rows() + self.log_cols()
 	}
 
-	#[instrument(skip_all, name = "tensor_pcs::commit")]
+	#[instrument(skip_all, name = "tensor_pcs::commit", level = "debug")]
 	fn commit<Data>(
 		&self,
 		polys: &[MultilinearExtension<PackedType<U, F>, Data>],
@@ -226,7 +233,7 @@ where
 	{
 		for poly in polys {
 			if poly.n_vars() != self.n_vars() {
-				return Err(Error::IncorrectPolynomialSize {
+				bail!(Error::IncorrectPolynomialSize {
 					expected: self.n_vars(),
 				});
 			}
@@ -298,43 +305,45 @@ where
 	/// Precondition: The queried point must already be observed by the challenger.
 	///
 	/// [DP23]: https://eprint.iacr.org/2023/630
-	#[instrument(skip_all, name = "tensor_pcs::prove_evaluation")]
-	fn prove_evaluation<Data, CH>(
+	#[instrument(skip_all, name = "tensor_pcs::prove_evaluation", level = "debug")]
+	fn prove_evaluation<Data, CH, Backend>(
 		&self,
 		challenger: &mut CH,
 		committed: &Self::Committed,
 		polys: &[MultilinearExtension<PackedType<U, F>, Data>],
 		query: &[FE],
+		backend: Backend,
 	) -> Result<Self::Proof, Error>
 	where
 		Data: Deref<Target = [PackedType<U, F>]> + Send + Sync,
 		CH: CanObserve<FE> + CanSample<FE> + CanSampleBits<usize>,
+		Backend: ComputationBackend,
 	{
 		let n_polys = polys.len();
 		let n_challenges = log2_ceil_usize(n_polys);
 		let mixing_challenges = challenger.sample_vec(n_challenges);
 		let mixing_coefficients =
-			&MultilinearQuery::with_full_query(&mixing_challenges)?.into_expansion()[..n_polys];
+			&MultilinearQuery::with_full_query(&mixing_challenges, backend.clone())?
+				.into_expansion()[..n_polys];
 
 		let (col_major_mats, ref vcs_committed) = committed;
 		if col_major_mats.len() != n_polys {
-			return Err(Error::NumBatchedMismatchError {
+			bail!(Error::NumBatchedMismatchError {
 				err_str: format!("In prove_evaluation: number of polynomials {} must match number of committed matrices {}", n_polys, col_major_mats.len()),
 			});
 		}
 
 		if query.len() != self.n_vars() {
-			return Err(PolynomialError::IncorrectQuerySize {
+			bail!(PolynomialError::IncorrectQuerySize {
 				expected: self.n_vars(),
-			}
-			.into());
+			});
 		}
 
 		let code_len_bits = log2_strict_usize(self.code.len());
 		let log_block_size = log2_strict_usize(<FI as ExtensionField<F>>::DEGREE);
 		let log_n_cols = self.code.dim_bits() + log_block_size;
 
-		let partial_query = &MultilinearQuery::with_full_query(&query[log_n_cols..])?;
+		let partial_query = &MultilinearQuery::with_full_query(&query[log_n_cols..], backend)?;
 		let ts = polys;
 		let t_primes = ts
 			.iter()
@@ -374,17 +383,19 @@ where
 	/// Precondition: The queried point must already be observed by the challenger.
 	///
 	/// [DP23]: https://eprint.iacr.org/2023/630
-	#[instrument(skip_all, name = "tensor_pcs::verify_evaluation")]
-	fn verify_evaluation<CH>(
+	#[instrument(skip_all, name = "tensor_pcs::verify_evaluation", level = "debug")]
+	fn verify_evaluation<CH, Backend>(
 		&self,
 		challenger: &mut CH,
 		commitment: &Self::Commitment,
 		query: &[FE],
 		proof: Self::Proof,
 		values: &[FE],
+		backend: Backend,
 	) -> Result<(), Error>
 	where
 		CH: CanObserve<FE> + CanSample<FE> + CanSampleBits<usize>,
+		Backend: ComputationBackend,
 	{
 		// These are all checked during construction, so it is safe to assert as a defensive
 		// measure.
@@ -397,7 +408,7 @@ where
 		debug_assert_eq!(self.code.dim() % pe_width, 0);
 
 		if values.len() != proof.n_polys {
-			return Err(Error::NumBatchedMismatchError {
+			bail!(Error::NumBatchedMismatchError {
 				err_str:
 					format!("In verify_evaluation: proof number of polynomials {} must match number of opened values {}", proof.n_polys, values.len()),
 			});
@@ -405,17 +416,18 @@ where
 
 		let n_challenges = log2_ceil_usize(proof.n_polys);
 		let mixing_challenges = challenger.sample_vec(n_challenges);
-		let mixing_coefficients =
-			&MultilinearQuery::<PackedType<U, FE>>::with_full_query(&mixing_challenges)?
-				.into_expansion()[..proof.n_polys];
+		let mixing_coefficients = &MultilinearQuery::<PackedType<U, FE>>::with_full_query(
+			&mixing_challenges,
+			backend.clone(),
+		)?
+		.into_expansion()[..proof.n_polys];
 		let value =
 			inner_product_unchecked(values.iter().copied(), iter_packed_slice(mixing_coefficients));
 
 		if query.len() != self.n_vars() {
-			return Err(PolynomialError::IncorrectQuerySize {
+			bail!(PolynomialError::IncorrectQuerySize {
 				expected: self.n_vars(),
-			}
-			.into());
+			});
 		}
 
 		self.check_proof_shape(&proof)?;
@@ -431,8 +443,10 @@ where
 		challenger.observe_slice(<PackedType<U, FE>>::unpack_scalars(proof.mixed_t_prime.evals()));
 
 		// Check evaluation of t' matches the claimed value
-		let multilin_query =
-			MultilinearQuery::<PackedType<U, FE>>::with_full_query(&query[..log_n_cols])?;
+		let multilin_query = MultilinearQuery::<PackedType<U, FE>>::with_full_query(
+			&query[..log_n_cols],
+			backend.clone(),
+		)?;
 		let computed_value = proof
 			.mixed_t_prime
 			.evaluate(&multilin_query)
@@ -513,8 +527,10 @@ where
 			.collect::<Vec<_>>();
 
 		// Batch evaluate all opened columns
-		let multilin_query =
-			MultilinearQuery::<PackedType<U, FE>>::with_full_query(&query[log_n_cols..])?;
+		let multilin_query = MultilinearQuery::<PackedType<U, FE>>::with_full_query(
+			&query[log_n_cols..],
+			backend.clone(),
+		)?;
 		let incorrect_evaluation = column_tests
 			.par_iter()
 			.map(|(expected, leaves)| {
@@ -540,7 +556,7 @@ where
 			});
 
 		if incorrect_evaluation {
-			Err(VerificationError::IncorrectPartialEvaluation.into())
+			return Err(VerificationError::IncorrectPartialEvaluation.into());
 		} else {
 			Ok(())
 		}
@@ -598,28 +614,28 @@ where
 		if !code.len().is_power_of_two() {
 			// This requirement is just to make sampling indices easier. With a little work it
 			// could be relaxed, but power-of-two code lengths are more convenient to work with.
-			return Err(Error::CodeLengthPowerOfTwoRequired);
+			bail!(Error::CodeLengthPowerOfTwoRequired);
 		}
 
 		let fi_degree = <FI as ExtensionField<F>>::DEGREE;
 		let fe_degree = <FE as ExtensionField<F>>::DEGREE;
 		if !fi_degree.is_power_of_two() {
-			return Err(Error::ExtensionDegreePowerOfTwoRequired);
+			bail!(Error::ExtensionDegreePowerOfTwoRequired);
 		}
 		if !fe_degree.is_power_of_two() {
-			return Err(Error::ExtensionDegreePowerOfTwoRequired);
+			bail!(Error::ExtensionDegreePowerOfTwoRequired);
 		}
 
 		let pi_width = PackedType::<U, FI>::WIDTH;
 		let pe_width = PackedType::<U, FE>::WIDTH;
 		if (1 << log_rows) % pi_width != 0 {
-			return Err(Error::PackingWidthMustDivideNumberOfRows);
+			bail!(Error::PackingWidthMustDivideNumberOfRows);
 		}
 		if code.dim() % pi_width != 0 {
-			return Err(Error::PackingWidthMustDivideCodeDimension);
+			bail!(Error::PackingWidthMustDivideCodeDimension);
 		}
 		if code.dim() % pe_width != 0 {
-			return Err(Error::PackingWidthMustDivideCodeDimension);
+			bail!(Error::PackingWidthMustDivideCodeDimension);
 		}
 
 		Ok(Self {
@@ -667,7 +683,7 @@ where
 		}
 		for (col_idx, (polys_col, _)) in proof.vcs_proofs.iter().enumerate() {
 			if polys_col.len() != proof.n_polys {
-				return Err(Error::NumBatchedMismatchError {
+				bail!(Error::NumBatchedMismatchError {
 					err_str: format!(
 						"Expected {} polynomials, but VCS proof at col_idx {} found {} polynomials instead",
 						proof.n_polys,
@@ -872,6 +888,18 @@ where
 	-total_err.log2() as usize
 }
 
+/// Calculate the optimal Merkle-cap height for a given log length and number of test queries.
+///
+/// It is explained in the concrete soundness subsection of section 5 of
+/// FRI-Binius that the optimal cap height is $\lceil \log_2(\gamma)\rceil$, where $\gamma$
+/// is the number of test queries. However, there is a maximal cap height of `log_len`, which
+/// corresponds to sending all of the leaves of the Merkle tree, so the optimal cap height
+/// is the minimum of the two.
+fn calculate_optimal_cap_height(log_len: usize, n_test_queries: usize) -> usize {
+	let cap_height = (n_test_queries as f64).log2().ceil() as usize;
+	min(cap_height, log_len)
+}
+
 /// Find the TensorPCS parameterization that optimizes proof size.
 ///
 /// This constructs a TensorPCS using a Reed-Solomon code and a Merkle tree using Groestl.
@@ -954,15 +982,67 @@ where
 	best_pcs
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+	#[error("the polynomial must have {expected} variables")]
+	IncorrectPolynomialSize { expected: usize },
+	#[error("linear encoding error: {0}")]
+	EncodeError(#[source] Box<dyn std::error::Error + Send + Sync>),
+	#[error("the polynomial commitment scheme requires a power of two code block length")]
+	CodeLengthPowerOfTwoRequired,
+	#[error("the polynomial commitment scheme requires a power of two extension degree")]
+	ExtensionDegreePowerOfTwoRequired,
+	#[error("cannot commit unaligned message")]
+	UnalignedMessage,
+	#[error("packing width must divide code dimension")]
+	PackingWidthMustDivideCodeDimension,
+	#[error("packing width must divide the number of rows")]
+	PackingWidthMustDivideNumberOfRows,
+	#[error("error in batching: {err_str}")]
+	NumBatchedMismatchError { err_str: String },
+	#[error("cannot calculate parameters satisfying the security target")]
+	ParameterError,
+	#[error("field error: {0}")]
+	Field(#[from] binius_field::Error),
+	#[error("polynomial error: {0}")]
+	Polynomial(#[from] PolynomialError),
+	#[error("vector commit error: {0}")]
+	VectorCommit(#[source] Box<dyn std::error::Error + Send + Sync>),
+	#[error("transpose error: {0}")]
+	Transpose(#[from] binius_field::transpose::Error),
+	#[error("verification failure: {0}")]
+	Verification(#[from] VerificationError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum VerificationError {
+	#[error("incorrect number of vector commitment opening proofs, expected {expected}")]
+	NumberOfOpeningProofs { expected: usize },
+	#[error("column opening at poly_index {poly_index}, col_index {col_index} has incorrect size, got {actual} expected {expected}")]
+	OpenedColumnSize {
+		poly_index: usize,
+		col_index: usize,
+		expected: usize,
+		actual: usize,
+	},
+	#[error("evaluation is incorrect")]
+	IncorrectEvaluation,
+	#[error("partial evaluation is incorrect")]
+	IncorrectPartialEvaluation,
+	#[error("partial evaluation (t') is the wrong size")]
+	PartialEvaluationSize,
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::challenger::HashChallenger;
+	use crate::challenger::new_hasher_challenger;
 	use binius_field::{
 		arch::OptimalUnderlier128b, BinaryField128b, BinaryField16b, BinaryField1b, BinaryField32b,
 		PackedBinaryField128x1b, PackedBinaryField16x8b, PackedBinaryField1x128b,
 		PackedBinaryField4x32b,
 	};
+	use binius_hal::make_backend;
 	use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
 
 	#[test]
@@ -993,23 +1073,25 @@ mod tests {
 
 		let (commitment, committed) = pcs.commit(&polys).unwrap();
 
-		let mut challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+		let mut challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 		let query = repeat_with(|| challenger.sample())
 			.take(pcs.n_vars())
 			.collect::<Vec<_>>();
 
+		let backend = make_backend();
 		let multilin_query =
-			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query).unwrap();
+			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query, backend.clone())
+				.unwrap();
 		let value = poly.evaluate(&multilin_query).unwrap();
 		let values = vec![value];
 
 		let mut prove_challenger = challenger.clone();
 		let proof = pcs
-			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query)
+			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query, backend.clone())
 			.unwrap();
 
 		let mut verify_challenger = challenger.clone();
-		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values)
+		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values, backend)
 			.unwrap();
 	}
 
@@ -1042,15 +1124,17 @@ mod tests {
 		})
 		.take(batch_size)
 		.collect::<Vec<_>>();
+		let backend = make_backend();
 
 		let (commitment, committed) = pcs.commit(&polys).unwrap();
 
-		let mut challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+		let mut challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 		let query = repeat_with(|| challenger.sample())
 			.take(pcs.n_vars())
 			.collect::<Vec<_>>();
 		let multilin_query =
-			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query).unwrap();
+			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query, backend.clone())
+				.unwrap();
 
 		let values = polys
 			.iter()
@@ -1059,11 +1143,11 @@ mod tests {
 
 		let mut prove_challenger = challenger.clone();
 		let proof = pcs
-			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query)
+			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query, backend.clone())
 			.unwrap();
 
 		let mut verify_challenger = challenger.clone();
-		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values)
+		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values, backend)
 			.unwrap();
 	}
 
@@ -1093,23 +1177,25 @@ mod tests {
 
 		let (commitment, committed) = pcs.commit(&polys).unwrap();
 
-		let mut challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+		let mut challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 		let query = repeat_with(|| challenger.sample())
 			.take(pcs.n_vars())
 			.collect::<Vec<_>>();
 
+		let backend = make_backend();
 		let multilin_query =
-			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query).unwrap();
+			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query, backend.clone())
+				.unwrap();
 		let value = poly.evaluate(&multilin_query).unwrap();
 		let values = vec![value];
 
 		let mut prove_challenger = challenger.clone();
 		let proof = pcs
-			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query)
+			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query, backend.clone())
 			.unwrap();
 
 		let mut verify_challenger = challenger.clone();
-		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values)
+		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values, backend)
 			.unwrap();
 	}
 
@@ -1142,12 +1228,14 @@ mod tests {
 		.collect::<Vec<_>>();
 		let (commitment, committed) = pcs.commit(&polys).unwrap();
 
-		let mut challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+		let mut challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
+		let backend = make_backend();
 		let query = repeat_with(|| challenger.sample())
 			.take(pcs.n_vars())
 			.collect::<Vec<_>>();
 		let multilinear_query =
-			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query).unwrap();
+			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query, backend.clone())
+				.unwrap();
 
 		let values = polys
 			.iter()
@@ -1156,11 +1244,11 @@ mod tests {
 
 		let mut prove_challenger = challenger.clone();
 		let proof = pcs
-			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query)
+			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query, backend.clone())
 			.unwrap();
 
 		let mut verify_challenger = challenger.clone();
-		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values)
+		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values, backend)
 			.unwrap();
 	}
 
@@ -1190,23 +1278,25 @@ mod tests {
 
 		let (commitment, committed) = pcs.commit(&polys).unwrap();
 
-		let mut challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+		let mut challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 		let query = repeat_with(|| challenger.sample())
 			.take(pcs.n_vars())
 			.collect::<Vec<_>>();
+		let backend = make_backend();
 
 		let multilin_query =
-			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query).unwrap();
+			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query, backend.clone())
+				.unwrap();
 		let value = poly.evaluate(&multilin_query).unwrap();
 		let values = vec![value];
 
 		let mut prove_challenger = challenger.clone();
 		let proof = pcs
-			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query)
+			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query, backend.clone())
 			.unwrap();
 
 		let mut verify_challenger = challenger.clone();
-		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values)
+		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values, backend)
 			.unwrap();
 	}
 
@@ -1239,12 +1329,14 @@ mod tests {
 		.collect::<Vec<_>>();
 		let (commitment, committed) = pcs.commit(&polys).unwrap();
 
-		let mut challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+		let mut challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
+		let backend = make_backend();
 		let query = repeat_with(|| challenger.sample())
 			.take(pcs.n_vars())
 			.collect::<Vec<_>>();
 		let multilin_query =
-			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query).unwrap();
+			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query, backend.clone())
+				.unwrap();
 
 		let values = polys
 			.iter()
@@ -1253,11 +1345,11 @@ mod tests {
 
 		let mut prove_challenger = challenger.clone();
 		let proof = pcs
-			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query)
+			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query, backend.clone())
 			.unwrap();
 
 		let mut verify_challenger = challenger.clone();
-		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values)
+		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values, backend)
 			.unwrap();
 	}
 
@@ -1278,8 +1370,8 @@ mod tests {
 		>>::new_using_groestl_merkle_tree(8, rs_code, n_test_queries)
 		.unwrap();
 
-		assert_eq!(pcs.proof_size(1), 182720);
-		assert_eq!(pcs.proof_size(2), 332224);
+		assert_eq!(pcs.proof_size(1), 150016);
+		assert_eq!(pcs.proof_size(2), 299520);
 	}
 
 	#[test]
@@ -1366,23 +1458,25 @@ mod tests {
 
 		let (commitment, committed) = pcs.commit(&polys).unwrap();
 
-		let mut challenger = <HashChallenger<_, GroestlHasher<_>>>::new();
+		let mut challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 		let query = repeat_with(|| challenger.sample())
 			.take(pcs.n_vars())
 			.collect::<Vec<_>>();
+		let backend = make_backend();
 
 		let multilin_query =
-			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query).unwrap();
+			MultilinearQuery::<PackedBinaryField1x128b>::with_full_query(&query, backend.clone())
+				.unwrap();
 		let value = poly.evaluate(&multilin_query).unwrap();
 		let values = vec![value];
 
 		let mut prove_challenger = challenger.clone();
 		let proof = pcs
-			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query)
+			.prove_evaluation(&mut prove_challenger, &committed, &polys, &query, backend.clone())
 			.unwrap();
 
 		let mut verify_challenger = challenger.clone();
-		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values)
+		pcs.verify_evaluation(&mut verify_challenger, &commitment, &query, proof, &values, backend)
 			.unwrap();
 	}
 }
