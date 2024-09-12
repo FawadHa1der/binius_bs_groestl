@@ -78,20 +78,12 @@ fn packed_to_bytes(packed: &[PackedPrimitiveType]) -> &[PackedBinaryField32x8b] 
 
 fn bench_groestl_long_data(c: &mut Criterion) {
     let mut group = c.benchmark_group("groestl");
-    let n_hashes = 8192;
-    let input_items_length = 131072;
+    let n_hashes = 64;
+    let input_items_length = 1024;
 
-    let default_input_value = PackedPrimitiveType {
-        value: M128 { high: 0, low: 0 },
-    };
-
-    // Initialize the vector with default values using the vec! macro and an iterator
-    let testdigests: Vec<ScaledPackedField<PackedPrimitiveType, 2>> = vec![
-        ScaledPackedField {
-            elements: [default_input_value, default_input_value]
-        };
-        n_hashes
-    ];
+    // let default_input_value = PackedPrimitiveType {
+    //     value: M128 { high: 0, low: 0 },
+    // };
 
     let mut rng = thread_rng();
     let mut testinput = vec![random_packed_primitive(&mut rng); input_items_length];
@@ -100,7 +92,7 @@ fn bench_groestl_long_data(c: &mut Criterion) {
     group.bench_function("Groestl256-nonbitsliced", |bench| {
         bench.iter(|| {
             testinput
-                .chunks_exact(16) // comes out to 16 in this instance, covert to chunks_exact instead of par_chunks_exact for sequential comparison 
+                .chunks_exact(input_items_length / n_hashes) 
                 .enumerate()
                 .map(|(index, chunk)| {
                     let chunk_bytes = packed_to_bytes(chunk);
@@ -127,11 +119,10 @@ fn random_packed_primitive(rng: &mut impl Rng) -> PackedPrimitiveType {
 
 fn bench_groestl_bitsliced(c: &mut Criterion) {
 	let mut group = c.benchmark_group("groestl");
-	let n_hashes = 8192;
-	let input_items_length = 131072;
+	let n_hashes = 64;
+	let input_items_length = 1024;
 	// let size_of_packed_primitive = std::mem::size_of::<PackedPrimitiveType>();
 	let size_of_packed_primitive = 16; //bytes
-	let size_of_each_digest = 32; //bytes
 
     let default_input_value = PackedPrimitiveType {
         value: M128 { high: 0, low: 0 },
