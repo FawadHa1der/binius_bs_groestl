@@ -1,9 +1,13 @@
 This repo is cloned from [binius gitlab repo by Irreducible](https://gitlab.com/IrreducibleOSS/binius) This integrates [bitsliced groestl](https://github.com/FawadHa1der/custom_groestl). Which is added as submodule to the hash crate.
-The [tensor_pcs](https://github.com/FawadHa1der/binius_bs_groestl/blob/main/crates/core/src/poly_commit/tensor_pcs.rs) has been been updated to use the new bitsliced groestl.
-Running the [keccak](https://github.com/FawadHa1der/binius_bs_groestl/blob/main/examples/keccakf.rs) will print/compare the time taken by each variant of the hash(bitsliced 
-vs the original)
 
-Benchmarks WIP. 
+Bitslicing allows constant time implementations(though my implementation does have some ifs, though they can be easily removed) and also is more performant when we multiple hashes/inpts to compute
+
+You can compare bitsliced groestl vs original groestl in the hash crate benchmarks. Currently on my mac M2 for 64 independent hashes it is about 4-5 times faster. 
+
+
+
+
+
 
 
 ![Binius logo](doc/Logo.png "Binius logo")
