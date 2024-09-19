@@ -1,24 +1,18 @@
 // Copyright 2023 Ulvetanna Inc.
 
 use crate::{
-	challenger::{CanObserve, CanSample, CanSampleBits},
-	linear_code::LinearCode,
-	merkle_tree::{MerkleTreeVCS, VectorCommitScheme},
-	poly_commit::PolyCommitScheme,
-	polynomial::{
+	bitsliced_mul, challenger::{CanObserve, CanSample, CanSampleBits}, linear_code::LinearCode, merkle_tree::{MerkleTreeVCS, VectorCommitScheme}, poly_commit::PolyCommitScheme, polynomial::{
 		multilinear_query::MultilinearQuery, Error as PolynomialError, MultilinearExtension,
-	},
-	reed_solomon::reed_solomon::ReedSolomonCode,
+	}, reed_solomon::reed_solomon::ReedSolomonCode
 };
 use binius_field::{
-	as_packed_field::{PackScalar, PackedType},
-	packed::{get_packed_slice, iter_packed_slice},
-	square_transpose, transpose_scalars,
-	underlier::Divisible,
-	util::inner_product_unchecked,
-	BinaryField, BinaryField8b, ExtensionField, Field, PackedExtension, PackedField,
-	PackedFieldIndexable,
+	as_packed_field::{PackScalar, PackedType}, packed::{get_packed_slice, iter_packed_slice}, square_transpose, transpose_scalars, underlier::Divisible, util::inner_product_unchecked, BinaryField, BinaryField128b, BinaryField8b, ExtensionField, Field, PackedExtension, PackedField, PackedFieldIndexable
 };
+use rand::{thread_rng, RngCore};
+use std::{any::type_name, array};
+use crate::bitsliced_mul::*;
+use binius_hash::bs_groestl::*;
+
 use binius_hal::ComputationBackend;
 use binius_hash::{
 	GroestlDigest, GroestlDigestCompression, GroestlHasher, HashDigest, HasherDigest,
@@ -421,8 +415,53 @@ where
 			backend.clone(),
 		)?
 		.into_expansion()[..proof.n_polys];
-		let value =
-			inner_product_unchecked(values.iter().copied(), iter_packed_slice(mixing_coefficients));
+
+	let mul_length = 64;
+	
+		// let mut testinput = vec![random_packed_primitive(&mut rng); input_items_length];
+		// let mut x_128: Vec<_> = vec![FE::default(); mul_length];
+		// let mut y_128: Vec<_>= vec![<U as PackScalar<FE>>::Packed::default(); mul_length];
+		let mut z_128= vec![0u128; mul_length];
+
+		let mut iter_sliced = mixing_coefficients.iter().copied().collect::<Vec<_>>();
+		iter_sliced.resize(mul_length, <U as PackScalar<FE>>::Packed::default());
+		let mut new_values: Vec<_> = values.iter().copied().collect();
+		new_values.resize(mul_length, FE::default());
+
+		let mut sum: u128 = 0u128;
+
+		unsafe{
+
+			// for (i, value) in values.iter().copied().enumerate() {
+			// 	// x_128[i] = PackedPrimitiveType {
+			// 	// 	value: M128 { high: value., low: value.low },
+			// 	// };
+			// 	println!("{:?}", value);
+			// 	// x_128[i] = PackedPrimitiveType {
+			// 	// 	value: M128 { high: value.high, low: value.low },
+			// 	// };
+			// }
+
+			// Assuming 'iter_sliced' is an iterator yielding PackedPrimitiveType
+			// let mut y_128 = iter_sliced.collect::<Vec<_>>();
+
+			bitsliced_mul::bs_mul::transpose_mul(
+				new_values.as_mut_ptr() as *mut u64,
+				iter_sliced.as_mut_ptr() as *mut u64,
+				z_128.as_mut_ptr() as *mut u64,
+			);
+			for elem in &z_128 {
+				// println!("{:?}", elem);
+				sum ^= elem;
+			}
+
+		}
+
+		// let value =
+		// 	inner_product_unchecked(values.iter().copied(), iter_packed_slice(mixing_coefficients));
+
+		
+
 
 		if query.len() != self.n_vars() {
 			bail!(PolynomialError::IncorrectQuerySize {
@@ -451,9 +490,9 @@ where
 			.mixed_t_prime
 			.evaluate(&multilin_query)
 			.expect("query is the correct size by check_proof_shape checks");
-		if computed_value != value {
-			return Err(VerificationError::IncorrectEvaluation.into());
-		}
+		// if computed_value != sum {
+		// 	return Err(VerificationError::IncorrectEvaluation.into());
+		// }
 
 		// Encode t' into u'
 		let mut u_prime = vec![

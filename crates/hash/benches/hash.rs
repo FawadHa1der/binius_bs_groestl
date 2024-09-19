@@ -77,34 +77,37 @@ fn packed_to_bytes(packed: &[PackedPrimitiveType]) -> &[PackedBinaryField32x8b] 
 
 
 fn bench_groestl_long_data(c: &mut Criterion) {
-    let mut group = c.benchmark_group("groestl");
-    let n_hashes = 64;
-    let input_items_length = 1024;
+    // let mut group = c.benchmark_group("groestl");
+    // let n_hashes = 64;
+    // let input_items_length = 1024;
 
-    // let default_input_value = PackedPrimitiveType {
-    //     value: M128 { high: 0, low: 0 },
-    // };
+    // // let default_input_value = PackedPrimitiveType {
+    // //     value: M128 { high: 0, low: 0 },
+    // // };
+    // let mut rng = thread_rng();
+	// let data_aes: [PackedAESBinaryField32x8b; N] =
+	// 	array::from_fn(|_| PackedAESBinaryField32x8b::random(&mut rng));
 
-    let mut rng = thread_rng();
-    let mut testinput = vec![random_packed_primitive(&mut rng); input_items_length];
+    // let mut testinput = vec![random_packed_primitive(&mut rng); input_items_length];
 
-    group.throughput(Throughput::Bytes((input_items_length * std::mem::size_of::<PackedPrimitiveType>()) as u64));
-    group.bench_function("Groestl256-nonbitsliced", |bench| {
-        bench.iter(|| {
-            testinput
-                .chunks_exact(input_items_length / n_hashes) 
-                .enumerate()
-                .map(|(index, chunk)| {
-                    let chunk_bytes = packed_to_bytes(chunk);
-                    // println!("chunk_bytes size: {}", chunk_bytes.len());
-                    //  println!("Chunk index: {}", index);
-                    HasherDigest::<_, Groestl256<_, _>>::hash(chunk_bytes)
-                })
-                .collect::<Vec<_>>(); // Collect the results into a Vec
-        });
-    });
+    // group.throughput(Throughput::Bytes((input_items_length * std::mem::size_of::<PackedPrimitiveType>()) as u64));
+    // group.bench_function("Groestl256-nonbitsliced", |bench| {
+    //     bench.iter(|| {
+    //         testinput
+    //             .chunks_exact(input_items_length / n_hashes) 
+    //             // .enumerate()
+    //             // .map(|(index, chunk)| {
+    //             //     let chunk_bytes = packed_to_bytes(chunk);
+    //             //     // println!("chunk_bytes size: {}", chunk_bytes.len());
+    //             //     //  println!("Chunk index: {}", index);
+    //             //     HasherDigest::<_, Groestl256<_, AESTowerField8b>>::hash(chunk_bytes)
+    //             //     // HasherDigest::<_, Groestl256<_, _>>::hash(chunk_bytes)
+    //             // })
+    //             .collect::<Vec<_>>(); // Collect the results into a Vec
+    //     });
+    // });
 
-    group.finish();
+    // group.finish();
 }
 
 // Function to generate a random PackedPrimitiveType
