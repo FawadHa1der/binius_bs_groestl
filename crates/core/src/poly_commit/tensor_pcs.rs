@@ -444,12 +444,15 @@ where
 
 			// Assuming 'iter_sliced' is an iterator yielding PackedPrimitiveType
 			// let mut y_128 = iter_sliced.collect::<Vec<_>>();
-
+			let start_time = std::time::Instant::now();
+	
 			bitsliced_mul::bs_mul::transpose_mul(
 				new_values.as_mut_ptr() as *mut u64,
 				iter_sliced.as_mut_ptr() as *mut u64,
 				z_128.as_mut_ptr() as *mut u64,
 			);
+			let duration = start_time.elapsed();
+			println!("Time taken for inner_product_unchecked: {:?}", duration);
 			for elem in &z_128 {
 				// println!("{:?}", elem);
 				sum ^= elem;
