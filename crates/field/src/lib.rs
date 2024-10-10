@@ -33,6 +33,8 @@ mod tracing;
 pub mod transpose;
 pub mod underlier;
 pub mod util;
+pub mod bitsliced_mul;
+
 
 pub use aes_field::*;
 pub use binary_field::*;
@@ -45,3 +47,5 @@ pub use packed_binary_field::*;
 pub use packed_extension::*;
 pub use polyval::*;
 pub use transpose::{square_transpose, transpose_scalars, Error as TransposeError};
+pub use bitsliced_mul::bs_mul;
+// pub use bs_mul::bs_mul;

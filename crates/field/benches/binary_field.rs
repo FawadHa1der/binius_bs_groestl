@@ -3,9 +3,7 @@
 use binius_field::{
 	aes_field::{
 		AESTowerField128b, AESTowerField16b, AESTowerField32b, AESTowerField64b, AESTowerField8b,
-	},
-	BinaryField128b, BinaryField128bPolyval, BinaryField16b, BinaryField32b, BinaryField64b,
-	BinaryField8b, Field,
+	}, arithmetic_traits::*, BinaryField128b, BinaryField128bPolyval, BinaryField16b, BinaryField32b, BinaryField64b, BinaryField8b, Field, PackedField
 };
 use criterion::{
 	criterion_group, criterion_main, measurement::Measurement, BenchmarkGroup, Criterion,
@@ -45,19 +43,19 @@ fn bench_all_fields<Op: FieldOperation>(c: &mut Criterion) {
 	let mut group = c.benchmark_group(Op::NAME);
 	group.throughput(criterion::Throughput::Elements(BATCH_SIZE as _));
 
-	run_bench!(group, BinaryField8b, Op);
-	run_bench!(group, BinaryField16b, Op);
-	run_bench!(group, BinaryField32b, Op);
-	run_bench!(group, BinaryField64b, Op);
+	// run_bench!(group, BinaryField8b, Op);
+	// run_bench!(group, BinaryField16b, Op);
+	// run_bench!(group, BinaryField32b, Op);
+	// run_bench!(group, BinaryField64b, Op);
 	run_bench!(group, BinaryField128b, Op);
 
-	run_bench!(group, AESTowerField8b, Op);
-	run_bench!(group, AESTowerField16b, Op);
-	run_bench!(group, AESTowerField32b, Op);
-	run_bench!(group, AESTowerField64b, Op);
-	run_bench!(group, AESTowerField128b, Op);
+	// run_bench!(group, AESTowerField8b, Op);
+	// run_bench!(group, AESTowerField16b, Op);
+	// run_bench!(group, AESTowerField32b, Op);
+	// run_bench!(group, AESTowerField64b, Op);
+	// run_bench!(group, AESTowerField128b, Op);
 
-	run_bench!(group, BinaryField128bPolyval, Op);
+	// run_bench!(group, BinaryField128bPolyval, Op);
 }
 
 struct MultiplyOp;
@@ -67,7 +65,13 @@ impl FieldOperation for MultiplyOp {
 	type Result<F> = F;
 
 	fn call<F: Field>(lhs: F, rhs: F) -> F {
-		lhs * rhs
+		let new_lhs = <F as PackedField>::set_single(lhs);
+		let new_rhs = <F as PackedField>::set_single(rhs);
+		let mut result = new_lhs * new_rhs;
+		for _ in 0..64 {
+			result = result * rhs;
+		}
+		result
 	}
 }
 

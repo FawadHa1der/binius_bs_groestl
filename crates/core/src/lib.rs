@@ -20,7 +20,7 @@ pub mod tensor_algebra;
 pub mod transparent;
 pub mod util;
 pub mod witness;
-pub mod bitsliced_mul;
+//pub mod bitsliced_mul;
 
 pub use core::iter::Step;
 // pub use bs_mul::*;

@@ -2,14 +2,14 @@ use cc;
 fn main() {
     // Specify the C library name and path
     let library_name = "bs_mul_128";
-    let files = ["src/bitsliced_mul/bs_multiply_128.c", "src/bitsliced_mul/bs.c"];
+    let files = ["src/bitsliced_mul/bs_multiply_128.c", "src/bitsliced_mul/bs.c", "src/bitsliced_mul/polynomial_byte_sliced_mul_16.c"];
     let includes = "src/bitsliced_mul";
 
     if cfg!(target_os = "windows") {
         cc::Build::new()
         .files(files) // Include both C files
-        // .flag("/O2")
-        // .flag("/ftree-vectorize")
+        .flag("/O2")
+        .flag("/ftree-vectorize")
         .include(includes) // Include the directory containing the headers
         .compile(library_name); // Compile into a static library
     } else {

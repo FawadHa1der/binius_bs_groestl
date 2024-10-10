@@ -1,7 +1,7 @@
 // Copyright 2023 Ulvetanna Inc.
 
 use crate::{
-	bitsliced_mul, challenger::{CanObserve, CanSample, CanSampleBits}, linear_code::LinearCode, merkle_tree::{MerkleTreeVCS, VectorCommitScheme}, poly_commit::PolyCommitScheme, polynomial::{
+	 challenger::{CanObserve, CanSample, CanSampleBits}, linear_code::LinearCode, merkle_tree::{MerkleTreeVCS, VectorCommitScheme}, poly_commit::PolyCommitScheme, polynomial::{
 		multilinear_query::MultilinearQuery, Error as PolynomialError, MultilinearExtension,
 	}, reed_solomon::reed_solomon::ReedSolomonCode
 };
@@ -10,7 +10,9 @@ use binius_field::{
 };
 use rand::{thread_rng, RngCore};
 use std::{any::type_name, array};
-use crate::bitsliced_mul::*;
+use binius_field::bitsliced_mul::bs_mul;
+use binius_field::bitsliced_mul::bs_mul::transpose_mul;
+use binius_field::bitsliced_mul::*;
 use binius_hash::bs_groestl::*;
 
 use binius_hal::ComputationBackend;
@@ -446,26 +448,49 @@ where
 			// let mut y_128 = iter_sliced.collect::<Vec<_>>();
 			let start_time = std::time::Instant::now();
 	
-			bitsliced_mul::bs_mul::transpose_mul(
-				new_values.as_mut_ptr() as *mut u64,
-				iter_sliced.as_mut_ptr() as *mut u64,
-				z_128.as_mut_ptr() as *mut u64,
+			transpose_mul(
+				new_values.as_mut_ptr() as *mut u128,
+				iter_sliced.as_mut_ptr() as *mut u128,
+				z_128.as_mut_ptr() as *mut u128,
 			);
 			let duration = start_time.elapsed();
-			println!("Time taken for inner_product_unchecked: {:?}", duration);
 			for elem in &z_128 {
 				// println!("{:?}", elem);
 				sum ^= elem;
 			}
+			println!("Time taken for transpose_mul: {:?} product sum {:?}", duration, sum);
 
 		}
+		let start_time = std::time::Instant::now();
 
-		// let value =
-		// 	inner_product_unchecked(values.iter().copied(), iter_packed_slice(mixing_coefficients));
+		let a_itr = values.iter().copied();
+		let b_itr = iter_packed_slice(mixing_coefficients);
+		let mut product_sum =  BinaryField128b::new(0);
+		
+		let test_a = BinaryField128b::new(273837094833434465575073686153488115946);
+		let test_b = BinaryField128b::new(273837094833434465575073686153488115333);
+		let mut mul_result = BinaryField128b::new(273837094833434465575073686153488112221);
+		
+		// for (a, b) in a_itr.zip(b_itr) {
+		for _ in 0..64{	
+			mul_result = mul_result * test_a; 
+			product_sum = product_sum + mul_result;
+		}
+		let duration = start_time.elapsed();
+		println!("Time taken for explicit for loop mul: {:?} product sum {:?}", duration, product_sum);
+		
+		let start_time = std::time::Instant::now();
+		let value = 
+			inner_product_unchecked(values.iter().copied(), iter_packed_slice(mixing_coefficients));
+
+		// for 1 .. 64 {
+		// }		
+
+		let duration = start_time.elapsed();
+		println!("Time taken for inner_product_unchecked: {:?}", duration);
+
 
 		
-
-
 		if query.len() != self.n_vars() {
 			bail!(PolynomialError::IncorrectQuerySize {
 				expected: self.n_vars(),
@@ -493,9 +518,9 @@ where
 			.mixed_t_prime
 			.evaluate(&multilin_query)
 			.expect("query is the correct size by check_proof_shape checks");
-		// if computed_value != sum {
-		// 	return Err(VerificationError::IncorrectEvaluation.into());
-		// }
+		if computed_value != value {
+			return Err(VerificationError::IncorrectEvaluation.into());
+		}
 
 		// Encode t' into u'
 		let mut u_prime = vec![
