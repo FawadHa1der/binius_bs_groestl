@@ -5,13 +5,11 @@ use binius_core::{
 	challenger::{new_hasher_challenger, CanObserve, CanSample, CanSampleBits},
 	oracle::{BatchId, MultilinearOracleSet, OracleId, ShiftVariant},
 	poly_commit::{tensor_pcs, PolyCommitScheme},
-	polynomial::MultilinearExtensionBorrowed,
 	protocols::{
-		abstract_sumcheck::standard_switchover_heuristic,
-		evalcheck::EvalcheckClaim,
 		gkr_gpa::{self, GrandProductBatchProof, GrandProductBatchProveOutput},
 		greedy_evalcheck::{self, GreedyEvalcheckProof},
 		lasso::{self, LassoBatches, LassoClaim, LassoProof, LassoProveOutput, LassoWitness},
+		sumcheck::standard_switchover_heuristic,
 	},
 	witness::MultilinearExtensionIndex,
 };
@@ -22,7 +20,7 @@ use binius_field::{
 	BinaryField, BinaryField128b, BinaryField16b, BinaryField1b, BinaryField32b, BinaryField8b,
 	ExtensionField, Field, PackedBinaryField128x1b, PackedField, PackedFieldIndexable, TowerField,
 };
-use binius_hal::{make_portable_backend, ComputationBackend};
+use binius_hal::{make_portable_backend, ComputationBackend, MultilinearExtensionBorrowed};
 use binius_hash::GroestlHasher;
 use binius_math::{EvaluationDomainFactory, IsomorphicEvaluationDomainFactory};
 use binius_utils::{
@@ -102,8 +100,8 @@ impl TraceOracle {
 	}
 }
 
-struct TraceWitness<U: UnderlierType + PackScalar<FW>, FW: BinaryField> {
-	index: MultilinearExtensionIndex<'static, U, FW>,
+struct TraceWitness<U: UnderlierType + PackScalar<F>, F: BinaryField> {
+	index: MultilinearExtensionIndex<'static, U, F>,
 	u_to_t_mapping: Vec<usize>,
 }
 
@@ -130,12 +128,12 @@ fn make_underliers<U: UnderlierType + PackScalar<FS>, FS: Field>(log_size: usize
 }
 
 #[instrument(skip_all)]
-fn generate_trace<U, FW>(log_size: usize, trace_oracle: &TraceOracle) -> Result<TraceWitness<U, FW>>
+fn generate_trace<U, F>(log_size: usize, trace_oracle: &TraceOracle) -> Result<TraceWitness<U, F>>
 where
-	U: UnderlierType + PackScalar<B1> + PackScalar<B8> + PackScalar<B32> + PackScalar<FW>,
+	U: UnderlierType + PackScalar<B1> + PackScalar<B8> + PackScalar<B32> + PackScalar<F>,
 	PackedType<U, B8>: PackedFieldIndexable,
 	PackedType<U, B32>: PackedFieldIndexable,
-	FW: BinaryField + ExtensionField<B8> + ExtensionField<B32>,
+	F: BinaryField + ExtensionField<B8> + ExtensionField<B32>,
 {
 	let mut a = make_underliers::<_, B32>(log_size);
 	let mut b = make_underliers::<_, B32>(log_size);
@@ -254,15 +252,14 @@ where
 
 // witness column extractor
 
-fn extract_batch_id_polys<'a, U, FW, F, FS>(
+fn extract_batch_id_polys<'a, U, F, FS>(
 	batch_id: BatchId,
-	witness_index: &'a MultilinearExtensionIndex<'a, U, FW>,
+	witness_index: &'a MultilinearExtensionIndex<'a, U, F>,
 	oracles: &MultilinearOracleSet<F>,
 ) -> Result<Vec<MultilinearExtensionBorrowed<'a, PackedType<U, FS>>>>
 where
-	U: UnderlierType + PackScalar<FW> + PackScalar<FS>,
-	F: TowerField,
-	FW: TowerField + ExtensionField<FS>,
+	U: UnderlierType + PackScalar<F> + PackScalar<FS>,
+	F: TowerField + ExtensionField<FS>,
 	FS: TowerField,
 {
 	let trace_commit_polys = oracles
@@ -285,7 +282,7 @@ fn prove<U, PCS1, PCS8, PCS32, CH, Backend>(
 	pcs_final_counts_lasso: &PCS32,
 	mut challenger: CH,
 	domain_factory: impl EvaluationDomainFactory<B128>,
-	backend: Backend,
+	backend: &Backend,
 ) -> Result<Proof<U, PCS1, PCS8, PCS32>>
 where
 	U: UnderlierType + PackScalar<B1> + PackScalar<B8> + PackScalar<B32> + PackScalar<B128>,
@@ -304,24 +301,21 @@ where
 	Backend: ComputationBackend + 'static,
 {
 	// Round 1 - trace commitments & Lasso deterministic reduction
-	let (b8_comm, b8_committed) = pcs8.commit(&extract_batch_id_polys::<_, _, _, B8>(
+	let (b8_comm, b8_committed) = pcs8.commit(&extract_batch_id_polys::<_, _, B8>(
 		trace_oracle.b8_batch,
 		&witness.index,
 		oracles,
 	)?)?;
 
-	let (b1_comm, b1_committed) = pcs1.commit(&extract_batch_id_polys::<_, _, _, B1>(
+	let (b1_comm, b1_committed) = pcs1.commit(&extract_batch_id_polys::<_, _, B1>(
 		trace_oracle.b1_batch,
 		&witness.index,
 		oracles,
 	)?)?;
 
-	let (lookup_t_comm, lookup_t_committed) =
-		pcs32.commit(&extract_batch_id_polys::<_, _, _, B32>(
-			trace_oracle.lookup_t_batch,
-			&witness.index,
-			oracles,
-		)?)?;
+	let (lookup_t_comm, lookup_t_committed) = pcs32.commit(
+		&extract_batch_id_polys::<_, _, B32>(trace_oracle.lookup_t_batch, &witness.index, oracles)?,
+	)?;
 
 	challenger.observe(b8_comm.clone());
 	challenger.observe(b1_comm.clone());
@@ -343,7 +337,7 @@ where
 	let gamma = challenger.sample();
 	let alpha = challenger.sample();
 
-	let lasso_prove_output = lasso::prove::<B32, U, _, _, _, _>(
+	let lasso_prove_output = lasso::prove::<B32, U, _, _>(
 		oracles,
 		witness.index,
 		&lasso_claim,
@@ -351,25 +345,25 @@ where
 		lasso_batch,
 		gamma,
 		alpha,
-		backend.clone(),
 	)?;
 
 	let LassoProveOutput {
 		reduced_gpa_claims,
 		reduced_gpa_witnesses,
+		gpa_metas,
 		lasso_proof,
 		witness_index,
 	} = lasso_prove_output;
 
 	let (lasso_counts_comm, lasso_counts_committed) =
-		pcs_counts_lasso.commit(&extract_batch_id_polys::<_, _, _, B32>(
+		pcs_counts_lasso.commit(&extract_batch_id_polys::<_, _, B32>(
 			trace_oracle.lasso_batch.counts_batch_ids[0],
 			&witness_index,
 			oracles,
 		)?)?;
 
 	let (lasso_final_counts_comm, lasso_final_counts_committed) =
-		pcs_final_counts_lasso.commit(&extract_batch_id_polys::<_, _, _, B32>(
+		pcs_final_counts_lasso.commit(&extract_batch_id_polys::<_, _, B32>(
 			trace_oracle.lasso_batch.final_counts_batch_id,
 			&witness_index,
 			oracles,
@@ -378,41 +372,34 @@ where
 	challenger.observe(lasso_counts_comm.clone());
 	challenger.observe(lasso_final_counts_comm.clone());
 
+	let switchover_fn = standard_switchover_heuristic(-2);
+
 	let GrandProductBatchProveOutput {
-		evalcheck_multilinear_claims,
+		final_layer_claims,
 		proof: gpa_proof,
 	} = gkr_gpa::batch_prove(
 		reduced_gpa_witnesses,
-		reduced_gpa_claims,
+		&reduced_gpa_claims,
 		domain_factory.clone(),
 		&mut challenger,
-		backend.clone(),
+		&backend,
 	)?;
 
-	let switchover_fn = standard_switchover_heuristic(-2);
+	let evalcheck_multilinear_claims =
+		gkr_gpa::make_eval_claims(oracles, gpa_metas, &final_layer_claims)?;
 
 	// Greedy Evalcheck
-	let evalcheck_claims = evalcheck_multilinear_claims
-		.into_iter()
-		.map(|claim| EvalcheckClaim {
-			poly: claim.poly.into_composite(),
-			eval_point: claim.eval_point,
-			eval: claim.eval,
-			is_random_point: claim.is_random_point,
-		});
-
 	let mut witness_index = witness_index;
 
-	let greedy_evalcheck_prove_output =
-		greedy_evalcheck::prove::<_, PackedType<U, B128>, B128, _, _>(
-			oracles,
-			&mut witness_index,
-			evalcheck_claims,
-			switchover_fn,
-			&mut challenger,
-			domain_factory,
-			backend.clone(),
-		)?;
+	let greedy_evalcheck_prove_output = greedy_evalcheck::prove::<U, B128, _, _, _>(
+		oracles,
+		&mut witness_index,
+		evalcheck_multilinear_claims,
+		switchover_fn,
+		&mut challenger,
+		domain_factory,
+		backend,
+	)?;
 
 	// PCS opening proofs
 
@@ -428,53 +415,49 @@ where
 	let lasso_counts_proof = pcs_counts_lasso.prove_evaluation(
 		&mut challenger,
 		&lasso_counts_committed,
-		&extract_batch_id_polys::<_, _, _, B32>(
+		&extract_batch_id_polys::<_, _, B32>(
 			trace_oracle.lasso_batch.counts_batch_ids[0],
 			&witness_index,
 			oracles,
 		)?,
 		batch_id_to_eval_point(trace_oracle.lasso_batch.counts_batch_ids[0]),
-		backend.clone(),
+		&backend,
 	)?;
 
 	let lasso_final_counts_proof = pcs_final_counts_lasso.prove_evaluation(
 		&mut challenger,
 		&lasso_final_counts_committed,
-		&extract_batch_id_polys::<_, _, _, B32>(
+		&extract_batch_id_polys::<_, _, B32>(
 			trace_oracle.lasso_batch.final_counts_batch_id,
 			&witness_index,
 			oracles,
 		)?,
 		batch_id_to_eval_point(trace_oracle.lasso_batch.final_counts_batch_id),
-		backend.clone(),
+		&backend,
 	)?;
 
 	let b8_proof = pcs8.prove_evaluation(
 		&mut challenger,
 		&b8_committed,
-		&extract_batch_id_polys::<_, _, _, B8>(trace_oracle.b8_batch, &witness_index, oracles)?,
+		&extract_batch_id_polys::<_, _, B8>(trace_oracle.b8_batch, &witness_index, oracles)?,
 		batch_id_to_eval_point(trace_oracle.b8_batch),
-		backend.clone(),
+		&backend,
 	)?;
 
 	let b1_proof = pcs1.prove_evaluation(
 		&mut challenger,
 		&b1_committed,
-		&extract_batch_id_polys::<_, _, _, B1>(trace_oracle.b1_batch, &witness_index, oracles)?,
+		&extract_batch_id_polys::<_, _, B1>(trace_oracle.b1_batch, &witness_index, oracles)?,
 		batch_id_to_eval_point(trace_oracle.b1_batch),
-		backend.clone(),
+		&backend,
 	)?;
 
 	let lookup_t_proof = pcs32.prove_evaluation(
 		&mut challenger,
 		&lookup_t_committed,
-		&extract_batch_id_polys::<_, _, _, B32>(
-			trace_oracle.lookup_t_batch,
-			&witness_index,
-			oracles,
-		)?,
+		&extract_batch_id_polys::<_, _, B32>(trace_oracle.lookup_t_batch, &witness_index, oracles)?,
 		batch_id_to_eval_point(trace_oracle.lookup_t_batch),
-		backend.clone(),
+		&backend,
 	)?;
 
 	Ok(Proof {
@@ -507,7 +490,7 @@ fn verify<U, PCS1, PCS8, PCS32, CH, Backend>(
 	pcs_final_counts_lasso: &PCS32,
 	mut challenger: CH,
 	proof: Proof<U, PCS1, PCS8, PCS32>,
-	backend: Backend,
+	backend: &Backend,
 ) -> Result<()>
 where
 	U: UnderlierType + PackScalar<B1> + PackScalar<B8> + PackScalar<B32> + PackScalar<B128>,
@@ -554,35 +537,27 @@ where
 	let gamma = challenger.sample();
 	let alpha = challenger.sample();
 
-	let reduced_gpa_claims = lasso::verify::<B32, _, _>(
+	let (reduced_gpa_claims, gpa_metas) = lasso::verify::<B32, _>(
 		oracles,
 		&lasso_claim,
 		&trace_oracle.lasso_batch,
 		gamma,
 		alpha,
 		lasso_proof,
-		backend.clone(),
 	)?;
 
 	challenger.observe(lasso_counts_comm.clone());
 	challenger.observe(lasso_final_counts_comm.clone());
 
-	let evalcheck_multilinear_claim =
-		gkr_gpa::batch_verify(reduced_gpa_claims, gpa_proof, &mut challenger)?;
+	let final_layer_claims = gkr_gpa::batch_verify(reduced_gpa_claims, gpa_proof, &mut challenger)?;
 
-	let evalcheck_claims = evalcheck_multilinear_claim
-		.into_iter()
-		.map(|claim| EvalcheckClaim {
-			poly: claim.poly.into_composite(),
-			eval_point: claim.eval_point,
-			eval: claim.eval,
-			is_random_point: claim.is_random_point,
-		});
+	let evalcheck_multilinear_claims =
+		gkr_gpa::make_eval_claims(oracles, gpa_metas, &final_layer_claims)?;
 
 	// Greedy evalcheck
 	let same_query_pcs_claims = greedy_evalcheck::verify(
 		oracles,
-		evalcheck_claims,
+		evalcheck_multilinear_claims,
 		greedy_evalcheck_proof,
 		&mut challenger,
 	)?;
@@ -605,7 +580,7 @@ where
 		&lasso_counts_eval_claim.eval_point,
 		lasso_counts_proof,
 		&lasso_counts_eval_claim.evals,
-		backend.clone(),
+		backend,
 	)?;
 
 	let lasso_final_counts_eval_claim =
@@ -617,7 +592,7 @@ where
 		&lasso_final_counts_eval_claim.eval_point,
 		lasso_final_counts_proof,
 		&lasso_final_counts_eval_claim.evals,
-		backend.clone(),
+		&backend,
 	)?;
 
 	let b8_eval_claim = batch_id_to_eval_claim(trace_oracle.b8_batch);
@@ -628,7 +603,7 @@ where
 		&b8_eval_claim.eval_point,
 		b8_proof,
 		&b8_eval_claim.evals,
-		backend.clone(),
+		&backend,
 	)?;
 
 	let b1_eval_claim = batch_id_to_eval_claim(trace_oracle.b1_batch);
@@ -639,7 +614,7 @@ where
 		&b1_eval_claim.eval_point,
 		b1_proof,
 		&b1_eval_claim.evals,
-		backend.clone(),
+		&backend,
 	)?;
 
 	let lookup_t_eval_claim = batch_id_to_eval_claim(trace_oracle.lookup_t_batch);
@@ -650,7 +625,7 @@ where
 		&lookup_t_eval_claim.eval_point,
 		lookup_t_proof,
 		&lookup_t_eval_claim.evals,
-		backend.clone(),
+		&backend,
 	)?;
 
 	Ok(())
@@ -710,7 +685,7 @@ fn main() -> Result<()> {
 		&pcs_final_counts_lasso,
 		challenger.clone(),
 		domain_factory,
-		backend.clone(),
+		&backend,
 	)?;
 
 	verify(
@@ -723,7 +698,7 @@ fn main() -> Result<()> {
 		&pcs_final_counts_lasso,
 		challenger.clone(),
 		proof,
-		backend.clone(),
+		&backend,
 	)?;
 
 	Ok(())

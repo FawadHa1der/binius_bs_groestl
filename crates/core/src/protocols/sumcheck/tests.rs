@@ -1,258 +1,30 @@
 // Copyright 2024 Ulvetanna Inc.
 
+use super::{
+	common::CompositeSumClaim,
+	prove::{batch_prove, RegularSumcheckProver},
+	verify::batch_verify,
+	BatchSumcheckOutput, SumcheckClaim,
+};
 use crate::{
-	challenger::new_hasher_challenger,
-	oracle::{CompositePolyOracle, MultilinearOracleSet},
-	polynomial::{
-		CompositionPoly, Error as PolynomialError, MultilinearComposite, MultilinearExtension,
-		MultilinearExtensionSpecialized, MultilinearQuery,
-	},
-	protocols::{
-		sumcheck::{batch_prove, batch_verify, prove, verify, SumcheckClaim},
-		test_utils::{transform_poly, TestProductComposition},
-	},
-	witness::MultilinearExtensionIndex,
+	challenger::{new_hasher_challenger, CanSample},
+	composition::index_composition,
+	polynomial::{IdentityCompositionPoly, MultilinearComposite},
+	protocols::test_utils::TestProductComposition,
 };
 use binius_field::{
-	underlier::WithUnderlier, BinaryField128b, BinaryField128bPolyval, BinaryField32b,
-	ExtensionField, Field, PackedBinaryField4x128b, PackedField, TowerField,
+	BinaryField128b, BinaryField32b, BinaryField8b, ExtensionField, Field, PackedField,
 };
-use binius_hal::make_portable_backend;
+use binius_hal::{
+	make_portable_backend, MLEEmbeddingAdapter, MultilinearExtension, MultilinearPoly,
+	MultilinearQuery,
+};
 use binius_hash::GroestlHasher;
-use binius_math::IsomorphicEvaluationDomainFactory;
-use binius_utils::checked_arithmetics::checked_int_div;
+use binius_math::{CompositionPoly, IsomorphicEvaluationDomainFactory};
 use p3_util::log2_ceil_usize;
-use rand::{rngs::StdRng, SeedableRng};
-use rayon::current_num_threads;
-use std::iter::repeat_with;
-
-fn generate_poly_and_sum_helper<P, PE>(
-	rng: &mut StdRng,
-	n_vars: usize,
-	n_multilinears: usize,
-) -> (
-	MultilinearComposite<PE, TestProductComposition, MultilinearExtensionSpecialized<P, PE>>,
-	P::Scalar,
-)
-where
-	P: PackedField,
-	PE: PackedField,
-	PE::Scalar: ExtensionField<P::Scalar>,
-{
-	let composition = TestProductComposition::new(n_multilinears);
-	let multilinears = repeat_with(|| {
-		let values = repeat_with(|| PackedField::random(&mut *rng))
-			.take(checked_int_div(1 << n_vars, P::WIDTH))
-			.collect::<Vec<P>>();
-		MultilinearExtension::from_values(values).unwrap()
-	})
-	.take(<_ as CompositionPoly<PE>>::n_vars(&composition))
-	.collect::<Vec<_>>();
-
-	let poly = MultilinearComposite::<PE, _, _>::new(
-		n_vars,
-		composition,
-		multilinears
-			.iter()
-			.map(|multilin| multilin.clone().specialize())
-			.collect(),
-	)
-	.unwrap();
-
-	// Get the sum
-	let sum = (0..1 << n_vars)
-		.map(|i| {
-			let mut prod = P::Scalar::ONE;
-			(0..n_multilinears).for_each(|j| {
-				prod *= multilinears[j].evaluate_on_hypercube(i).unwrap();
-			});
-			prod
-		})
-		.sum();
-
-	(poly, sum)
-}
-
-fn test_prove_verify_interaction_helper(
-	n_vars: usize,
-	n_multilinears: usize,
-	switchover_rd: usize,
-) {
-	type F = BinaryField32b;
-	type FE = BinaryField128b;
-	let mut rng = StdRng::seed_from_u64(0);
-
-	let (poly, sum) = generate_poly_and_sum_helper::<F, FE>(&mut rng, n_vars, n_multilinears);
-	let sumcheck_witness = poly.clone();
-
-	// Setup Claim
-	let mut oracles = MultilinearOracleSet::new();
-	let batch_id = oracles.add_committed_batch(n_vars, F::TOWER_LEVEL);
-	let h = (0..n_multilinears)
-		.map(|_| {
-			let id = oracles.add_committed(batch_id);
-			oracles.oracle(id)
-		})
-		.collect();
-	let composite_poly =
-		CompositePolyOracle::new(n_vars, h, TestProductComposition::new(n_multilinears)).unwrap();
-
-	let sumcheck_claim = SumcheckClaim {
-		sum: sum.into(),
-		poly: composite_poly,
-	};
-
-	// Setup evaluation domain
-	let domain_factory = IsomorphicEvaluationDomainFactory::<F>::default();
-	let challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
-	let backend = make_portable_backend();
-
-	let final_prove_output = prove::<_, _, BinaryField32b, _, _>(
-		&sumcheck_claim,
-		sumcheck_witness,
-		domain_factory,
-		move |_| switchover_rd,
-		challenger.clone(),
-		backend.clone(),
-	)
-	.expect("failed to prove sumcheck");
-
-	let final_verify_output =
-		verify(&sumcheck_claim, final_prove_output.sumcheck_proof, challenger.clone())
-			.expect("failed to verify sumcheck proof");
-
-	assert_eq!(final_prove_output.evalcheck_claim.eval, final_verify_output.eval);
-	assert_eq!(final_prove_output.evalcheck_claim.eval_point, final_verify_output.eval_point);
-	assert_eq!(final_prove_output.evalcheck_claim.poly.n_vars(), n_vars);
-	assert!(final_prove_output.evalcheck_claim.is_random_point);
-	assert_eq!(final_verify_output.poly.n_vars(), n_vars);
-
-	// Verify that the evalcheck claim is correct
-	let eval_point = &final_verify_output.eval_point;
-	let multilin_query = MultilinearQuery::with_full_query(eval_point, backend.clone()).unwrap();
-	let actual = poly.evaluate(&multilin_query).unwrap();
-	assert_eq!(actual, final_verify_output.eval);
-}
-
-fn test_prove_verify_interaction_with_monomial_basis_conversion_helper(
-	n_vars: usize,
-	n_multilinears: usize,
-) {
-	type F = BinaryField128b;
-	type OF = BinaryField128bPolyval;
-	let mut rng = StdRng::seed_from_u64(0);
-
-	let (poly, sum) = generate_poly_and_sum_helper::<F, F>(&mut rng, n_vars, n_multilinears);
-
-	let prover_poly = MultilinearComposite::new(
-		n_vars,
-		poly.composition.clone(),
-		poly.multilinears
-			.iter()
-			.map(|multilin| {
-				transform_poly::<_, OF, _>(multilin.as_ref().to_ref())
-					.unwrap()
-					.specialize::<OF>()
-			})
-			.collect(),
-	)
-	.unwrap();
-
-	let operating_witness = prover_poly;
-
-	// CLAIM
-	let mut oracles = MultilinearOracleSet::new();
-	let batch_id = oracles.add_committed_batch(n_vars, F::TOWER_LEVEL);
-	let h = (0..n_multilinears)
-		.map(|_| {
-			let id = oracles.add_committed(batch_id);
-			oracles.oracle(id)
-		})
-		.collect();
-	let composite_poly =
-		CompositePolyOracle::new(n_vars, h, TestProductComposition::new(n_multilinears)).unwrap();
-	let poly_oracle = composite_poly;
-
-	let sumcheck_claim = SumcheckClaim {
-		sum,
-		poly: poly_oracle,
-	};
-
-	// Setup evaluation domain
-	let domain_factory = IsomorphicEvaluationDomainFactory::<F>::default();
-	let backend = make_portable_backend();
-
-	let challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
-	let switchover_fn = |_| 3;
-	let final_prove_output = prove::<_, OF, OF, _, _>(
-		&sumcheck_claim,
-		operating_witness,
-		domain_factory,
-		switchover_fn,
-		challenger.clone(),
-		backend.clone(),
-	)
-	.expect("failed to prove sumcheck");
-
-	let final_verify_output =
-		verify(&sumcheck_claim, final_prove_output.sumcheck_proof, challenger.clone())
-			.expect("failed to verify sumcheck proof");
-
-	assert_eq!(final_prove_output.evalcheck_claim.eval, final_verify_output.eval);
-	assert_eq!(final_prove_output.evalcheck_claim.eval_point, final_verify_output.eval_point);
-	assert_eq!(final_prove_output.evalcheck_claim.poly.n_vars(), n_vars);
-	assert!(final_prove_output.evalcheck_claim.is_random_point);
-	assert_eq!(final_verify_output.poly.n_vars(), n_vars);
-
-	// Verify that the evalcheck claim is correct
-	let eval_point = &final_verify_output.eval_point;
-	let multilin_query = MultilinearQuery::with_full_query(eval_point, backend).unwrap();
-	let actual = poly.evaluate(&multilin_query).unwrap();
-	assert_eq!(actual, final_verify_output.eval);
-}
-
-#[test]
-fn test_sumcheck_prove_verify_interaction_basic() {
-	for n_vars in 2..8 {
-		for n_multilinears in 1..4 {
-			for switchover_rd in 1..=n_vars / 2 {
-				test_prove_verify_interaction_helper(n_vars, n_multilinears, switchover_rd);
-			}
-		}
-	}
-}
-
-#[test]
-fn test_prove_verify_interaction_pigeonhole_cores() {
-	let n_threads = current_num_threads();
-	let n_vars = log2_ceil_usize(n_threads) + 1;
-	for n_multilinears in 1..4 {
-		for switchover_rd in 1..=n_vars / 2 {
-			test_prove_verify_interaction_helper(n_vars, n_multilinears, switchover_rd);
-		}
-	}
-}
-
-#[test]
-fn test_prove_verify_interaction_with_monomial_basis_conversion_basic() {
-	for n_vars in 2..8 {
-		for n_multilinears in 1..4 {
-			test_prove_verify_interaction_with_monomial_basis_conversion_helper(
-				n_vars,
-				n_multilinears,
-			);
-		}
-	}
-}
-
-#[test]
-fn test_prove_verify_interaction_with_monomial_basis_conversion_pigeonhole_cores() {
-	let n_threads = current_num_threads();
-	let n_vars = log2_ceil_usize(n_threads) + 1;
-	for n_multilinears in 1..6 {
-		test_prove_verify_interaction_with_monomial_basis_conversion_helper(n_vars, n_multilinears);
-	}
-}
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use rayon::{current_num_threads, prelude::*};
+use std::{iter, iter::repeat_with, sync::Arc};
 
 #[derive(Debug, Clone)]
 struct SquareComposition;
@@ -266,7 +38,7 @@ impl<P: PackedField> CompositionPoly<P> for SquareComposition {
 		2
 	}
 
-	fn evaluate(&self, query: &[P]) -> Result<P, PolynomialError> {
+	fn evaluate(&self, query: &[P]) -> Result<P, binius_math::Error> {
 		// Square each scalar value in the given packed value.
 		Ok(query[0].square())
 	}
@@ -276,204 +48,229 @@ impl<P: PackedField> CompositionPoly<P> for SquareComposition {
 	}
 }
 
-#[test]
-fn test_prove_verify_batch() {
-	type F = BinaryField32b;
-	type FE = BinaryField128b;
-	type U = <FE as WithUnderlier>::Underlier;
+fn generate_random_multilinears<P, PE>(
+	mut rng: impl Rng,
+	n_vars: usize,
+	n_multilinears: usize,
+) -> Vec<MLEEmbeddingAdapter<P, PE>>
+where
+	P: PackedField,
+	PE: PackedField,
+	PE::Scalar: ExtensionField<P::Scalar>,
+{
+	repeat_with(|| {
+		let values = repeat_with(|| P::random(&mut rng))
+			.take(1 << (n_vars - P::LOG_WIDTH))
+			.collect::<Vec<_>>();
+		MultilinearExtension::from_values(values)
+			.unwrap()
+			.specialize()
+	})
+	.take(n_multilinears)
+	.collect()
+}
 
+fn compute_composite_sum<F, P, M, Composition>(multilinears: &[M], composition: Composition) -> F
+where
+	F: Field,
+	P: PackedField<Scalar = F>,
+	M: MultilinearPoly<P> + Send + Sync,
+	Composition: CompositionPoly<P>,
+{
+	let n_vars = multilinears
+		.first()
+		.map(|multilinear| multilinear.n_vars())
+		.unwrap_or_default();
+	for multilinear in multilinears.iter() {
+		assert_eq!(multilinear.n_vars(), n_vars);
+	}
+
+	let multilinears = multilinears.iter().collect::<Vec<_>>();
+	let witness = MultilinearComposite::new(n_vars, composition, multilinears.clone()).unwrap();
+	(0..(1 << n_vars))
+		.into_par_iter()
+		.map(|j| witness.evaluate_on_hypercube(j).unwrap())
+		.sum()
+}
+
+fn test_prove_verify_product_helper(n_vars: usize, n_multilinears: usize, switchover_rd: usize) {
+	type F = BinaryField32b;
+	type FDomain = BinaryField8b;
+	type FE = BinaryField128b;
 	let mut rng = StdRng::seed_from_u64(0);
 
-	let mut oracles = MultilinearOracleSet::<FE>::new();
-	let mut witness_index = MultilinearExtensionIndex::<U, FE>::new();
+	let multilins = generate_random_multilinears::<F, FE>(&mut rng, n_vars, n_multilinears);
+	let composition = TestProductComposition::new(n_multilinears);
+	let sum = compute_composite_sum(&multilins, &composition);
 
-	let multilin_oracles = [4, 6, 8].map(|n_vars| {
-		let batch_id = oracles.add_committed_batch(n_vars, F::TOWER_LEVEL);
-		let id = oracles.add_committed(batch_id);
-		oracles.oracle(id)
-	});
-
-	let composites = multilin_oracles.clone().map(|poly| {
-		CompositePolyOracle::new(poly.n_vars(), vec![poly], SquareComposition).unwrap()
-	});
-
-	let poly0 = MultilinearExtension::from_values(
-		repeat_with(|| <F as Field>::random(&mut rng))
-			.take(1 << 4)
-			.collect(),
-	)
-	.unwrap();
-	let poly1 = MultilinearExtension::from_values(
-		repeat_with(|| <F as Field>::random(&mut rng))
-			.take(1 << 6)
-			.collect(),
-	)
-	.unwrap();
-	let poly2 = MultilinearExtension::from_values(
-		repeat_with(|| <F as Field>::random(&mut rng))
-			.take(1 << 8)
-			.collect(),
+	let claim = SumcheckClaim::new(
+		n_vars,
+		n_multilinears,
+		vec![CompositeSumClaim {
+			composition: &composition,
+			sum,
+		}],
 	)
 	.unwrap();
 
-	witness_index
-		.update_multilin_poly(vec![
-			(multilin_oracles[0].id(), poly0.specialize_arc_dyn()),
-			(multilin_oracles[1].id(), poly1.specialize_arc_dyn()),
-			(multilin_oracles[2].id(), poly2.specialize_arc_dyn()),
-		])
-		.unwrap();
-
-	let witnesses = composites.clone().map(|oracle| {
-		MultilinearComposite::new(
-			oracle.n_vars(),
-			SquareComposition,
-			oracle
-				.inner_polys()
-				.into_iter()
-				.map(|multilin_oracle| {
-					witness_index
-						.get_multilin_poly(multilin_oracle.id())
-						.unwrap()
-				})
-				.collect(),
-		)
-		.unwrap()
-	});
-
-	let composite_sums = witnesses
-		.iter()
-		.map(|composite_witness| {
-			(0..1 << composite_witness.n_vars())
-				.map(|i| composite_witness.evaluate_on_hypercube(i).unwrap())
-				.sum()
-		})
-		.collect::<Vec<_>>();
-
-	let sumcheck_claims = composites
-		.into_iter()
-		.zip(composite_sums)
-		.map(|(poly, sum)| SumcheckClaim { poly, sum })
-		.collect::<Vec<_>>();
-
-	let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField32b>::default();
-
-	// Setup evaluation domain
-	let challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 	let backend = make_portable_backend();
-
-	let prove_output = batch_prove::<_, _, BinaryField32b, _, _>(
-		sumcheck_claims.clone().into_iter().zip(witnesses),
+	let domain_factory = IsomorphicEvaluationDomainFactory::<FDomain>::default();
+	let prover = RegularSumcheckProver::<FDomain, _, _, _, _>::new(
+		multilins.iter().collect(),
+		[CompositeSumClaim {
+			composition: &composition,
+			sum,
+		}],
 		domain_factory,
-		|_| 5,
-		challenger.clone(),
-		backend,
+		move |_| switchover_rd,
+		&backend,
 	)
 	.unwrap();
-	let proof = prove_output.proof;
-	assert_eq!(proof.rounds.len(), 8);
 
-	let _evalcheck_claims =
-		batch_verify(sumcheck_claims.iter().cloned(), proof, challenger.clone()).unwrap();
+	let challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
+
+	let mut prover_challenger = challenger.clone();
+	let (prover_reduced_claims, proof) =
+		batch_prove(vec![prover], &mut prover_challenger).expect("failed to prove sumcheck");
+
+	let mut verifier_challenger = challenger.clone();
+	let verifier_reduced_claims = batch_verify(&[claim], proof, &mut verifier_challenger).unwrap();
+
+	// Check that challengers are in the same state
+	assert_eq!(
+		CanSample::<FE>::sample(&mut prover_challenger),
+		CanSample::<FE>::sample(&mut verifier_challenger)
+	);
+
+	assert_eq!(verifier_reduced_claims, prover_reduced_claims);
+
+	// Verify that the evaluation claims are correct
+	let BatchSumcheckOutput {
+		challenges,
+		multilinear_evals,
+	} = verifier_reduced_claims;
+
+	let eval_point = &challenges;
+	assert_eq!(multilinear_evals.len(), 1);
+	assert_eq!(multilinear_evals[0].len(), n_multilinears);
+
+	// Verify the reduced multilinear evaluations are correct
+	let multilin_query = MultilinearQuery::with_full_query(eval_point, &backend).unwrap();
+	for (multilinear, &expected) in iter::zip(multilins, multilinear_evals[0].iter()) {
+		assert_eq!(multilinear.evaluate(multilin_query.to_ref()).unwrap(), expected);
+	}
 }
 
 #[test]
-fn test_packed_sumcheck() {
+fn test_sumcheck_prove_verify_interaction_basic() {
+	for n_vars in 2..8 {
+		for n_multilinears in 1..4 {
+			for switchover_rd in 0..=n_vars / 2 {
+				test_prove_verify_product_helper(n_vars, n_multilinears, switchover_rd);
+			}
+		}
+	}
+}
+
+/// For small numbers of variables, the [`test_prove_verify_interaction_basic'] test may have so
+/// few vertices to process that each vertex is processed on a separate thread. This ensures that
+/// each Rayon task processes more than one vertex and that accumulation is handled correctly in
+/// that case.
+#[test]
+fn test_prove_verify_interaction_pigeonhole_cores() {
+	let n_threads = current_num_threads();
+	let n_vars = log2_ceil_usize(n_threads) + 1;
+	for n_multilinears in 1..4 {
+		for switchover_rd in 0..=n_vars / 2 {
+			test_prove_verify_product_helper(n_vars, n_multilinears, switchover_rd);
+		}
+	}
+}
+
+fn prove_verify_batch(n_vars: &[usize]) {
 	type F = BinaryField32b;
+	type FDomain = BinaryField8b;
 	type FE = BinaryField128b;
-	type PE = PackedBinaryField4x128b;
-	type U = <PE as WithUnderlier>::Underlier;
+
 	let mut rng = StdRng::seed_from_u64(0);
 
-	let mut oracles = MultilinearOracleSet::<FE>::new();
-	let mut witness_index = MultilinearExtensionIndex::<U, FE>::new();
-
-	let multilin_oracles = [4, 6, 8].map(|n_vars| {
-		let batch_id = oracles.add_committed_batch(n_vars, F::TOWER_LEVEL);
-		let id = oracles.add_committed(batch_id);
-		oracles.oracle(id)
-	});
-
-	let composites = multilin_oracles.clone().map(|poly| {
-		CompositePolyOracle::new(poly.n_vars(), vec![poly], SquareComposition).unwrap()
-	});
-
-	let poly0 = MultilinearExtension::from_values(
-		repeat_with(|| <F as Field>::random(&mut rng))
-			.take(1 << 4)
-			.collect(),
-	)
-	.unwrap();
-	let poly1 = MultilinearExtension::from_values(
-		repeat_with(|| <F as Field>::random(&mut rng))
-			.take(1 << 6)
-			.collect(),
-	)
-	.unwrap();
-	let poly2 = MultilinearExtension::from_values(
-		repeat_with(|| <F as Field>::random(&mut rng))
-			.take(1 << 8)
-			.collect(),
-	)
-	.unwrap();
-
-	witness_index
-		.update_multilin_poly(vec![
-			(multilin_oracles[0].id(), poly0.specialize_arc_dyn()),
-			(multilin_oracles[1].id(), poly1.specialize_arc_dyn()),
-			(multilin_oracles[2].id(), poly2.specialize_arc_dyn()),
-		])
-		.unwrap();
-
-	let witnesses = composites.clone().map(|oracle| {
-		MultilinearComposite::new(
-			oracle.n_vars(),
-			SquareComposition,
-			oracle
-				.inner_polys()
-				.into_iter()
-				.map(|multilin_oracle| {
-					witness_index
-						.get_multilin_poly(multilin_oracle.id())
-						.unwrap()
-				})
-				.collect(),
-		)
-		.unwrap()
-	});
-
-	let composite_sums = witnesses
+	let backend = make_portable_backend();
+	let domain_factory = IsomorphicEvaluationDomainFactory::<FDomain>::default();
+	let (claims, provers) = n_vars
 		.iter()
-		.map(|composite_witness| {
-			(0..1 << composite_witness.n_vars())
-				.map(|i| composite_witness.evaluate_on_hypercube(i).unwrap())
-				.sum()
+		.map(|n_vars| {
+			let multilins = generate_random_multilinears::<F, FE>(&mut rng, *n_vars, 3);
+			let identity_composition =
+				Arc::new(index_composition(&[0, 1, 2], [0], IdentityCompositionPoly).unwrap())
+					as Arc<dyn CompositionPoly<FE>>;
+
+			let square_composition =
+				Arc::new(index_composition(&[0, 1, 2], [1], SquareComposition).unwrap())
+					as Arc<dyn CompositionPoly<FE>>;
+
+			let product_composition = Arc::new(TestProductComposition::new(3));
+
+			let identity_sum = compute_composite_sum(&multilins, &identity_composition);
+			let square_sum = compute_composite_sum(&multilins, &square_composition);
+			let product_sum = compute_composite_sum(&multilins, &product_composition);
+
+			let claim = SumcheckClaim::new(
+				*n_vars,
+				3,
+				vec![
+					CompositeSumClaim {
+						composition: identity_composition,
+						sum: identity_sum,
+					},
+					CompositeSumClaim {
+						composition: square_composition,
+						sum: square_sum,
+					},
+					CompositeSumClaim {
+						composition: product_composition,
+						sum: product_sum,
+					},
+				],
+			)
+			.unwrap();
+
+			let prover = RegularSumcheckProver::<FDomain, _, _, _, _>::new(
+				multilins,
+				claim.composite_sums().iter().cloned(),
+				domain_factory.clone(),
+				|_| (n_vars / 2).max(1),
+				&backend,
+			)
+			.unwrap();
+
+			(claim, prover)
 		})
-		.collect::<Vec<_>>();
+		.unzip::<_, _, Vec<_>, Vec<_>>();
 
-	let sumcheck_claims = composites
-		.into_iter()
-		.zip(composite_sums)
-		.map(|(poly, sum)| SumcheckClaim { poly, sum })
-		.collect::<Vec<_>>();
-
-	let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField32b>::default();
-
-	// Setup evaluation domain
 	let challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 
-	let backend = make_portable_backend();
-	let prove_output = batch_prove::<_, PE, BinaryField32b, _, _>(
-		sumcheck_claims.clone().into_iter().zip(witnesses),
-		domain_factory,
-		|_| 5,
-		challenger.clone(),
-		backend,
-	)
-	.unwrap();
-	let proof = prove_output.proof;
-	assert_eq!(proof.rounds.len(), 8);
+	let mut prover_challenger = challenger.clone();
+	let (prover_output, proof) =
+		batch_prove(provers, &mut prover_challenger).expect("failed to prove sumcheck");
 
-	let _evalcheck_claims =
-		batch_verify(sumcheck_claims.iter().cloned(), proof, challenger.clone()).unwrap();
+	let mut verifier_challenger = challenger.clone();
+	let verifier_output = batch_verify(&claims, proof, &mut verifier_challenger).unwrap();
+
+	assert_eq!(prover_output, verifier_output);
+
+	// Check that challengers are in the same state
+	assert_eq!(
+		CanSample::<FE>::sample(&mut prover_challenger),
+		CanSample::<FE>::sample(&mut verifier_challenger)
+	);
+}
+
+#[test]
+fn test_prove_verify_batch() {
+	prove_verify_batch(&[8, 6, 2])
+}
+
+#[test]
+fn test_prove_verify_batch_constant_polys() {
+	prove_verify_batch(&[2, 0])
 }

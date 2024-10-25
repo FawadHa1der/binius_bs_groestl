@@ -34,6 +34,7 @@ log.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+binius_macros = { path = "../macros" }
 criterion.workspace = true
 proptest.workspace = true
 tiny-keccak.workspace = true
@@ -48,15 +49,11 @@ cc = "1.0"
 bench = false
 
 [[bench]]
-name = "sumcheck"
+name = "composition_poly"
 harness = false
 
 [[bench]]
 name = "multilinear_query"
-harness = false
-
-[[bench]]
-name = "zerocheck"
 harness = false
 
 [[bench]]

@@ -23,14 +23,13 @@ use bytemuck::{Pod, TransparentWrapper, Zeroable};
 use rand::{Rng, RngCore};
 use std::{
 	array,
-	fmt::{self, Display, Formatter},
+	fmt::{self, Debug, Display, Formatter},
 	iter::{Product, Sum},
 	ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
 };
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
 #[derive(
-	Debug,
 	Default,
 	Clone,
 	Copy,
@@ -290,6 +289,12 @@ impl Display for BinaryField128bPolyval {
 	}
 }
 
+impl Debug for BinaryField128bPolyval {
+	fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+		write!(f, "BinaryField128bPolyval({})", self)
+	}
+}
+
 impl BinaryField128bPolyval {
 	#[inline]
 	pub(super) fn to_montgomery(self) -> Self {
@@ -406,7 +411,7 @@ impl Mul<BinaryField128bPolyval> for BinaryField1b {
 
 impl ExtensionField<BinaryField1b> for BinaryField128bPolyval {
 	type Iterator = <[BinaryField1b; 128] as IntoIterator>::IntoIter;
-	const DEGREE: usize = 128;
+	const LOG_DEGREE: usize = 7;
 
 	#[inline]
 	fn basis(i: usize) -> Result<Self, Error> {
@@ -417,10 +422,11 @@ impl ExtensionField<BinaryField1b> for BinaryField128bPolyval {
 	}
 
 	#[inline]
-	fn from_bases(base_elems: &[BinaryField1b]) -> Result<Self, Error> {
-		if base_elems.len() > 128 {
+	fn from_bases_sparse(base_elems: &[BinaryField1b], log_stride: usize) -> Result<Self, Error> {
+		if base_elems.len() > 128 || log_stride != 7 {
 			return Err(Error::ExtensionDegreeMismatch);
 		}
+		// REVIEW: is this actually correct for a monomial field?
 		let value = base_elems
 			.iter()
 			.rev()
@@ -441,6 +447,8 @@ impl BinaryField for BinaryField128bPolyval {
 }
 
 impl TowerField for BinaryField128bPolyval {
+	type Canonical = BinaryField128b;
+
 	fn mul_primitive(self, _iota: usize) -> Result<Self, Error> {
 		// This method could be implemented by multiplying by isomorphic alpha value
 		// But it's not being used as for now
@@ -733,10 +741,14 @@ mod tests {
 			packed_polyval_512::PackedBinaryPolyval4x128b,
 		},
 		binary_field::tests::is_binary_field_valid_generator,
+		deserialize_canonical,
 		linear_transformation::PackedTransformationFactory,
-		PackedBinaryField1x128b, PackedBinaryField2x128b, PackedBinaryField4x128b, PackedField,
+		serialize_canonical, PackedBinaryField1x128b, PackedBinaryField2x128b,
+		PackedBinaryField4x128b, PackedField,
 	};
+	use bytes::BytesMut;
 	use proptest::prelude::*;
+	use rand::thread_rng;
 
 	#[test]
 	fn test_display() {
@@ -860,6 +872,31 @@ mod tests {
 		assert_eq!(
 			BinaryField128bPolyval::from(BinaryField1b::from(1)),
 			BinaryField128bPolyval::ONE
+		);
+	}
+
+	#[test]
+	fn test_canonical_serialization() {
+		let mut buffer = BytesMut::new();
+		let mut rng = thread_rng();
+
+		let b128_poly1 = <BinaryField128bPolyval as Field>::random(&mut rng);
+		let b128_poly2 = <BinaryField128bPolyval as Field>::random(&mut rng);
+
+		serialize_canonical(b128_poly1, &mut buffer).unwrap();
+		serialize_canonical(b128_poly2, &mut buffer).unwrap();
+
+		let mut read_buffer = buffer.freeze();
+
+		assert_eq!(
+			deserialize_canonical::<BinaryField128bPolyval, _>(&mut read_buffer).unwrap(),
+			b128_poly1
+		);
+		assert_eq!(
+			BinaryField128bPolyval::from(
+				deserialize_canonical::<BinaryField128b, _>(&mut read_buffer).unwrap()
+			),
+			b128_poly2
 		);
 	}
 }

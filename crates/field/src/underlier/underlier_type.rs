@@ -15,6 +15,8 @@ pub trait UnderlierType:
 	+ Default
 	+ PartialEq
 	+ Eq
+	+ PartialOrd
+	+ Ord
 	+ ConstantTimeEq
 	+ Copy
 	+ Random
@@ -32,6 +34,8 @@ pub trait UnderlierType:
 	const BITS: usize = 1 << Self::LOG_BITS;
 }
 
+/// A type that is transparently backed by an underlier.
+///
 /// This trait is needed to make it possible getting the underlier type from already defined type.
 /// Bidirectional `From` trait implementations are not enough, because they do not allow getting underlier type
 /// in a generic code.

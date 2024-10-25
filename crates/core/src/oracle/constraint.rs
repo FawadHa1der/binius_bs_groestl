@@ -1,8 +1,11 @@
 // Copyright 2024 Ulvetanna Inc.
 
-use super::OracleId;
-use crate::{composition::index_composition, polynomial::CompositionPoly};
-use binius_field::{Field, PackedField};
+use super::{Error, MultilinearOracleSet, OracleId};
+use crate::composition::index_composition;
+use binius_field::{Field, PackedField, TowerField};
+use binius_math::CompositionPoly;
+use binius_utils::bail;
+use itertools::Itertools;
 use std::sync::Arc;
 
 /// Composition trait object that can be used to create lists of compositions of differing
@@ -37,6 +40,7 @@ impl<F: Field> ConstraintPredicate<F> {
 /// Constraint set is a group of constraints that operate over the same set of oracle-identified multilinears
 #[derive(Clone)]
 pub struct ConstraintSet<P: PackedField> {
+	pub n_vars: usize,
 	pub oracle_ids: Vec<OracleId>,
 	pub constraints: Vec<Constraint<P>>,
 }
@@ -44,22 +48,21 @@ pub struct ConstraintSet<P: PackedField> {
 // A deferred constraint constructor that instantiates index composition after the superset of oracles is known
 #[allow(clippy::type_complexity)]
 struct ConstraintThunk<P: PackedField> {
+	oracle_ids: Vec<OracleId>,
 	composition_thunk: Box<dyn FnOnce(&[OracleId]) -> TypeErasedComposition<P>>,
 	predicate: ConstraintPredicate<P::Scalar>,
 }
 
 /// A builder struct that turns individual compositions over oraclized multilinears into a set of
 /// type erased `IndexComposition` instances operating over a superset of oracles of all constraints.
+#[derive(Default)]
 pub struct ConstraintSetBuilder<P: PackedField> {
-	oracle_ids: Vec<OracleId>,
 	constraint_thunks: Vec<ConstraintThunk<P>>,
 }
 
 impl<P: PackedField> ConstraintSetBuilder<P> {
-	#[allow(clippy::new_without_default)]
 	pub fn new() -> Self {
 		Self {
-			oracle_ids: Vec::new(),
 			constraint_thunks: Vec::new(),
 		}
 	}
@@ -72,8 +75,8 @@ impl<P: PackedField> ConstraintSetBuilder<P> {
 	) where
 		Composition: CompositionPoly<P> + 'static,
 	{
-		self.oracle_ids.extend(&oracle_ids);
 		self.constraint_thunks.push(ConstraintThunk {
+			oracle_ids: oracle_ids.into(),
 			composition_thunk: thunk(oracle_ids, composition),
 			predicate: ConstraintPredicate::Sum(sum),
 		});
@@ -86,18 +89,47 @@ impl<P: PackedField> ConstraintSetBuilder<P> {
 	) where
 		Composition: CompositionPoly<P> + 'static,
 	{
-		self.oracle_ids.extend(&oracle_ids);
 		self.constraint_thunks.push(ConstraintThunk {
+			oracle_ids: oracle_ids.into(),
 			composition_thunk: thunk(oracle_ids, composition),
 			predicate: ConstraintPredicate::Zero,
 		});
 	}
 
-	pub fn build(self) -> ConstraintSet<P> {
-		let mut oracle_ids = self.oracle_ids;
-
+	/// Build a single constraint set, requiring that all included oracle n_vars are the same
+	pub fn build_one(
+		self,
+		oracles: &MultilinearOracleSet<impl TowerField>,
+	) -> Result<ConstraintSet<P>, Error> {
+		let mut oracle_ids = self
+			.constraint_thunks
+			.iter()
+			.flat_map(|thunk| thunk.oracle_ids.clone())
+			.collect::<Vec<_>>();
+		if oracle_ids.is_empty() {
+			bail!(Error::EmptyConstraintSet);
+		}
+		for id in oracle_ids.iter() {
+			if !oracles.is_valid_oracle_id(*id) {
+				bail!(Error::InvalidOracleId(*id));
+			}
+		}
 		oracle_ids.sort();
 		oracle_ids.dedup();
+
+		let n_vars = oracle_ids
+			.first()
+			.map(|id| oracles.n_vars(*id))
+			.unwrap_or_default();
+
+		for id in oracle_ids.iter() {
+			if oracles.n_vars(*id) != n_vars {
+				bail!(Error::ConstraintSetNvarsMismatch {
+					expected: n_vars,
+					got: oracles.n_vars(*id)
+				});
+			}
+		}
 
 		// at this point the superset of oracles is known and index compositions
 		// may be finally instantiated
@@ -113,10 +145,81 @@ impl<P: PackedField> ConstraintSetBuilder<P> {
 			})
 			.collect();
 
-		ConstraintSet {
+		Ok(ConstraintSet {
+			n_vars,
 			oracle_ids,
 			constraints,
-		}
+		})
+	}
+
+	/// Create one ConstraintSet for every unique n_vars used.
+	///
+	/// Note that you can't mix oracles with different n_vars in a single constraint.
+	pub fn build(
+		self,
+		oracles: &MultilinearOracleSet<impl TowerField>,
+	) -> Result<Vec<ConstraintSet<P>>, Error> {
+		let n_vars_and_constraints = self
+			.constraint_thunks
+			.into_iter()
+			.map(|thunk| {
+				if thunk.oracle_ids.is_empty() {
+					bail!(Error::EmptyConstraintSet);
+				}
+				for id in thunk.oracle_ids.iter() {
+					if !oracles.is_valid_oracle_id(*id) {
+						bail!(Error::InvalidOracleId(*id));
+					}
+				}
+				let n_vars = thunk
+					.oracle_ids
+					.first()
+					.map(|id| oracles.n_vars(*id))
+					.unwrap();
+				for id in thunk.oracle_ids.iter() {
+					if oracles.n_vars(*id) != n_vars {
+						bail!(Error::ConstraintSetNvarsMismatch {
+							expected: n_vars,
+							got: oracles.n_vars(*id)
+						});
+					}
+				}
+				Ok::<_, Error>((n_vars, thunk))
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+
+		let constraints_grouped_by_nvars = n_vars_and_constraints
+			.into_iter()
+			.sorted_by_key(|(n_vars, _)| *n_vars)
+			.chunk_by(|(n_vars, _)| *n_vars);
+
+		let constraint_sets = constraints_grouped_by_nvars
+			.into_iter()
+			.map(|(n_vars, grouped_thunks)| {
+				let mut thunks = vec![];
+				let mut oracle_ids = vec![];
+				for (_, thunk) in grouped_thunks {
+					oracle_ids.extend(&thunk.oracle_ids);
+					thunks.push(thunk);
+				}
+				oracle_ids.sort();
+				oracle_ids.dedup();
+				let constraints = thunks
+					.into_iter()
+					.map(|thunk| Constraint {
+						composition: (thunk.composition_thunk)(&oracle_ids),
+						predicate: thunk.predicate,
+					})
+					.collect();
+				ConstraintSet {
+					constraints,
+					oracle_ids,
+					n_vars,
+				}
+			})
+			.collect();
+
+		Ok(constraint_sets)
 	}
 }
 

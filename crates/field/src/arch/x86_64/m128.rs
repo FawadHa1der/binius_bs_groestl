@@ -26,7 +26,7 @@ use std::{
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 /// 128-bit value that is used for 128-bit SIMD operations
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct M128(pub(super) __m128i);
 
@@ -266,6 +266,18 @@ impl PartialEq for M128 {
 
 impl Eq for M128 {}
 
+impl PartialOrd for M128 {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl Ord for M128 {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		u128::from(*self).cmp(&u128::from(*other))
+	}
+}
+
 impl ConstantTimeEq for M128 {
 	fn ct_eq(&self, other: &Self) -> Choice {
 		unsafe {
@@ -292,6 +304,12 @@ impl std::fmt::Display for M128 {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let data: u128 = (*self).into();
 		write!(f, "{data:02X?}")
+	}
+}
+
+impl std::fmt::Debug for M128 {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "M128({})", self)
 	}
 }
 

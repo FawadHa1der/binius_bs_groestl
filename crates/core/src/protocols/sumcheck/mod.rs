@@ -1,24 +1,24 @@
-// Copyright 2023 Ulvetanna Inc.
+// Copyright 2024 Ulvetanna Inc.
 
-//! The multivariate sumcheck polynomial protocol.
+//! The multivariate sumcheck and zerocheck polynomial protocols.
 //!
-//! Sumcheck supports an efficient prover algorithm when the virtual polynomial is a multilinear composite, so this
-//! module only handles that case, rather than the case of general multivariate polynomials.
+//! Sumcheck supports an efficient prover algorithm when the virtual polynomial is a multilinear
+//! composite, so this module only handles that case, rather than the case of general multivariate
+//! polynomials.
 
-mod batch;
+mod common;
 mod error;
-mod prove;
-#[allow(clippy::module_inception)]
-mod sumcheck;
+mod oracles;
+pub mod prove;
 #[cfg(test)]
 mod tests;
-mod verify;
+pub mod univariate;
+pub mod verify;
+pub mod zerocheck;
 
-pub use batch::*;
+pub use common::*;
 pub use error::*;
-pub use prove::*;
-pub use sumcheck::{
-	validate_witness, SumcheckClaim, SumcheckProof, SumcheckProveOutput, SumcheckRound,
-	SumcheckRoundClaim, SumcheckWitness,
-};
-pub use verify::*;
+pub use oracles::*;
+pub use prove::batch_prove;
+pub use verify::batch_verify;
+pub use zerocheck::ZerocheckClaim;

@@ -13,58 +13,48 @@
 use super::{
 	error::Error,
 	evalcheck::{BatchCommittedEvalClaims, CommittedEvalClaim},
+	EvalcheckMultilinearClaim, EvalcheckProver, EvalcheckVerifier,
 };
 use crate::{
 	composition::BivariateProduct,
 	oracle::{
-		CompositePolyOracle, Error as OracleError, MultilinearOracleSet, OracleId, Packed,
-		ProjectionVariant, ShiftVariant, Shifted,
+		ConstraintSet, ConstraintSetBuilder, Error as OracleError, MultilinearOracleSet, OracleId,
+		Packed, ProjectionVariant, Shifted,
 	},
-	polynomial::{MultilinearComposite, MultilinearPoly, MultilinearQuery, MultivariatePoly},
-	protocols::sumcheck::SumcheckClaim,
+	polynomial::MultivariatePoly,
+	protocols::sumcheck::{
+		self,
+		prove::oracles::{constraint_sets_sumcheck_provers_metas, SumcheckProversWithMetas},
+		Error as SumcheckError, Proof as SumcheckBatchProof,
+	},
 	transparent::{
 		eq_ind::EqIndPartialEval, shift_ind::ShiftIndPartialEval, tower_basis::TowerBasis,
 	},
 	witness::{MultilinearExtensionIndex, MultilinearWitness},
 };
 use binius_field::{
-	as_packed_field::PackScalar, underlier::WithUnderlier, Field, PackedField,
-	PackedFieldIndexable, TowerField,
+	as_packed_field::{PackScalar, PackedType},
+	underlier::UnderlierType,
+	ExtensionField, Field, PackedField, PackedFieldIndexable, TowerField,
 };
-use binius_hal::ComputationBackend;
+use binius_hal::{ComputationBackend, MLEDirectAdapter, MultilinearQuery};
+use binius_math::EvaluationDomainFactory;
 use binius_utils::bail;
-use std::sync::Arc;
-use tracing::instrument;
-
-// type aliases for bivariate claims/witnesses and their pairs to shorten type signatures
-pub type BivariateSumcheck<'a, F, PW> = (SumcheckClaim<F>, BivariateSumcheckWitness<'a, PW>);
-pub type BivariateSumcheckWitness<'a, PW> =
-	MultilinearComposite<PW, BivariateProduct, MultilinearWitness<'a, PW>>;
-
-// type alias for the simple linear map used to deduplicate transparent polynomials
-pub type MemoizedTransparentPolynomials<K> = Vec<(K, OracleId)>;
+use p3_challenger::{CanObserve, CanSample};
 
 /// Create oracles for the bivariate product of an inner oracle with shift indicator.
 ///
 /// Projects to first `block_size()` vars.
-/// Returns metadata object with oracle identifiers. Pass this object to:
-///  - [`projected_bivariate_claim`] to obtain sumcheck claim
-///  - [`shifted_sumcheck_witness`] to obtain sumcheck witness
 pub fn shifted_sumcheck_meta<F: TowerField>(
 	oracles: &mut MultilinearOracleSet<F>,
 	shifted: &Shifted<F>,
 	eval_point: &[F],
-	shift_ind_memo: Option<&mut MemoizedTransparentPolynomials<(usize, ShiftVariant, Vec<F>)>>,
 ) -> Result<ProjectedBivariateMeta, Error> {
 	projected_bivariate_meta(
 		oracles,
 		shifted.inner().id(),
 		shifted.block_size(),
 		eval_point,
-		shift_ind_memo,
-		|projected_eval_point| {
-			(shifted.shift_offset(), shifted.shift_variant(), projected_eval_point.to_vec())
-		},
 		|projected_eval_point| {
 			Ok(ShiftIndPartialEval::new(
 				shifted.block_size(),
@@ -76,29 +66,31 @@ pub fn shifted_sumcheck_meta<F: TowerField>(
 	)
 }
 
-/// Takes in metadata object and creates a witness for a bivariate claim on shift indicator.
-///
-/// `wf_eval_point` should be isomorphic to `eval_point` in `shifted_sumcheck_meta`.
-pub fn shifted_sumcheck_witness<'a, F, PW, Backend>(
-	witness_index: &mut MultilinearExtensionIndex<'a, PW::Underlier, PW::Scalar>,
-	memoized_queries: &mut MemoizedQueries<PW, Backend>,
-	meta: ProjectedBivariateMeta,
+/// Creates bivariate witness and adds them to the witness index, and add bivariate sumcheck constraint to the [`ConstraintSetBuilder`]
+#[allow(clippy::too_many_arguments)]
+pub fn process_shifted_sumcheck<U, F, Backend>(
+	oracles: &mut MultilinearOracleSet<F>,
 	shifted: &Shifted<F>,
-	wf_eval_point: &[PW::Scalar],
-	backend: Backend,
-) -> Result<BivariateSumcheckWitness<'a, PW>, Error>
+	eval_point: &[F],
+	eval: F,
+	witness_index: &mut MultilinearExtensionIndex<U, F>,
+	memoized_queries: &mut MemoizedQueries<PackedType<U, F>, Backend>,
+	constraint_builders: &mut Vec<ConstraintSetBuilder<PackedType<U, F>>>,
+	backend: &Backend,
+) -> Result<(), Error>
 where
-	F: Field,
-	PW: PackedFieldIndexable + WithUnderlier,
-	PW::Scalar: TowerField,
-	PW::Underlier: PackScalar<PW::Scalar, Packed = PW>,
+	PackedType<U, F>: PackedFieldIndexable,
+	U: UnderlierType + PackScalar<F>,
+	F: TowerField,
 	Backend: ComputationBackend,
 {
-	projected_bivariate_witness(
+	let meta = shifted_sumcheck_meta(oracles, shifted, eval_point)?;
+
+	process_projected_bivariate_witness(
 		witness_index,
 		memoized_queries,
 		meta,
-		wf_eval_point,
+		eval_point,
 		|projected_eval_point| {
 			let shift_ind = ShiftIndPartialEval::new(
 				projected_eval_point.len(),
@@ -107,20 +99,21 @@ where
 				projected_eval_point.to_vec(),
 			)?;
 
-			Ok(shift_ind
-				.multilinear_extension::<PW>()?
-				.specialize_arc_dyn())
+			let shift_ind_mle = shift_ind.multilinear_extension::<PackedType<U, F>>()?;
+			Ok(MLEDirectAdapter::from(shift_ind_mle).upcast_arc_dyn())
 		},
 		backend,
-	)
+	)?;
+
+	add_bivariate_sumcheck_to_constraints(meta, constraint_builders, shifted.block_size(), eval);
+
+	Ok(())
 }
 
 /// Create oracles for the bivariate product of an inner oracle with the tower basis.
 ///
 /// Projects to first `log_degree()` vars.
-/// Returns metadata object with oracle identifiers. Pass this object to:
-///  - [`projected_bivariate_claim`] to obtain sumcheck claim
-///  - [`packed_sumcheck_witness`] to obtain sumcheck witness
+/// Returns metadata object with oracle identifiers.
 pub fn packed_sumcheck_meta<F: TowerField>(
 	oracles: &mut MultilinearOracleSet<F>,
 	packed: &Packed<F>,
@@ -135,58 +128,77 @@ pub fn packed_sumcheck_meta<F: TowerField>(
 	}
 
 	// NB. projected_n_vars = 0 because eval_point length is log_degree less than inner n_vars
-	projected_bivariate_meta(
-		oracles,
-		packed.inner().id(),
-		0,
-		eval_point,
-		None,
-		|_| (),
-		|_| Ok(TowerBasis::new(log_degree, binary_tower_level)?),
-	)
+	projected_bivariate_meta(oracles, packed.inner().id(), 0, eval_point, |_| {
+		Ok(TowerBasis::new(log_degree, binary_tower_level)?)
+	})
 }
 
-/// Takes in metadata object and creates a witness for a bivariate claim on tower basis.
-///
-/// `wf_eval_point` should be isomorphic to `eval_point` in `shifted_sumcheck_meta`.
-pub fn packed_sumcheck_witness<'a, F, PW, Backend>(
-	witness_index: &mut MultilinearExtensionIndex<'a, PW::Underlier, PW::Scalar>,
-	memoized_queries: &mut MemoizedQueries<PW, Backend>,
+pub fn add_bivariate_sumcheck_to_constraints<P: PackedField>(
 	meta: ProjectedBivariateMeta,
+	constraint_builders: &mut Vec<ConstraintSetBuilder<P>>,
+	n_vars: usize,
+	eval: P::Scalar,
+) {
+	if n_vars > constraint_builders.len() {
+		constraint_builders.resize_with(n_vars, || ConstraintSetBuilder::new());
+	}
+
+	add_bivariate_sumcheck_to_constraint_builder(meta, &mut constraint_builders[n_vars - 1], eval);
+}
+
+fn add_bivariate_sumcheck_to_constraint_builder<P: PackedField>(
+	meta: ProjectedBivariateMeta,
+	constraint_builder: &mut ConstraintSetBuilder<P>,
+	eval: P::Scalar,
+) {
+	constraint_builder.add_sumcheck(meta.oracle_ids(), BivariateProduct {}, eval);
+}
+
+/// Creates bivariate witness and adds them to the witness index, and add bivariate sumcheck constraint to the [`ConstraintSetBuilder`]
+#[allow(clippy::too_many_arguments)]
+pub fn process_packed_sumcheck<U, F, Backend>(
+	oracles: &mut MultilinearOracleSet<F>,
 	packed: &Packed<F>,
-	wf_eval_point: &[PW::Scalar],
-	backend: Backend,
-) -> Result<BivariateSumcheckWitness<'a, PW>, Error>
+	eval_point: &[F],
+	eval: F,
+	witness_index: &mut MultilinearExtensionIndex<U, F>,
+	memoized_queries: &mut MemoizedQueries<PackedType<U, F>, Backend>,
+	constraint_builders: &mut Vec<ConstraintSetBuilder<PackedType<U, F>>>,
+	backend: &Backend,
+) -> Result<(), Error>
 where
-	F: Field,
-	PW: PackedFieldIndexable + WithUnderlier,
-	PW::Scalar: TowerField,
-	PW::Underlier: PackScalar<PW::Scalar, Packed = PW>,
+	U: UnderlierType + PackScalar<F>,
+	F: TowerField,
 	Backend: ComputationBackend,
 {
 	let log_degree = packed.log_degree();
 	let binary_tower_level = packed.inner().binary_tower_level();
 
-	projected_bivariate_witness(
+	let meta = packed_sumcheck_meta(oracles, packed, eval_point)?;
+
+	process_projected_bivariate_witness(
 		witness_index,
 		memoized_queries,
 		meta,
-		wf_eval_point,
+		eval_point,
 		|_projected_eval_point| {
 			let tower_basis = TowerBasis::new(log_degree, binary_tower_level)?;
-			Ok(tower_basis
-				.multilinear_extension::<PW>()?
-				.specialize_arc_dyn())
+			let tower_basis_mle = tower_basis.multilinear_extension::<PackedType<U, F>>()?;
+			Ok(MLEDirectAdapter::from(tower_basis_mle).upcast_arc_dyn())
 		},
 		backend,
-	)
+	)?;
+
+	add_bivariate_sumcheck_to_constraints(meta, constraint_builders, packed.log_degree(), eval);
+
+	Ok(())
 }
 
 #[derive(Clone)]
 pub struct NonSameQueryPcsClaimMeta<F> {
-	projected_bivariate_meta: ProjectedBivariateMeta,
+	pub projected_bivariate_meta: ProjectedBivariateMeta,
 	eval_point: Vec<F>,
-	eval: F,
+	pub eval: F,
 }
 
 /// Create sumchecks for committed evalcheck claims on differing eval points.
@@ -194,12 +206,10 @@ pub struct NonSameQueryPcsClaimMeta<F> {
 /// Each sumcheck instance is bivariate product of a column projection and equality indicator.
 /// Common suffix is optimized out, degenerate zero variable sumchecks are not emitted, and
 /// PCS claims are inserted directly into [`BatchCommittedEvalClaims`] instead.
-#[allow(clippy::type_complexity)]
 pub fn non_same_query_pcs_sumcheck_metas<F: TowerField>(
 	oracles: &mut MultilinearOracleSet<F>,
 	committed_eval_claims: &[CommittedEvalClaim<F>],
 	new_batch_committed_eval_claims: &mut BatchCommittedEvalClaims<F>,
-	mut eq_ind_memo: Option<&mut MemoizedTransparentPolynomials<Vec<F>>>,
 ) -> Result<Vec<NonSameQueryPcsClaimMeta<F>>, Error> {
 	let common_suffix_len = compute_common_suffix_len(
 		committed_eval_claims
@@ -223,8 +233,6 @@ pub fn non_same_query_pcs_sumcheck_metas<F: TowerField>(
 			oracles.committed_oracle_id(claim.id),
 			eval_point.len() - common_suffix_len,
 			eval_point,
-			eq_ind_memo.as_deref_mut(),
-			|projected_eval_point| projected_eval_point.to_vec(),
 			|projected_eval_point| {
 				Ok(EqIndPartialEval::new(
 					projected_eval_point.len(),
@@ -265,46 +273,29 @@ fn compute_common_suffix_len<'a, F: PartialEq + 'a>(
 	}
 }
 
-pub fn non_same_query_pcs_sumcheck_claim<F: TowerField>(
-	oracles: &MultilinearOracleSet<F>,
+pub fn process_non_same_query_pcs_sumcheck_witness<U, F, Backend>(
+	witness_index: &mut MultilinearExtensionIndex<U, F>,
+	memoized_queries: &mut MemoizedQueries<PackedType<U, F>, Backend>,
 	meta: NonSameQueryPcsClaimMeta<F>,
-) -> Result<SumcheckClaim<F>, Error> {
-	projected_bivariate_claim(oracles, meta.projected_bivariate_meta, meta.eval)
-}
-
-pub fn non_same_query_pcs_sumcheck_witness<'a, F, PW, Backend>(
-	witness_index: &mut MultilinearExtensionIndex<'a, PW::Underlier, PW::Scalar>,
-	memoized_queries: &mut MemoizedQueries<PW, Backend>,
-	meta: NonSameQueryPcsClaimMeta<F>,
-	backend: Backend,
-) -> Result<BivariateSumcheckWitness<'a, PW>, Error>
+	backend: &Backend,
+) -> Result<(), Error>
 where
-	F: Field + From<PW::Scalar>,
-	PW: PackedField + WithUnderlier,
-	PW::Scalar: From<F> + TowerField,
-	PW::Underlier: PackScalar<PW::Scalar, Packed = PW>,
+	U: UnderlierType + PackScalar<F>,
+	F: TowerField,
 	Backend: ComputationBackend,
 {
-	let wf_eval_point = meta
-		.eval_point
-		.into_iter()
-		.map(Into::into)
-		.collect::<Vec<_>>();
-
-	projected_bivariate_witness(
+	process_projected_bivariate_witness(
 		witness_index,
 		memoized_queries,
 		meta.projected_bivariate_meta,
-		&wf_eval_point,
+		&meta.eval_point,
 		|projected_eval_point| {
 			let eq_ind =
 				EqIndPartialEval::new(projected_eval_point.len(), projected_eval_point.to_vec())?;
-
-			Ok(eq_ind
-				.multilinear_extension::<PW, _>(backend.clone())?
-				.specialize_arc_dyn())
+			let eq_ind_mle = eq_ind.multilinear_extension::<PackedType<U, F>, _>(backend)?;
+			Ok(MLEDirectAdapter::from(eq_ind_mle).upcast_arc_dyn())
 		},
-		backend.clone(),
+		backend,
 	)
 }
 
@@ -316,13 +307,20 @@ pub struct ProjectedBivariateMeta {
 	projected_n_vars: usize,
 }
 
-fn projected_bivariate_meta<F: TowerField, T: MultivariatePoly<F> + 'static, K: PartialEq>(
+impl ProjectedBivariateMeta {
+	pub fn oracle_ids(&self) -> [OracleId; 2] {
+		[
+			self.projected_id.unwrap_or(self.inner_id),
+			self.multiplier_id,
+		]
+	}
+}
+
+fn projected_bivariate_meta<F: TowerField, T: MultivariatePoly<F> + 'static>(
 	oracles: &mut MultilinearOracleSet<F>,
 	inner_id: OracleId,
 	projected_n_vars: usize,
 	eval_point: &[F],
-	mut multiplier_memo: Option<&mut MemoizedTransparentPolynomials<K>>,
-	multiplier_memo_key: impl FnOnce(&[F]) -> K,
 	multiplier_transparent_ctr: impl FnOnce(&[F]) -> Result<T, Error>,
 ) -> Result<ProjectedBivariateMeta, Error> {
 	let inner = oracles.oracle(inner_id);
@@ -340,27 +338,9 @@ fn projected_bivariate_meta<F: TowerField, T: MultivariatePoly<F> + 'static, K: 
 	};
 
 	let projected_n_vars = projected_eval_point.len();
-	let memo_key = multiplier_memo_key(projected_eval_point);
 
-	let opt_multiplier_id = multiplier_memo
-		.as_ref()
-		.and_then(|memo| {
-			memo.iter()
-				.find(|(other_memo_key, _)| other_memo_key == &memo_key)
-		})
-		.map(|(_, oracle_id)| *oracle_id);
-
-	let multiplier_id = if let Some(multiplier_id) = opt_multiplier_id {
-		multiplier_id
-	} else {
-		let multiplier_id =
-			oracles.add_transparent(multiplier_transparent_ctr(projected_eval_point)?)?;
-
-		if let Some(memo) = multiplier_memo.as_mut() {
-			memo.push((memo_key, multiplier_id));
-		}
-		multiplier_id
-	};
+	let multiplier_id =
+		oracles.add_transparent(multiplier_transparent_ctr(projected_eval_point)?)?;
 
 	let meta = ProjectedBivariateMeta {
 		inner_id,
@@ -372,45 +352,17 @@ fn projected_bivariate_meta<F: TowerField, T: MultivariatePoly<F> + 'static, K: 
 	Ok(meta)
 }
 
-/// Take in projected bivariate metadata and produce a sumcheck claim.
-pub fn projected_bivariate_claim<F: TowerField>(
-	oracles: &MultilinearOracleSet<F>,
+fn process_projected_bivariate_witness<'a, U, F, Backend>(
+	witness_index: &mut MultilinearExtensionIndex<'a, U, F>,
+	memoized_queries: &mut MemoizedQueries<PackedType<U, F>, Backend>,
 	meta: ProjectedBivariateMeta,
-	eval: F,
-) -> Result<SumcheckClaim<F>, Error> {
-	let ProjectedBivariateMeta {
-		multiplier_id,
-		inner_id,
-		projected_id,
-		..
-	} = meta;
-
-	let inner = oracles.oracle(projected_id.unwrap_or(inner_id));
-	let multiplier = oracles.oracle(multiplier_id);
-
-	let product =
-		CompositePolyOracle::new(multiplier.n_vars(), vec![inner, multiplier], BivariateProduct)?;
-
-	let sumcheck_claim = SumcheckClaim {
-		poly: product,
-		sum: eval,
-	};
-
-	Ok(sumcheck_claim)
-}
-
-fn projected_bivariate_witness<'a, PW, Backend>(
-	witness_index: &mut MultilinearExtensionIndex<'a, PW::Underlier, PW::Scalar>,
-	memoized_queries: &mut MemoizedQueries<PW, Backend>,
-	meta: ProjectedBivariateMeta,
-	wf_eval_point: &[PW::Scalar],
-	multiplier_witness_ctr: impl FnOnce(&[PW::Scalar]) -> Result<MultilinearWitness<'a, PW>, Error>,
-	backend: Backend,
-) -> Result<BivariateSumcheckWitness<'a, PW>, Error>
+	eval_point: &[F],
+	multiplier_witness_ctr: impl FnOnce(&[F]) -> Result<MultilinearWitness<'a, PackedType<U, F>>, Error>,
+	backend: &Backend,
+) -> Result<(), Error>
 where
-	PW: PackedField + WithUnderlier,
-	PW::Scalar: TowerField,
-	PW::Underlier: PackScalar<PW::Scalar, Packed = PW>,
+	U: UnderlierType + PackScalar<F>,
+	F: TowerField,
 	Backend: ComputationBackend,
 {
 	let ProjectedBivariateMeta {
@@ -422,47 +374,30 @@ where
 
 	let inner_multilin = witness_index.get_multilin_poly(inner_id)?;
 
-	let (projected_inner_multilin, projected_eval_point) = if let Some(projected_id) = projected_id
-	{
-		let query = memoized_queries.full_query(&wf_eval_point[projected_n_vars..], backend)?;
-		// upcast_arc_dyn() doesn't compile, but an explicit Arc::new() does compile. Beats me.
-		let projected: Arc<dyn MultilinearPoly<PW> + Send + Sync> =
-			Arc::new(inner_multilin.evaluate_partial_high(query.to_ref())?);
-		witness_index.update_multilin_poly(vec![(projected_id, projected.clone())])?;
+	let projected_eval_point = if let Some(projected_id) = projected_id {
+		let query = memoized_queries.full_query(&eval_point[projected_n_vars..], backend)?;
+		let projected = inner_multilin.evaluate_partial_high(query.to_ref())?;
+		witness_index.update_multilin_poly(vec![(
+			projected_id,
+			MLEDirectAdapter::from(projected).upcast_arc_dyn(),
+		)])?;
 
-		(projected, &wf_eval_point[..projected_n_vars])
+		&eval_point[..projected_n_vars]
 	} else {
-		(inner_multilin, wf_eval_point)
+		eval_point
 	};
 
+	let m = multiplier_witness_ctr(projected_eval_point)?;
+
 	if !witness_index.has(multiplier_id) {
-		witness_index.update_multilin_poly(vec![(
-			multiplier_id,
-			multiplier_witness_ctr(projected_eval_point)?,
-		)])?;
+		witness_index.update_multilin_poly(vec![(multiplier_id, m)])?;
 	}
-
-	let multiplier_multilin = witness_index
-		.get_multilin_poly(multiplier_id)
-		.expect("multilinear forcibly created if absent")
-		.clone();
-
-	let witness = MultilinearComposite::new(
-		multiplier_multilin.n_vars(),
-		BivariateProduct,
-		vec![projected_inner_multilin, multiplier_multilin],
-	)?;
-
-	Ok(witness)
+	Ok(())
 }
 
-struct MemoizedQuery<P: PackedField, Backend: ComputationBackend> {
-	eval_point: Vec<P::Scalar>,
-	query: MultilinearQuery<P, Backend>,
-}
-
+#[allow(clippy::type_complexity)]
 pub struct MemoizedQueries<P: PackedField, Backend: ComputationBackend> {
-	memo: Vec<MemoizedQuery<P, Backend>>,
+	memo: Vec<(Vec<P::Scalar>, MultilinearQuery<P, Backend>)>,
 }
 
 impl<P: PackedField, Backend: ComputationBackend> MemoizedQueries<P, Backend> {
@@ -471,34 +406,119 @@ impl<P: PackedField, Backend: ComputationBackend> MemoizedQueries<P, Backend> {
 		Self { memo: Vec::new() }
 	}
 
-	#[instrument(skip_all)]
 	pub fn full_query(
 		&mut self,
 		eval_point: &[P::Scalar],
-		backend: Backend,
+		backend: &Backend,
 	) -> Result<&MultilinearQuery<P, Backend>, Error> {
 		if let Some(index) = self
 			.memo
 			.iter()
-			.position(|memo_query| memo_query.eval_point.as_slice() == eval_point)
+			.position(|(memo_eval_point, _)| memo_eval_point.as_slice() == eval_point)
 		{
-			let query = &self.memo[index].query;
+			let (_, ref query) = &self.memo[index];
 			return Ok(query);
 		}
 
-		let wf_query = MultilinearQuery::with_full_query(eval_point, backend)?;
-		self.memo.push(MemoizedQuery {
-			eval_point: eval_point.to_vec(),
-			query: wf_query,
-		});
+		let query = MultilinearQuery::with_full_query(eval_point, backend)?;
+		self.memo.push((eval_point.to_vec(), query));
 
-		let query = &self
-			.memo
-			.last()
-			.expect("pushed query immediately above")
-			.query;
+		let (_, ref query) = self.memo.last().expect("pushed query immediately above");
 		Ok(query)
 	}
+}
+
+type SumcheckProofEvalcheckClaims<F> = (SumcheckBatchProof<F>, Vec<EvalcheckMultilinearClaim<F>>);
+
+pub fn prove_bivariate_sumchecks_with_switchover<U, F, DomainField, CH, Backend>(
+	oracles: &MultilinearOracleSet<F>,
+	witness: &MultilinearExtensionIndex<U, F>,
+	constraint_sets: Vec<ConstraintSet<PackedType<U, F>>>,
+	challenger: &mut CH,
+	switchover_fn: impl Fn(usize) -> usize + 'static,
+	domain_factory: impl EvaluationDomainFactory<DomainField>,
+	backend: &Backend,
+) -> Result<SumcheckProofEvalcheckClaims<F>, SumcheckError>
+where
+	U: UnderlierType + PackScalar<F> + PackScalar<DomainField>,
+	F: TowerField + ExtensionField<DomainField>,
+	DomainField: Field,
+	CH: CanObserve<F> + CanSample<F>,
+	Backend: ComputationBackend,
+{
+	let SumcheckProversWithMetas { provers, metas } = constraint_sets_sumcheck_provers_metas(
+		constraint_sets,
+		witness,
+		domain_factory.clone(),
+		&switchover_fn,
+		backend,
+	)?;
+
+	let (sumcheck_output, proof) = sumcheck::batch_prove(provers, challenger)?;
+
+	let evalcheck_claims = sumcheck::make_eval_claims(oracles, metas, sumcheck_output)?;
+
+	Ok((proof, evalcheck_claims))
+}
+
+pub fn make_non_same_query_pcs_sumcheck_claims<F>(
+	verifier: &mut EvalcheckVerifier<F>,
+	committed_eval_claims: &[CommittedEvalClaim<F>],
+) -> Result<ConstraintSet<F>, Error>
+where
+	F: TowerField,
+{
+	let metas = non_same_query_pcs_sumcheck_metas(
+		verifier.oracles,
+		committed_eval_claims,
+		&mut verifier.batch_committed_eval_claims,
+	)?;
+
+	let mut constraint_set_builder = ConstraintSetBuilder::new();
+	for meta in metas {
+		add_bivariate_sumcheck_to_constraint_builder(
+			meta.projected_bivariate_meta,
+			&mut constraint_set_builder,
+			meta.eval,
+		)
+	}
+	Ok(constraint_set_builder.build_one(verifier.oracles)?)
+}
+
+pub fn make_non_same_query_pcs_sumchecks<U, F, Backend>(
+	prover: &mut EvalcheckProver<U, F, Backend>,
+	committed_eval_claims: &[CommittedEvalClaim<F>],
+	backend: &Backend,
+) -> Result<ConstraintSet<PackedType<U, F>>, Error>
+where
+	U: UnderlierType + PackScalar<F>,
+	F: TowerField,
+	Backend: ComputationBackend,
+{
+	let metas = non_same_query_pcs_sumcheck_metas(
+		prover.oracles,
+		committed_eval_claims,
+		&mut prover.batch_committed_eval_claims,
+	)?;
+
+	let mut memoized_queries = MemoizedQueries::new();
+
+	let mut constraint_set_builder = ConstraintSetBuilder::new();
+
+	for meta in metas {
+		add_bivariate_sumcheck_to_constraint_builder(
+			meta.projected_bivariate_meta,
+			&mut constraint_set_builder,
+			meta.eval,
+		);
+		process_non_same_query_pcs_sumcheck_witness(
+			prover.witness_index,
+			&mut memoized_queries,
+			meta,
+			backend,
+		)?;
+	}
+	Ok(constraint_set_builder.build_one(prover.oracles)?)
 }
 
 #[cfg(test)]

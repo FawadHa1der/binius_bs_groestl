@@ -3,16 +3,6 @@
 use crate::polynomial::MultivariatePoly;
 use binius_field::{packed::set_packed_slice, BinaryField1b, Field, PackedField};
 
-// If the macro is not used in the same module, rustc thinks it is unused for some reason
-#[allow(unused_macros, unused_imports)]
-pub mod macros {
-	#[macro_export]
-	macro_rules! felts {
-		($f:ident[$($elem:expr),* $(,)?]) => { vec![$($f::from($elem)),*] };
-	}
-	pub use felts;
-}
-
 pub fn hypercube_evals_from_oracle<F: Field>(oracle: &dyn MultivariatePoly<F>) -> Vec<F> {
 	(0..(1 << oracle.n_vars()))
 		.map(|i| {
@@ -55,11 +45,12 @@ where
 	assignments
 		.iter()
 		.for_each(|(r, _)| assert!(r.end > r.start, "Range must have positive size"));
-	let packed_len = (P::WIDTH - 1
-		+ (assignments.iter().map(|(range, _)| range.end))
-			.max()
-			.unwrap_or(0))
-		/ P::WIDTH;
+	let packed_len = assignments
+		.iter()
+		.map(|(range, _)| range.end)
+		.max()
+		.unwrap_or(0)
+		.div_ceil(P::WIDTH);
 	let mut result: Vec<P> = vec![P::default(); packed_len];
 	for (range, value) in assignments.iter() {
 		for i in range.clone() {

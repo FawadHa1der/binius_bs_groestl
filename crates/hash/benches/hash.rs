@@ -4,14 +4,13 @@ use binius_field::{
 	PackedBinaryField32x8b, PackedField,
 };
 use binius_hash::{
-	FixedLenHasherDigest, Groestl256, HashDigest, HasherDigest, Vision32b, VisionHasher,
+	FixedLenHasherDigest, Groestl256, GroestlDigest, GroestlDigestCompression, HashDigest,
+	HasherDigest, Vision32b, VisionHasher,
 };
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use groestl_crypto::{Digest, Groestl256 as GenericGroestl256};
+use p3_symmetric::PseudoCompressionFunction;
 use rand::{thread_rng, RngCore};
-use std::{any::type_name, array};
-
-
 use binius_hash::bs_groestl::*;
 use rand::prelude::*;
 use rayon::prelude::*;
@@ -20,6 +19,38 @@ use std::{iter::repeat_with, marker::PhantomData, mem};
 use binius_hash::{GroestlDigest, GroestlDigestCompression, GroestlHasher, Hasher};
 use binius_field::PackedBinaryField16x8b;
 
+use std::array;
+fn bench_groestl_compression(c: &mut Criterion) {
+	let mut group = c.benchmark_group("groestl-compression");
+
+	let mut rng = thread_rng();
+
+	const N: usize = 1 << 10;
+	let digests_aes: [[GroestlDigest<AESTowerField8b>; 2]; N] =
+		array::from_fn(|_| array::from_fn(|_| GroestlDigest::<AESTowerField8b>::random(&mut rng)));
+	let digests_bin: [[GroestlDigest<BinaryField8b>; 2]; N] =
+		array::from_fn(|_| array::from_fn(|_| GroestlDigest::<BinaryField8b>::random(&mut rng)));
+
+	group.throughput(Throughput::Bytes(
+		2 * (N * std::mem::size_of::<GroestlDigest<AESTowerField8b>>()) as u64,
+	));
+	group.bench_function("GroestlCompression-Binary", |bench| {
+		bench.iter(|| {
+			let out: [GroestlDigest<BinaryField8b>; N] = digests_bin.map(|digest| {
+				GroestlDigestCompression::<BinaryField8b>::default().compress(digest)
+			});
+			out
+		})
+	});
+	group.bench_function("GroestlCompression-AES", |bench| {
+		bench.iter(|| {
+			let out: [GroestlDigest<AESTowerField8b>; N] = digests_aes.map(|digest| {
+				GroestlDigestCompression::<AESTowerField8b>::default().compress(digest)
+			});
+			out
+		})
+	});
+}
 
 fn bench_groestl(c: &mut Criterion) {
 	let mut group = c.benchmark_group("groestl");
@@ -157,25 +188,14 @@ fn bench_groestl_bitsliced(c: &mut Criterion) {
 	group.finish()
 }
 
-// fn bench_vision32(c: &mut Criterion) {
-// 	let mut group = c.benchmark_group("vision");
+criterion_group!(
+	hash,
+	bench_groestl_compression,
+	bench_groestl,
+	bench_groestl_rustcrypto,
+	bench_vision32
+);
+//criterion_group!(hash, bench_groestl_bitsliced, bench_groestl_long_data);
 
-// 	let mut rng = thread_rng();
-
-// 	const N: usize = 1 << 14;
-// 	let data = (0..N)
-// 		.map(|_| BinaryField32b::random(&mut rng))
-// 		.collect::<Vec<_>>();
-
-// 	group.throughput(Throughput::Bytes((N * 4) as u64));
-// 	group.bench_function(type_name::<Vision32b<BinaryField32b>>(), |bench| {
-// 		bench.iter(|| FixedLenHasherDigest::<_, Vision32b<_>>::hash(data.as_slice()))
-// 	});
-
-// 	group.finish()
-// }
-
-// criterion_group!(hash, bench_groestl_long_data, bench_groestl_bitsliced, bench_groestl);
-criterion_group!(hash, bench_groestl_bitsliced, bench_groestl_long_data);
 criterion_main!(hash);
 

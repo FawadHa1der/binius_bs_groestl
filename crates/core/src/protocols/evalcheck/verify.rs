@@ -1,16 +1,19 @@
 // Copyright 2024 Ulvetanna Inc.
 
+use std::mem;
+
 use super::{
 	error::{Error, VerificationError},
 	evalcheck::{
-		BatchCommittedEvalClaims, CommittedEvalClaim, EvalcheckClaim, EvalcheckMultilinearClaim,
-		EvalcheckProof,
+		BatchCommittedEvalClaims, CommittedEvalClaim, EvalcheckMultilinearClaim, EvalcheckProof,
 	},
-	subclaims::{packed_sumcheck_meta, projected_bivariate_claim, shifted_sumcheck_meta},
+	subclaims::{
+		add_bivariate_sumcheck_to_constraints, packed_sumcheck_meta, shifted_sumcheck_meta,
+	},
 };
-use crate::{
-	oracle::{MultilinearOracleSet, MultilinearPolyOracle, ProjectionVariant},
-	protocols::sumcheck::SumcheckClaim,
+use crate::oracle::{
+	ConstraintSet, ConstraintSetBuilder, Error as OracleError, MultilinearOracleSet,
+	MultilinearPolyOracle, ProjectionVariant,
 };
 use binius_field::{util::inner_product_unchecked, TowerField};
 use binius_math::extrapolate_line_scalar;
@@ -20,17 +23,19 @@ use tracing::instrument;
 /// A mutable verifier state.
 ///
 /// Can be persisted across [`EvalcheckVerifier::verify`] invocations. Accumulates
-/// `new_sumchecks` bivariate sumcheck instances, as well as holds mutable references to
+/// `new_sumchecks` bivariate sumcheck constraints, as well as holds mutable references to
 /// the trace (to which new oracles & multilinears may be added during verification)
 #[derive(Getters, MutGetters)]
-pub struct EvalcheckVerifier<'a, F: TowerField> {
+pub struct EvalcheckVerifier<'a, F>
+where
+	F: TowerField,
+{
 	pub(crate) oracles: &'a mut MultilinearOracleSet<F>,
 
 	#[getset(get = "pub", get_mut = "pub")]
 	pub(crate) batch_committed_eval_claims: BatchCommittedEvalClaims<F>,
 
-	#[get = "pub"]
-	new_sumcheck_claims: Vec<SumcheckClaim<F>>,
+	new_sumcheck_constraints: Vec<ConstraintSetBuilder<F>>,
 }
 
 impl<'a, F: TowerField> EvalcheckVerifier<'a, F> {
@@ -38,20 +43,25 @@ impl<'a, F: TowerField> EvalcheckVerifier<'a, F> {
 	/// (it needs to be mutable because `new_sumcheck` reduction may add new
 	/// oracles & multilinears)
 	pub fn new(oracles: &'a mut MultilinearOracleSet<F>) -> Self {
-		let new_sumcheck_claims = Vec::new();
+		let new_sumcheck_constraints = Vec::new();
 		let batch_committed_eval_claims =
 			BatchCommittedEvalClaims::new(&oracles.committed_batches());
 
 		Self {
 			oracles,
 			batch_committed_eval_claims,
-			new_sumcheck_claims,
+			new_sumcheck_constraints,
 		}
 	}
 
-	/// A helper method to move out the set of reduced claims
-	pub fn take_new_sumchecks(&mut self) -> Vec<SumcheckClaim<F>> {
-		std::mem::take(&mut self.new_sumcheck_claims)
+	/// A helper method to move out sumcheck constraints
+	pub fn take_new_sumcheck_constraints(&mut self) -> Result<Vec<ConstraintSet<F>>, OracleError> {
+		self.new_sumcheck_constraints
+			.iter_mut()
+			.map(|builder| mem::take(builder).build_one(self.oracles))
+			.filter(|constraint| !matches!(constraint, Err(OracleError::EmptyConstraintSet)))
+			.rev()
+			.collect()
 	}
 
 	/// Verify an evalcheck claim.
@@ -60,44 +70,15 @@ impl<'a, F: TowerField> EvalcheckVerifier<'a, F> {
 	#[instrument(skip_all, name = "EvalcheckVerifierState::verify", level = "debug")]
 	pub fn verify(
 		&mut self,
-		evalcheck_claim: EvalcheckClaim<F>,
-		evalcheck_proof: EvalcheckProof<F>,
+		evalcheck_claims: Vec<EvalcheckMultilinearClaim<F>>,
+		evalcheck_proofs: Vec<EvalcheckProof<F>>,
 	) -> Result<(), Error> {
-		let EvalcheckClaim {
-			poly: composite,
-			eval_point,
-			eval,
-			is_random_point,
-		} = evalcheck_claim;
-
-		let subproofs = match evalcheck_proof {
-			EvalcheckProof::Composite { subproofs } => subproofs,
-			_ => return Err(VerificationError::SubproofMismatch.into()),
-		};
-
-		if subproofs.len() != composite.n_multilinears() {
-			return Err(VerificationError::SubproofMismatch.into());
-		}
-
-		// Verify the evaluation of the composition function over the claimed evaluations
-		let evals = subproofs.iter().map(|(eval, _)| *eval).collect::<Vec<_>>();
-		let actual_eval = composite.composition().evaluate(&evals)?;
-		if actual_eval != eval {
-			return Err(VerificationError::incorrect_composite_poly_evaluation(composite).into());
-		}
-
-		subproofs
+		for (claim, proof) in evalcheck_claims
 			.into_iter()
-			.zip(composite.inner_polys().into_iter())
-			.try_for_each(|((eval, subproof), suboracle)| {
-				self.verify_multilinear_subclaim(
-					eval,
-					subproof,
-					suboracle,
-					&eval_point,
-					is_random_point,
-				)
-			})?;
+			.zip(evalcheck_proofs.into_iter())
+		{
+			self.verify_multilinear(claim, proof)?;
+		}
 
 		Ok(())
 	}
@@ -275,10 +256,13 @@ impl<'a, F: TowerField> EvalcheckVerifier<'a, F> {
 					_ => return Err(VerificationError::SubproofMismatch.into()),
 				};
 
-				let meta =
-					shifted_sumcheck_meta(self.oracles, &shifted, eval_point.as_slice(), None)?;
-				let sumcheck_claim = projected_bivariate_claim(self.oracles, meta, eval)?;
-				self.new_sumcheck_claims.push(sumcheck_claim);
+				let meta = shifted_sumcheck_meta(self.oracles, &shifted, eval_point.as_slice())?;
+				add_bivariate_sumcheck_to_constraints(
+					meta,
+					&mut self.new_sumcheck_constraints,
+					shifted.block_size(),
+					eval,
+				)
 			}
 
 			MultilinearPolyOracle::Packed { packed, .. } => {
@@ -288,8 +272,12 @@ impl<'a, F: TowerField> EvalcheckVerifier<'a, F> {
 				};
 
 				let meta = packed_sumcheck_meta(self.oracles, &packed, eval_point.as_slice())?;
-				let sumcheck_claim = projected_bivariate_claim(self.oracles, meta, eval)?;
-				self.new_sumcheck_claims.push(sumcheck_claim);
+				add_bivariate_sumcheck_to_constraints(
+					meta,
+					&mut self.new_sumcheck_constraints,
+					packed.log_degree(),
+					eval,
+				)
 			}
 
 			MultilinearPolyOracle::LinearCombination {

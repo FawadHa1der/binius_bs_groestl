@@ -4,8 +4,12 @@
 use super::error::Error;
 use crate::Matrix;
 use auto_impl::auto_impl;
-use binius_field::{packed::mul_by_subfield_scalar, ExtensionField, Field, PackedExtension};
+use binius_field::{
+	packed::mul_by_subfield_scalar, BinaryField, ExtensionField, Field, PackedExtension,
+	PackedField,
+};
 use binius_utils::bail;
+use p3_util::log2_ceil_usize;
 use std::{
 	iter::{self, Step},
 	marker::PhantomData,
@@ -14,28 +18,53 @@ use std::{
 /// A domain that univariate polynomials may be evaluated on.
 ///
 /// An evaluation domain of size d + 1 along with polynomial values on that domain are sufficient
-/// to reconstruct a degree <= d.
+/// to reconstruct a degree <= d. This struct supports Barycentric extrapolation.
 #[derive(Debug, Clone)]
 pub struct EvaluationDomain<F: Field> {
 	points: Vec<F>,
 	weights: Vec<F>,
+}
+
+/// An extended version of `EvaluationDomain` that supports interpolation to monomial form. Takes
+/// longer to construct due to Vandermonde inversion, which has cubic complexity.
+#[derive(Debug, Clone)]
+pub struct InterpolationDomain<F: Field> {
+	evaluation_domain: EvaluationDomain<F>,
 	interpolation_matrix: Matrix<F>,
 }
 
 /// Wraps type information to enable instantiating EvaluationDomains.
 #[auto_impl(&)]
 pub trait EvaluationDomainFactory<DomainField: Field>: Clone {
-	/// Instantiates an EvaluationDomain with the given number of points.
+	/// Instantiates an EvaluationDomain from a set of points isomorphic to direct
+	/// lexicographic successors of zero in Fan-Paar tower
 	fn create(&self, size: usize) -> Result<EvaluationDomain<DomainField>, Error>;
 }
 
 #[derive(Default, Clone)]
-/// Uses EvaluationDomain::new_isomorphic() to instantiate an EvaluationDomain.
+pub struct DefaultEvaluationDomainFactory<DomainFieldWithStep>
+where
+	DomainFieldWithStep: Field + Step,
+{
+	_p: PhantomData<DomainFieldWithStep>,
+}
+
+#[derive(Default, Clone)]
 pub struct IsomorphicEvaluationDomainFactory<DomainFieldWithStep>
 where
 	DomainFieldWithStep: Field + Step,
 {
 	_p: PhantomData<DomainFieldWithStep>,
+}
+
+impl<DomainField> EvaluationDomainFactory<DomainField>
+	for DefaultEvaluationDomainFactory<DomainField>
+where
+	DomainField: Field + Step,
+{
+	fn create(&self, size: usize) -> Result<EvaluationDomain<DomainField>, Error> {
+		EvaluationDomain::from_points(make_evaluation_points(size)?)
+	}
 }
 
 impl<DomainField, DomainFieldWithStep> EvaluationDomainFactory<DomainField>
@@ -45,7 +74,8 @@ where
 	DomainFieldWithStep: Field + Step,
 {
 	fn create(&self, size: usize) -> Result<EvaluationDomain<DomainField>, Error> {
-		EvaluationDomain::<DomainField>::new_isomorphic::<DomainFieldWithStep>(size)
+		let points = make_evaluation_points::<DomainFieldWithStep>(size)?;
+		EvaluationDomain::from_points(points.into_iter().map(Into::into).collect())
 	}
 }
 
@@ -59,29 +89,23 @@ fn make_evaluation_points<F: Field + Step>(size: usize) -> Result<Vec<F>, Error>
 	Ok(points)
 }
 
-impl<F: Field + Step> EvaluationDomain<F> {
-	pub fn new(size: usize) -> Result<Self, Error> {
-		let points = make_evaluation_points::<F>(size)?;
-		Self::from_points(points)
+pub fn make_ntt_domain_points<F: BinaryField>(size: usize) -> Result<Vec<F>, Error> {
+	let mut points = Vec::with_capacity(size);
+	points.push(F::ZERO);
+	for basis_idx in 0..log2_ceil_usize(size) {
+		let basis_eval = F::basis(basis_idx)?;
+		for i in 0..points.len().min(size - points.len()) {
+			points.push(points[i] + basis_eval);
+		}
 	}
+	debug_assert_eq!(points.len(), size);
+	Ok(points)
 }
 
-impl<OF: Field> EvaluationDomain<OF> {
-	pub fn new_isomorphic<F: Field + Step + Into<OF>>(size: usize) -> Result<Self, Error> {
-		let points = make_evaluation_points::<F>(size)?
-			.into_iter()
-			.map(Into::into)
-			.collect::<Vec<OF>>();
-		Self::from_points(points)
-	}
-}
-
-impl<F: Field> EvaluationDomain<F> {
-	pub fn from_points(points: Vec<F>) -> Result<Self, Error> {
-		let weights = compute_barycentric_weights(&points)?;
-
-		let n = points.len();
-		let evaluation_matrix = vandermonde(&points);
+impl<F: Field> From<EvaluationDomain<F>> for InterpolationDomain<F> {
+	fn from(evaluation_domain: EvaluationDomain<F>) -> InterpolationDomain<F> {
+		let n = evaluation_domain.size();
+		let evaluation_matrix = vandermonde(evaluation_domain.points());
 		let mut interpolation_matrix = Matrix::zeros(n, n);
 		evaluation_matrix
 			.inverse_into(&mut interpolation_matrix)
@@ -92,11 +116,17 @@ impl<F: Field> EvaluationDomain<F> {
 				matrix is non-singular because it is Vandermonde with no duplicate points",
 			);
 
-		Ok(Self {
-			points,
-			weights,
+		InterpolationDomain {
+			evaluation_domain,
 			interpolation_matrix,
-		})
+		}
+	}
+}
+
+impl<F: Field> EvaluationDomain<F> {
+	pub fn from_points(points: Vec<F>) -> Result<Self, Error> {
+		let weights = compute_barycentric_weights(&points)?;
+		Ok(Self { points, weights })
 	}
 
 	pub fn size(&self) -> usize {
@@ -107,8 +137,72 @@ impl<F: Field> EvaluationDomain<F> {
 		self.points.as_slice()
 	}
 
-	pub fn interpolate<FE: ExtensionField<F>>(&self, values: &[FE]) -> Result<Vec<FE>, Error> {
+	/// Compute a vector of Lagrange polynomial evaluations in $O(N)$ at a given point `x`.
+	///
+	/// For an evaluation domain consisting of points $\pi_i$ Lagrange polynomials $L_i(x)$
+	/// are defined by
+	/// $$L_i(x) = \sum_{j \neq i}\frac{x - \pi_j}{\pi_i - \pi_j}$$
+	pub fn lagrange_evals<FE: ExtensionField<F>>(&self, x: FE) -> Vec<FE> {
+		let num_evals = self.size();
+
+		let mut result: Vec<FE> = vec![FE::ONE; num_evals];
+
+		// Multiply the product suffixes
+		for i in (1..num_evals).rev() {
+			result[i - 1] = result[i] * (x - self.points[i]);
+		}
+
+		let mut prefix = FE::ONE;
+
+		// Multiply the product prefixes and weights
+		for ((r, &point), &weight) in result.iter_mut().zip(&self.points).zip(&self.weights) {
+			*r *= prefix * weight;
+			prefix *= x - point;
+		}
+
+		result
+	}
+
+	/// Evaluate the unique interpolated polynomial at any point, for a given set of values, in $O(N)$.
+	pub fn extrapolate<PE>(&self, values: &[PE], x: PE::Scalar) -> Result<PE, Error>
+	where
+		PE: PackedField<Scalar: ExtensionField<F>>,
+	{
+		let lagrange_eval_results = self.lagrange_evals(x);
+
 		let n = self.size();
+		if values.len() != n {
+			bail!(Error::ExtrapolateNumberOfEvaluations);
+		}
+
+		let result = lagrange_eval_results
+			.into_iter()
+			.zip(values)
+			.map(|(evaluation, &value)| value * evaluation)
+			.sum::<PE>();
+
+		Ok(result)
+	}
+}
+
+impl<F: Field> InterpolationDomain<F> {
+	pub fn size(&self) -> usize {
+		self.evaluation_domain.size()
+	}
+
+	pub fn points(&self) -> &[F] {
+		self.evaluation_domain.points()
+	}
+
+	pub fn extrapolate<PE>(&self, values: &[PE], x: PE::Scalar) -> Result<PE, Error>
+	where
+		PE: PackedExtension<F, Scalar: ExtensionField<F>>,
+	{
+		self.evaluation_domain.extrapolate(values, x)
+	}
+
+	pub fn interpolate<FE: ExtensionField<F>>(&self, values: &[FE]) -> Result<Vec<FE>, Error> {
+		let n = self.evaluation_domain.size();
 		if values.len() != n {
 			bail!(Error::ExtrapolateNumberOfEvaluations);
 		}
@@ -116,33 +210,6 @@ impl<F: Field> EvaluationDomain<F> {
 		let mut coeffs = vec![FE::ZERO; values.len()];
 		self.interpolation_matrix.mul_vec_into(values, &mut coeffs);
 		Ok(coeffs)
-	}
-
-	pub fn extrapolate<PE>(&self, values: &[PE], x: PE::Scalar) -> Result<PE, Error>
-	where
-		PE: PackedExtension<F, Scalar: ExtensionField<F>>,
-	{
-		let n = self.size();
-		if values.len() != n {
-			bail!(Error::ExtrapolateNumberOfEvaluations);
-		}
-
-		let weighted_values = values
-			.iter()
-			.zip(self.weights.iter())
-			.map(|(&value, &weight)| mul_by_subfield_scalar(value, weight));
-
-		let (result, _) = weighted_values.zip(self.points.iter()).fold(
-			(PE::zero(), PE::Scalar::ONE),
-			|(eval, terms_partial_prod), (val, &x_i)| {
-				let term = x - x_i;
-				let next_eval = eval * term + val * terms_partial_prod;
-				let next_terms_partial_prod = terms_partial_prod * term;
-				(next_eval, next_terms_partial_prod)
-			},
-		);
-
-		Ok(result)
 	}
 }
 
@@ -209,9 +276,10 @@ mod tests {
 	use super::*;
 	use assert_matches::assert_matches;
 	use binius_field::{
-		AESTowerField32b, BinaryField128b, BinaryField128bPolyval, BinaryField32b, BinaryField8b,
+		util::inner_product_unchecked, AESTowerField32b, BinaryField16b, BinaryField32b,
+		BinaryField8b,
 	};
-	use proptest::proptest;
+	use proptest::{collection::vec, proptest};
 	use rand::{rngs::StdRng, SeedableRng};
 	use std::{iter::repeat_with, slice};
 
@@ -225,8 +293,9 @@ mod tests {
 
 	#[test]
 	fn test_new_domain() {
+		let domain_factory = DefaultEvaluationDomainFactory::<BinaryField8b>::default();
 		assert_eq!(
-			<EvaluationDomain<BinaryField8b>>::new(3).unwrap().points,
+			domain_factory.create(3).unwrap().points,
 			&[
 				BinaryField8b::new(0),
 				BinaryField8b::new(1),
@@ -237,40 +306,33 @@ mod tests {
 
 	#[test]
 	fn test_domain_factory_binary_field() {
-		let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField32b>::default();
-		let domain_1: EvaluationDomain<BinaryField32b> = domain_factory.create(10).unwrap();
-		let domain_2 =
-			EvaluationDomain::<BinaryField32b>::new_isomorphic::<BinaryField32b>(10).unwrap();
-		let domain_3 = EvaluationDomain::<BinaryField32b>::new(10).unwrap();
+		let default_domain_factory = DefaultEvaluationDomainFactory::<BinaryField32b>::default();
+		let iso_domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField32b>::default();
+		let domain_1: EvaluationDomain<BinaryField32b> = default_domain_factory.create(10).unwrap();
+		let domain_2: EvaluationDomain<BinaryField32b> = iso_domain_factory.create(10).unwrap();
 		assert_eq!(domain_1.points, domain_2.points);
-		assert_eq!(domain_1.points, domain_3.points);
 	}
 
 	#[test]
 	fn test_domain_factory_aes() {
-		let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField32b>::default();
-		let domain_1: EvaluationDomain<AESTowerField32b> = domain_factory.create(10).unwrap();
-		let domain_2 =
-			EvaluationDomain::<AESTowerField32b>::new_isomorphic::<BinaryField32b>(10).unwrap();
-		assert_eq!(domain_1.points, domain_2.points);
-	}
-
-	#[test]
-	fn test_domain_factory_polyval() {
-		let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField128b>::default();
-		let domain_1: EvaluationDomain<BinaryField128bPolyval> = domain_factory.create(10).unwrap();
-		let domain_2 =
-			EvaluationDomain::<BinaryField128bPolyval>::new_isomorphic::<BinaryField128b>(10)
-				.unwrap();
-		assert_eq!(domain_1.points, domain_2.points);
+		let default_domain_factory = DefaultEvaluationDomainFactory::<BinaryField32b>::default();
+		let iso_domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField32b>::default();
+		let domain_1: EvaluationDomain<BinaryField32b> = default_domain_factory.create(10).unwrap();
+		let domain_2: EvaluationDomain<AESTowerField32b> = iso_domain_factory.create(10).unwrap();
+		assert_eq!(
+			domain_1
+				.points
+				.into_iter()
+				.map(AESTowerField32b::from)
+				.collect::<Vec<_>>(),
+			domain_2.points
+		);
 	}
 
 	#[test]
 	fn test_new_oversized_domain() {
-		assert_matches!(
-			<EvaluationDomain<BinaryField8b>>::new(300),
-			Err(Error::DomainSizeTooLarge)
-		);
+		let default_domain_factory = DefaultEvaluationDomainFactory::<BinaryField8b>::default();
+		assert_matches!(default_domain_factory.create(300), Err(Error::DomainSizeTooLarge));
 	}
 
 	#[test]
@@ -339,8 +401,28 @@ mod tests {
 			.map(|&x| evaluate_univariate(&coeffs, x))
 			.collect::<Vec<_>>();
 
-		let interpolated = domain.interpolate(&values).unwrap();
+		let interpolated = InterpolationDomain::from(domain)
+			.interpolate(&values)
+			.unwrap();
 		assert_eq!(interpolated, coeffs);
+	}
+
+	#[test]
+	fn test_make_ntt_domain_points() {
+		for size in 1..256 {
+			check_ntt_domain::<BinaryField8b>(size)
+		}
+
+		check_ntt_domain::<BinaryField16b>(513);
+		check_ntt_domain::<BinaryField16b>(997);
+		check_ntt_domain::<BinaryField16b>(65536);
+	}
+
+	fn check_ntt_domain<F: BinaryField + Step>(size: usize) {
+		let domain = make_ntt_domain_points(size).unwrap();
+		let expected =
+			iter::successors(Some(F::ZERO), |&pred| F::forward_checked(pred, 1)).take(size);
+		assert!(expected.zip(domain).all(|(l, r)| l == r));
 	}
 
 	proptest! {
@@ -351,6 +433,20 @@ mod tests {
 			let z = BinaryField8b::from(z);
 			assert_eq!(extrapolate_line(x0, x1, z), x0 + (x1 - x0) * z);
 			assert_eq!(extrapolate_line_scalar(x0, x1, z), x0 + (x1 - x0) * z);
+		}
+
+		#[test]
+		fn test_lagrange_evals(values in vec(0u32.., 0..100), z in 0u32..) {
+			let field_values = values.into_iter().map(BinaryField32b::from).collect::<Vec<_>>();
+			let factory = DefaultEvaluationDomainFactory::<BinaryField32b>::default();
+			let evaluation_domain = factory.create(field_values.len()).unwrap();
+
+			let z = BinaryField32b::new(z);
+
+			let extrapolated = evaluation_domain.extrapolate(field_values.as_slice(), z).unwrap();
+			let lagrange_coeffs = evaluation_domain.lagrange_evals(z);
+			let lagrange_eval = inner_product_unchecked(lagrange_coeffs.into_iter(), field_values.into_iter());
+			assert_eq!(lagrange_eval, extrapolated);
 		}
 	}
 }

@@ -1,34 +1,30 @@
 // Copyright 2024 Ulvetanna Inc.
 
 use super::lasso::{reduce_lasso_claim, LassoBatches, LassoClaim, LassoProof};
-use binius_hal::ComputationBackend;
-
-use crate::protocols::lasso::Error;
-
-use crate::oracle::MultilinearOracleSet;
-
-use crate::protocols::gkr_gpa::GrandProductClaim;
-
+use crate::{
+	oracle::{MultilinearOracleSet, OracleId},
+	protocols::{
+		gkr_gpa::{construct_grand_product_claims, GrandProductClaim},
+		lasso::Error,
+	},
+};
 use binius_field::{ExtensionField, TowerField};
 use binius_utils::bail;
-use itertools::chain;
 use tracing::instrument;
 
 /// Verify a Lasso instance reduction.
 #[instrument(skip_all, name = "lasso::verify", level = "debug")]
-pub fn verify<C, F, Backend>(
+pub fn verify<C, F>(
 	oracles: &mut MultilinearOracleSet<F>,
 	claim: &LassoClaim<F>,
 	batch: &LassoBatches,
 	gamma: F,
 	alpha: F,
 	lasso_proof: LassoProof<F>,
-	backend: Backend,
-) -> Result<Vec<GrandProductClaim<F>>, Error>
+) -> Result<(Vec<GrandProductClaim<F>>, Vec<OracleId>), Error>
 where
 	C: TowerField,
 	F: TowerField + ExtensionField<C>,
-	Backend: ComputationBackend + 'static,
 {
 	let common_counts_len = claim
 		.u_oracles()
@@ -66,7 +62,7 @@ where
 	}
 
 	let (gkr_claim_oracle_ids, ..) =
-		reduce_lasso_claim::<C, _, _>(oracles, claim, batch, gamma, alpha, backend)?;
+		reduce_lasso_claim::<C, _>(oracles, claim, batch, gamma, alpha)?;
 
 	if gkr_claim_oracle_ids.left.len() != grand_product_arrays_len
 		|| gkr_claim_oracle_ids.right.len() != grand_product_arrays_len
@@ -75,19 +71,29 @@ where
 		bail!(Error::ProductsClaimsArraysLenMismatch);
 	}
 
-	let grand_product_claims = chain!(
-		gkr_claim_oracle_ids.left.iter().zip(left_grand_products),
-		gkr_claim_oracle_ids.right.iter().zip(right_grand_products),
-		gkr_claim_oracle_ids
-			.counts
-			.iter()
-			.zip(counts_grand_products)
-	)
-	.map(|(id, product)| GrandProductClaim {
-		poly: oracles.oracle(*id),
-		product,
-	})
-	.collect::<Vec<_>>();
+	let left_claims =
+		construct_grand_product_claims(&gkr_claim_oracle_ids.left, oracles, &left_grand_products)?;
 
-	Ok(grand_product_claims)
+	let right_claims = construct_grand_product_claims(
+		&gkr_claim_oracle_ids.right,
+		oracles,
+		&right_grand_products,
+	)?;
+
+	let counts_claims = construct_grand_product_claims(
+		&gkr_claim_oracle_ids.counts,
+		oracles,
+		&counts_grand_products,
+	)?;
+
+	let reduced_gpa_claims = [left_claims, right_claims, counts_claims].concat();
+
+	let gpa_metas = [
+		gkr_claim_oracle_ids.left,
+		gkr_claim_oracle_ids.right,
+		gkr_claim_oracle_ids.counts,
+	]
+	.concat();
+
+	Ok((reduced_gpa_claims, gpa_metas))
 }

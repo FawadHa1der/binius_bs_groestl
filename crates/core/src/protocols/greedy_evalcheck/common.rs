@@ -4,7 +4,7 @@ use crate::{
 	oracle::BatchId,
 	protocols::{
 		evalcheck::{EvalcheckProof, SameQueryPcsClaim},
-		sumcheck::SumcheckBatchProof,
+		sumcheck::Proof,
 	},
 };
 use binius_field::Field;
@@ -12,9 +12,31 @@ use binius_field::Field;
 #[derive(Debug, Default)]
 pub struct GreedyEvalcheckProof<F: Field> {
 	pub initial_evalcheck_proofs: Vec<EvalcheckProof<F>>,
-	pub virtual_opening_proofs: Vec<(SumcheckBatchProof<F>, Vec<EvalcheckProof<F>>)>,
-	#[allow(clippy::type_complexity)]
-	pub batch_opening_proof: Vec<Option<(SumcheckBatchProof<F>, Vec<EvalcheckProof<F>>)>>,
+	pub virtual_opening_proofs: Vec<(Proof<F>, Vec<EvalcheckProof<F>>)>,
+	pub batch_opening_proof: (Proof<F>, Vec<EvalcheckProof<F>>),
+}
+
+impl<F: Field> GreedyEvalcheckProof<F> {
+	fn isomorphic_vec<FI: Field + From<F>>(vec: Vec<EvalcheckProof<F>>) -> Vec<EvalcheckProof<FI>> {
+		vec.into_iter().map(|x| x.isomorphic()).collect()
+	}
+
+	pub fn isomorphic<FI: Field + From<F>>(self) -> GreedyEvalcheckProof<FI> {
+		GreedyEvalcheckProof {
+			initial_evalcheck_proofs: Self::isomorphic_vec(self.initial_evalcheck_proofs),
+			virtual_opening_proofs: self
+				.virtual_opening_proofs
+				.into_iter()
+				.map(|(proof, evalcheck_proof)| {
+					(proof.isomorphic(), Self::isomorphic_vec(evalcheck_proof))
+				})
+				.collect(),
+			batch_opening_proof: (
+				self.batch_opening_proof.0.isomorphic(),
+				Self::isomorphic_vec(self.batch_opening_proof.1),
+			),
+		}
+	}
 }
 
 #[derive(Debug)]

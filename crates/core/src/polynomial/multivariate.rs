@@ -1,11 +1,13 @@
 // Copyright 2023 Ulvetanna Inc.
 
-use super::{error::Error, MultilinearExtension, MultilinearPoly, MultilinearQueryRef};
-use auto_impl::auto_impl;
-use binius_field::{ExtensionField, Field, PackedField, TowerField};
+use super::error::Error;
+use binius_field::{Field, PackedField};
+use binius_hal::{MLEDirectAdapter, MultilinearPoly, MultilinearQueryRef};
+use binius_math::CompositionPoly;
 use binius_utils::bail;
-use stackalloc::stackalloc_with_default;
-use std::{borrow::Borrow, fmt::Debug, marker::PhantomData, sync::Arc};
+use itertools::Itertools;
+use rand::{rngs::StdRng, SeedableRng};
+use std::{borrow::Borrow, fmt::Debug, iter::repeat_with, marker::PhantomData, sync::Arc};
 
 /// A multivariate polynomial over a binary tower field.
 ///
@@ -25,65 +27,6 @@ pub trait MultivariatePoly<P>: Debug + Send + Sync {
 	fn binary_tower_level(&self) -> usize;
 }
 
-/// A multivariate polynomial that defines a composition of `MultilinearComposite`.
-#[auto_impl(Arc, &)]
-pub trait CompositionPoly<P>: Debug + Send + Sync
-where
-	P: PackedField,
-{
-	/// The number of variables.
-	fn n_vars(&self) -> usize;
-
-	/// Total degree of the polynomial.
-	fn degree(&self) -> usize;
-
-	/// Evaluates the polynomial using packed values, where each packed value may contain multiple scalar values.
-	/// The evaluation follows SIMD semantics, meaning that operations are performed
-	/// element-wise across corresponding scalar values in the packed values.
-	///
-	/// For example, given a polynomial represented as `query[0] + query[1]`:
-	/// - The addition operation is applied element-wise between `query[0]` and `query[1]`.
-	/// - Each scalar value in `query[0]` is added to the corresponding scalar value in `query[1]`.
-	/// - There are no operations performed between scalar values within the same packed value.
-	fn evaluate(&self, query: &[P]) -> Result<P, Error>;
-
-	/// Returns the maximum binary tower level of all constants in the arithmetic expression.
-	fn binary_tower_level(&self) -> usize;
-
-	/// Batch evaluation that admits non-strided argument layout.
-	/// `sparse_batch_query` is a slice of slice references of equal length, which furthermore should equal
-	/// the length of `evals` parameter.
-	///
-	/// Evaluation follows SIMD semantics as in `evaluate`:
-	/// - `evals[j] := composition([sparse_batch_query[i][j] forall i]) forall j`
-	/// - no crosstalk between evaluations
-	///
-	/// This method has a default implementation.
-	fn sparse_batch_evaluate(
-		&self,
-		sparse_batch_query: &[&[P]],
-		evals: &mut [P],
-	) -> Result<(), Error> {
-		let row_len = sparse_batch_query.first().map_or(0, |row| row.len());
-
-		if evals.len() != row_len || sparse_batch_query.iter().any(|row| row.len() != row_len) {
-			return Err(Error::SparseBatchEvaluateSizeMismatch);
-		}
-
-		stackalloc_with_default(sparse_batch_query.len(), |query| {
-			for (column, eval) in evals.iter_mut().enumerate() {
-				for (query_elem, sparse_batch_query_row) in query.iter_mut().zip(sparse_batch_query)
-				{
-					*query_elem = sparse_batch_query_row[column];
-				}
-
-				*eval = self.evaluate(query)?;
-			}
-			Ok(())
-		})
-	}
-}
-
 /// Identity composition function $g(X) = X$.
 #[derive(Clone, Debug)]
 pub struct IdentityCompositionPoly;
@@ -97,9 +40,9 @@ impl<P: PackedField> CompositionPoly<P> for IdentityCompositionPoly {
 		1
 	}
 
-	fn evaluate(&self, query: &[P]) -> Result<P, Error> {
+	fn evaluate(&self, query: &[P]) -> Result<P, binius_math::Error> {
 		if query.len() != 1 {
-			bail!(Error::IncorrectQuerySize { expected: 1 });
+			bail!(binius_math::Error::IncorrectQuerySize { expected: 1 });
 		}
 		Ok(query[0])
 	}
@@ -146,7 +89,7 @@ where
 		self.composition.degree()
 	}
 
-	fn evaluate(&self, query: &[F]) -> Result<F, Error> {
+	fn evaluate(&self, query: &[F]) -> Result<F, binius_math::Error> {
 		let packed_query = query.iter().cloned().map(P::set_single).collect::<Vec<_>>();
 		let packed_result = self.composition.evaluate(&packed_query)?;
 		Ok(packed_result.get(0))
@@ -225,7 +168,7 @@ where
 		let evals = self
 			.multilinears
 			.iter()
-			.map(|multilin| Ok::<P, Error>(P::set_single(multilin.evaluate(query.clone())?)))
+			.map(|multilin| Ok::<P, Error>(P::set_single(multilin.evaluate(query)?)))
 			.collect::<Result<Vec<_>, _>>()?;
 		Ok(self.composition.evaluate(&evals)?.get(0))
 	}
@@ -276,31 +219,6 @@ where
 	}
 }
 
-impl<'a, F, C> MultilinearComposite<F, C, Arc<dyn MultilinearPoly<F> + Send + Sync + 'a>>
-where
-	F: TowerField,
-	C: CompositionPoly<F>,
-{
-	pub fn from_columns<P>(
-		composition: C,
-		columns: impl IntoIterator<Item = &'a (impl AsRef<[P]> + 'a)>,
-	) -> Result<Self, Error>
-	where
-		P: PackedField,
-		F: ExtensionField<P::Scalar>,
-	{
-		let multilinears = columns
-			.into_iter()
-			.map(|v| {
-				let mle = MultilinearExtension::from_values_slice(v.as_ref())?;
-				Ok(mle.specialize_arc_dyn())
-			})
-			.collect::<Result<Vec<_>, Error>>()?;
-		let n_vars = multilinears[0].n_vars();
-		Self::new(n_vars, composition, multilinears)
-	}
-}
-
 impl<P, C, M> MultilinearComposite<P, C, M>
 where
 	P: PackedField,
@@ -314,7 +232,11 @@ where
 		let new_multilinears = self
 			.multilinears
 			.iter()
-			.map(|multilin| multilin.evaluate_partial_low(query.clone()))
+			.map(|multilin| {
+				multilin
+					.evaluate_partial_low(query)
+					.map(MLEDirectAdapter::from)
+			})
 			.collect::<Result<Vec<_>, _>>()?;
 		Ok(MultilinearComposite {
 			composition: self.composition.clone(),
@@ -322,5 +244,173 @@ where
 			multilinears: new_multilinears,
 			_marker: PhantomData,
 		})
+	}
+}
+
+/// Fingerprinting for composition polynomials done by evaluation at a deterministic random point.
+/// Outputs f(r_0,...,r_n-1) where f is a composite and the r_i are the components of the random point.
+///
+/// Probabilistic collision resistance comes from Schwartz-Zippel on the equation f(x_0,...,x_n-1) = g(x_0,...,x_n-1)
+/// for two distinct multivariate polynomials f and g.
+///
+/// NOTE: THIS IS NOT ADVERSARIALLY COLLISION RESISTANT, COLLISIONS CAN BE MANUFACTURED EASILY
+pub fn composition_hash<P: PackedField, C: CompositionPoly<P>>(composition: &C) -> P {
+	let mut rng = StdRng::from_seed([0; 32]);
+
+	let random_point = repeat_with(|| P::random(&mut rng))
+		.take(composition.n_vars())
+		.collect_vec();
+
+	composition
+		.evaluate(&random_point)
+		.expect("Failed to evaluate composition")
+}
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn test_fingerprint_same_32b() {
+		use binius_field::{BinaryField32b, PackedBinaryField8x32b};
+
+		//Complicated circuit for x0*x1
+		let circuit: Vec<crate::polynomial::Expr<BinaryField32b>> = vec![
+			crate::polynomial::Expr::Var(0),
+			crate::polynomial::Expr::Var(1),
+			crate::polynomial::Expr::Add(0, 1),
+			crate::polynomial::Expr::Mul(0, 2),
+			crate::polynomial::Expr::Mul(0, 0),
+			crate::polynomial::Expr::Add(3, 4),
+		];
+		let circuit_poly = crate::polynomial::ArithCircuitPoly::<
+			BinaryField32b,
+			PackedBinaryField8x32b,
+		>::new(circuit);
+
+		let product_composition = crate::composition::ProductComposition::<2> {};
+
+		assert_eq!(
+			crate::polynomial::composition_hash(&circuit_poly),
+			crate::polynomial::composition_hash(&product_composition)
+		);
+	}
+
+	#[test]
+	fn test_fingerprint_diff_32b() {
+		use binius_field::{BinaryField32b, PackedBinaryField8x32b};
+
+		let circuit: Vec<crate::polynomial::Expr<BinaryField32b>> = vec![
+			crate::polynomial::Expr::Var(0),
+			crate::polynomial::Expr::Var(1),
+			crate::polynomial::Expr::Add(0, 1),
+		];
+
+		let circuit_poly = crate::polynomial::ArithCircuitPoly::<
+			BinaryField32b,
+			PackedBinaryField8x32b,
+		>::new(circuit);
+
+		let product_composition = crate::composition::ProductComposition::<2> {};
+
+		assert_ne!(
+			crate::polynomial::composition_hash(&circuit_poly),
+			crate::polynomial::composition_hash(&product_composition)
+		);
+	}
+
+	#[test]
+	fn test_fingerprint_same_64b() {
+		use binius_field::{BinaryField64b, PackedBinaryField4x64b};
+
+		//Complicated circuit for x0*x1
+		let circuit: Vec<crate::polynomial::Expr<BinaryField64b>> = vec![
+			crate::polynomial::Expr::Var(0),
+			crate::polynomial::Expr::Var(1),
+			crate::polynomial::Expr::Add(0, 1),
+			crate::polynomial::Expr::Mul(0, 2),
+			crate::polynomial::Expr::Mul(0, 0),
+			crate::polynomial::Expr::Add(3, 4),
+		];
+		let circuit_poly = crate::polynomial::ArithCircuitPoly::<
+			BinaryField64b,
+			PackedBinaryField4x64b,
+		>::new(circuit);
+
+		let product_composition = crate::composition::ProductComposition::<2> {};
+
+		assert_eq!(
+			crate::polynomial::composition_hash(&circuit_poly),
+			crate::polynomial::composition_hash(&product_composition)
+		);
+	}
+
+	#[test]
+	fn test_fingerprint_diff_64b() {
+		use binius_field::{BinaryField64b, PackedBinaryField4x64b};
+
+		let circuit: Vec<crate::polynomial::Expr<BinaryField64b>> = vec![
+			crate::polynomial::Expr::Var(0),
+			crate::polynomial::Expr::Var(1),
+			crate::polynomial::Expr::Add(0, 1),
+		];
+
+		let circuit_poly = crate::polynomial::ArithCircuitPoly::<
+			BinaryField64b,
+			PackedBinaryField4x64b,
+		>::new(circuit);
+
+		let product_composition = crate::composition::ProductComposition::<2> {};
+
+		assert_ne!(
+			crate::polynomial::composition_hash(&circuit_poly),
+			crate::polynomial::composition_hash(&product_composition)
+		);
+	}
+
+	#[test]
+	fn test_fingerprint_same_128b() {
+		use binius_field::{BinaryField128b, PackedBinaryField2x128b};
+
+		//Complicated circuit for x0*x1
+		let circuit: Vec<crate::polynomial::Expr<BinaryField128b>> = vec![
+			crate::polynomial::Expr::Var(0),
+			crate::polynomial::Expr::Var(1),
+			crate::polynomial::Expr::Add(0, 1),
+			crate::polynomial::Expr::Mul(0, 2),
+			crate::polynomial::Expr::Mul(0, 0),
+			crate::polynomial::Expr::Add(3, 4),
+		];
+		let circuit_poly = crate::polynomial::ArithCircuitPoly::<
+			BinaryField128b,
+			PackedBinaryField2x128b,
+		>::new(circuit);
+
+		let product_composition = crate::composition::ProductComposition::<2> {};
+
+		assert_eq!(
+			crate::polynomial::composition_hash(&circuit_poly),
+			crate::polynomial::composition_hash(&product_composition)
+		);
+	}
+
+	#[test]
+	fn test_fingerprint_diff_128b() {
+		use binius_field::{BinaryField128b, PackedBinaryField2x128b};
+
+		let circuit: Vec<crate::polynomial::Expr<BinaryField128b>> = vec![
+			crate::polynomial::Expr::Var(0),
+			crate::polynomial::Expr::Var(1),
+			crate::polynomial::Expr::Add(0, 1),
+		];
+		let circuit_poly = crate::polynomial::ArithCircuitPoly::<
+			BinaryField128b,
+			PackedBinaryField2x128b,
+		>::new(circuit);
+
+		let product_composition = crate::composition::ProductComposition::<2> {};
+
+		assert_ne!(
+			crate::polynomial::composition_hash(&circuit_poly),
+			crate::polynomial::composition_hash(&product_composition)
+		);
 	}
 }

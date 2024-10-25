@@ -2,7 +2,6 @@
 
 use crate::{
 	oracle::MultilinearOracleSet,
-	polynomial::MultilinearExtension,
 	protocols::lasso::{prove, verify, LassoBatches, LassoClaim, LassoWitness},
 	witness::MultilinearExtensionIndex,
 };
@@ -10,7 +9,7 @@ use binius_field::{
 	as_packed_field::PackedType, underlier::WithUnderlier, BinaryField128b, BinaryField16b,
 	BinaryField64b, Field, PackedBinaryField128x1b, PackedFieldIndexable, TowerField,
 };
-use binius_hal::make_portable_backend;
+use binius_hal::MultilinearExtension;
 
 #[test]
 fn test_prove_verify_interaction() {
@@ -20,8 +19,6 @@ fn test_prove_verify_interaction() {
 	type U = <PackedBinaryField128x1b as WithUnderlier>::Underlier;
 
 	let n_vars = 10;
-
-	let backend = make_portable_backend();
 
 	// Setup witness
 
@@ -90,7 +87,7 @@ fn test_prove_verify_interaction() {
 
 	let alpha = F::ONE;
 
-	let prove_output = prove::<C, U, F, F, _, _>(
+	let prove_output = prove::<C, U, F, _>(
 		&mut oracles.clone(),
 		witness_index,
 		&claim,
@@ -98,19 +95,17 @@ fn test_prove_verify_interaction() {
 		&lasso_batches,
 		gamma,
 		alpha,
-		backend.clone(),
 	)
 	.unwrap();
 
 	// // VERIFIER
-	let _verified_reduced_claim = verify::<C, _, _>(
+	let _verified_reduced_claim = verify::<C, _>(
 		&mut oracles.clone(),
 		&claim,
 		&lasso_batches,
 		gamma,
 		alpha,
 		prove_output.lasso_proof,
-		backend.clone(),
 	)
 	.unwrap();
 }

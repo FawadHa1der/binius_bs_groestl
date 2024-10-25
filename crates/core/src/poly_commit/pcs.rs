@@ -1,11 +1,8 @@
 // Copyright 2023 Ulvetanna Inc.
 
-use crate::{
-	challenger::{CanObserve, CanSample, CanSampleBits},
-	polynomial::MultilinearExtension,
-};
+use crate::challenger::{CanObserve, CanSample, CanSampleBits};
 use binius_field::{ExtensionField, PackedField};
-use binius_hal::ComputationBackend;
+use binius_hal::{ComputationBackend, MultilinearExtension};
 use std::ops::Deref;
 
 pub trait PolyCommitScheme<P, FE>
@@ -36,7 +33,7 @@ where
 		committed: &Self::Committed,
 		polys: &[MultilinearExtension<P, Data>],
 		query: &[FE],
-		backend: Backend,
+		backend: &Backend,
 	) -> Result<Self::Proof, Self::Error>
 	where
 		Data: Deref<Target = [P]> + Send + Sync,
@@ -51,7 +48,7 @@ where
 		query: &[FE],
 		proof: Self::Proof,
 		values: &[FE],
-		backend: Backend,
+		backend: &Backend,
 	) -> Result<(), Self::Error>
 	where
 		CH: CanObserve<FE> + CanObserve<Self::Commitment> + CanSample<FE> + CanSampleBits<usize>,

@@ -6,15 +6,12 @@
 /// The example performs the computation, generates a proof and verifies it.
 use anyhow::Result;
 use binius_core::{
-	challenger::new_hasher_challenger,
-	composition::{empty_mix_composition, index_composition},
-	oracle::{BatchId, CompositePolyOracle, MultilinearOracleSet, OracleId, ShiftVariant},
+	challenger::{new_hasher_challenger, IsomorphicChallenger},
+	oracle::{BatchId, ConstraintSetBuilder, MultilinearOracleSet, OracleId, ShiftVariant},
 	poly_commit::{tensor_pcs, PolyCommitScheme},
-	polynomial::{CompositionPoly, MultilinearComposite},
 	protocols::{
-		abstract_sumcheck::standard_switchover_heuristic,
 		greedy_evalcheck::{self, GreedyEvalcheckProof, GreedyEvalcheckProveOutput},
-		zerocheck::{self, ZerocheckBatchProof, ZerocheckBatchProveOutput, ZerocheckClaim},
+		sumcheck::{self, standard_switchover_heuristic, Proof as ZerocheckProof},
 	},
 	transparent::step_down::StepDown,
 	witness::MultilinearExtensionIndex,
@@ -45,6 +42,7 @@ mod field_types {
 	pub type Field = binius_field::AESTowerField128b;
 	pub type DomainField = binius_field::AESTowerField8b;
 	pub type DomainFieldWithStep = binius_field::AESTowerField8b;
+	pub type FBase = binius_field::AESTowerField8b;
 }
 
 #[cfg(not(feature = "aes-tower"))]
@@ -52,6 +50,7 @@ mod field_types {
 	pub type Field = binius_field::BinaryField128bPolyval;
 	pub type DomainField = binius_field::BinaryField128bPolyval;
 	pub type DomainFieldWithStep = binius_field::BinaryField128b;
+	pub type FBase = binius_field::BinaryField128bPolyval;
 }
 
 // The fields must be in exactly the same order as the fields in U32FibOracle.
@@ -201,14 +200,10 @@ impl U32FibOracle {
 		}
 	}
 
-	pub fn mixed_constraints<P: PackedField<Scalar: TowerField>>(
-		&self,
-		challenge: P::Scalar,
-	) -> Result<impl CompositionPoly<P> + Clone> {
-		let all_columns = &self.iter_oracles().collect::<Vec<_>>();
-		let mix = empty_mix_composition(all_columns.len(), challenge);
-		let mix = mix.include([index_composition(
-			all_columns,
+	pub fn mixed_constraints<P: PackedField<Scalar: TowerField>>(&self) -> ConstraintSetBuilder<P> {
+		let mut builder = ConstraintSetBuilder::new();
+
+		builder.add_zerocheck(
 			[
 				self.fib_prev2,
 				self.fib_prev1,
@@ -217,36 +212,24 @@ impl U32FibOracle {
 				self.disabled,
 			],
 			composition_poly!([x, y, cin, z, disabled] = (1 - disabled) * (x + y + cin - z)),
-		)?])?;
-		let mix = mix.include([index_composition(
-			all_columns,
+		);
+		builder.add_zerocheck(
 			[self.fib_prev2, self.fib_prev1, self.c_in, self.c_out],
 			composition_poly!([x, y, cin, cout] = (x + cin) * (y + cin) + cin - cout),
-		)?])?;
-		Ok(mix)
+		);
+
+		builder
 	}
 }
 
-fn constrained_oracles(oracle: &U32FibOracle) -> impl Iterator<Item = OracleId> {
-	vec![
-		oracle.fib_out,
-		oracle.fib_prev1,
-		oracle.fib_prev2,
-		oracle.c_out,
-		oracle.c_in,
-		oracle.disabled,
-	]
-	.into_iter()
-}
-
 /// Joins U32FibOracle and U32FibTrace in a MultilinearExtensionIndex.
-fn to_index<'a, U, FW>(
+fn to_index<'a, U, F>(
 	oracle: &'a U32FibOracle,
 	trace: &'a U32FibTrace<U>,
-) -> MultilinearExtensionIndex<'a, U, FW>
+) -> MultilinearExtensionIndex<'a, U, F>
 where
-	U: PackScalar<BinaryField1b> + PackScalar<FW> + UnderlierType + Pod,
-	FW: TowerField + ExtensionField<BinaryField1b>,
+	U: PackScalar<BinaryField1b> + PackScalar<F> + UnderlierType + Pod,
+	F: TowerField + ExtensionField<BinaryField1b>,
 {
 	let oracle_id_and_data = oracle.iter_oracles().zip_eq(trace.borrowed_data());
 	MultilinearExtensionIndex::new()
@@ -256,27 +239,37 @@ where
 
 #[instrument(skip_all, level = "debug")]
 #[allow(clippy::too_many_arguments)]
-fn prove<U, F, FW, DomainField, PCS, CH, Backend>(
+fn prove<U, F, FBase, DomainField, FEPCS, PCS, CH, Backend>(
 	log_size: usize,
 	oracles: &mut MultilinearOracleSet<F>,
 	pcs: &PCS,
 	oracle: &U32FibOracle,
 	mut challenger: CH,
-	mut witness: MultilinearExtensionIndex<U, FW>,
+	mut witness: MultilinearExtensionIndex<U, F>,
 	domain_factory: impl EvaluationDomainFactory<DomainField>,
 	backend: Backend,
 ) -> Result<Proof<F, PCS::Commitment, PCS::Proof>>
 where
-	U: UnderlierType + PackScalar<BinaryField1b> + PackScalar<FW> + PackScalar<DomainField>,
-	F: TowerField + From<FW>,
-	FW: TowerField
-		+ From<F>
+	U: UnderlierType
+		+ PackScalar<BinaryField1b>
+		+ PackScalar<F>
+		+ PackScalar<DomainField>
+		+ PackScalar<FBase>,
+	FEPCS: TowerField + From<F>,
+	FBase: TowerField + ExtensionField<DomainField>,
+	F: TowerField
+		+ From<FEPCS>
+		+ ExtensionField<FBase>
 		+ ExtensionField<DomainField>
-		+ PackedExtension<DomainField, Scalar = FW>,
-	PackedType<U, FW>: PackedFieldIndexable<Scalar = FW>,
+		+ PackedExtension<DomainField, Scalar = F>,
+	PackedType<U, F>: PackedFieldIndexable<Scalar = F>,
 	DomainField: TowerField,
-	PCS: PolyCommitScheme<PackedType<U, BinaryField1b>, F, Error: Debug, Proof: 'static>,
-	CH: CanObserve<F> + CanObserve<PCS::Commitment> + CanSample<F> + CanSampleBits<usize> + Clone,
+	PCS: PolyCommitScheme<PackedType<U, BinaryField1b>, FEPCS, Error: Debug, Proof: 'static>,
+	CH: CanObserve<FEPCS>
+		+ CanObserve<PCS::Commitment>
+		+ CanSample<FEPCS>
+		+ CanSampleBits<usize>
+		+ Clone,
 	Backend: ComputationBackend,
 {
 	assert_eq!(pcs.n_vars(), log_size);
@@ -288,56 +281,52 @@ where
 	let (trace_comm, trace_committed) = pcs.commit(&trace_commit_polys)?;
 	challenger.observe(trace_comm.clone());
 
-	// Zerocheck mixing
-	let mixing_challenge = challenger.sample();
+	// Zerocheck
+	let mut iso_challenger = IsomorphicChallenger::<_, _, F>::new(&mut challenger);
 
-	let mix_composition_verifier = oracle.mixed_constraints(mixing_challenge)?;
-	let mix_composition_prover = oracle.mixed_constraints(FW::from(mixing_challenge))?;
+	let zerocheck_challenges = iso_challenger.sample_vec(log_size);
 
-	let zerocheck_column_oracles = oracle.iter_oracles().map(|id| oracles.oracle(id)).collect();
-	let zerocheck_claim = ZerocheckClaim {
-		poly: CompositePolyOracle::new(
-			log_size,
-			zerocheck_column_oracles,
-			mix_composition_verifier,
-		)?,
-	};
-
-	let zerocheck_witness = MultilinearComposite::new(
-		log_size,
-		mix_composition_prover,
-		constrained_oracles(oracle)
-			.map(|oracle_id| witness.get_multilin_poly(oracle_id))
-			.collect::<Result<_, _>>()?,
-	)?;
-
-	// zerocheck::prove is instrumented
 	let switchover_fn = standard_switchover_heuristic(-2);
 
-	let ZerocheckBatchProveOutput {
-		evalcheck_claims,
-		proof: zerocheck_proof,
-	} = zerocheck::batch_prove(
-		[(zerocheck_claim, zerocheck_witness)],
+	let constraint_set = oracle.mixed_constraints().build_one(oracles)?;
+	let constraint_set_base = oracle.mixed_constraints().build_one(oracles)?;
+
+	let (zerocheck_claim, meta) = sumcheck::constraint_set_zerocheck_claim(constraint_set.clone())?;
+
+	let prover = sumcheck::prove::constraint_set_zerocheck_prover::<_, FBase, _, _, _>(
+		constraint_set_base,
+		constraint_set,
+		&witness,
 		domain_factory.clone(),
 		switchover_fn,
-		mixing_challenge,
-		&mut challenger,
-		backend.clone(),
+		zerocheck_challenges.as_slice(),
+		&backend,
 	)?;
+
+	let (sumcheck_output, zerocheck_proof) =
+		sumcheck::prove::batch_prove(vec![prover], &mut iso_challenger)?;
+
+	let zerocheck_output = sumcheck::zerocheck::verify_sumcheck_outputs(
+		&[zerocheck_claim],
+		&zerocheck_challenges,
+		sumcheck_output,
+	)?;
+
+	let evalcheck_multilinear_claims =
+		sumcheck::make_eval_claims(oracles, [meta], zerocheck_output)?;
 
 	// Prove evaluation claims
 	let GreedyEvalcheckProveOutput {
 		same_query_claims,
 		proof: evalcheck_proof,
-	} = greedy_evalcheck::prove::<_, PackedType<U, FW>, DomainField, _, _>(
+	} = greedy_evalcheck::prove::<U, F, _, _, _>(
 		oracles,
 		&mut witness,
-		evalcheck_claims,
+		evalcheck_multilinear_claims,
 		switchover_fn,
-		&mut challenger,
+		&mut iso_challenger,
 		domain_factory,
-		backend.clone(),
+		&backend,
 	)?;
 
 	assert_eq!(same_query_claims.len(), 1);
@@ -353,12 +342,17 @@ where
 		.collect::<Result<Vec<_>, _>>()?;
 
 	// Prove commitment openings
+	let eval_point: Vec<FEPCS> = same_query_claim
+		.eval_point
+		.into_iter()
+		.map(|x| x.into())
+		.collect();
 	let trace_open_proof = pcs.prove_evaluation(
 		&mut challenger,
 		&trace_committed,
 		&trace_commit_polys,
-		&same_query_claim.eval_point,
-		backend,
+		&eval_point,
+		&backend,
 	)?;
 
 	Ok(Proof {
@@ -371,9 +365,20 @@ where
 
 struct Proof<F: Field, PCSComm, PCSProof> {
 	trace_comm: PCSComm,
-	zerocheck_proof: ZerocheckBatchProof<F>,
+	zerocheck_proof: ZerocheckProof<F>,
 	evalcheck_proof: GreedyEvalcheckProof<F>,
 	trace_open_proof: PCSProof,
+}
+
+impl<F: Field, PCSComm, PCSProof> Proof<F, PCSComm, PCSProof> {
+	fn isomorphic<F2: Field + From<F>>(self) -> Proof<F2, PCSComm, PCSProof> {
+		Proof {
+			trace_comm: self.trace_comm,
+			zerocheck_proof: self.zerocheck_proof.isomorphic(),
+			evalcheck_proof: self.evalcheck_proof.isomorphic(),
+			trace_open_proof: self.trace_open_proof,
+		}
+	}
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -388,7 +393,7 @@ fn verify<P, F, PCS, CH, Backend>(
 	backend: Backend,
 ) -> Result<()>
 where
-	P: PackedField<Scalar = BinaryField1b> + Pod,
+	P: PackedField<Scalar = BinaryField1b>,
 	F: TowerField,
 	PCS: PolyCommitScheme<P, F, Error: Debug, Proof: 'static>,
 	CH: CanObserve<F> + CanObserve<PCS::Commitment> + CanSample<F> + CanSampleBits<usize>,
@@ -404,22 +409,35 @@ where
 	// Round 1
 	challenger.observe(trace_comm.clone());
 
-	// Zerocheck mixing
-	let mixing_challenge = challenger.sample();
-	let mix_composition = oracle.mixed_constraints(mixing_challenge)?;
-
 	// Zerocheck
-	let zerocheck_column_oracles = oracle.iter_oracles().map(|id| oracles.oracle(id)).collect();
-	let zerocheck_claim = ZerocheckClaim {
-		poly: CompositePolyOracle::new(log_size, zerocheck_column_oracles, mix_composition)?,
-	};
+	let zerocheck_challenges = challenger.sample_vec(log_size);
 
-	let evalcheck_claims =
-		zerocheck::batch_verify([zerocheck_claim], zerocheck_proof, &mut challenger)?;
+	let constraint_set = oracle.mixed_constraints::<F>().build_one(oracles)?;
+
+	let (zerocheck_claim, meta) = sumcheck::constraint_set_zerocheck_claim(constraint_set)?;
+	let zerocheck_claims = [zerocheck_claim];
+
+	let sumcheck_claims = sumcheck::zerocheck::reduce_to_sumchecks(&zerocheck_claims)?;
+
+	let sumcheck_output =
+		sumcheck::batch_verify(&sumcheck_claims, zerocheck_proof, &mut challenger)?;
+
+	let zerocheck_output = sumcheck::zerocheck::verify_sumcheck_outputs(
+		&zerocheck_claims,
+		&zerocheck_challenges,
+		sumcheck_output,
+	)?;
+
+	let evalcheck_multilinear_claims =
+		sumcheck::make_eval_claims(oracles, [meta], zerocheck_output)?;
 
 	// Evalcheck
-	let same_query_claims =
-		greedy_evalcheck::verify(oracles, evalcheck_claims, evalcheck_proof, &mut challenger)?;
+	let same_query_claims = greedy_evalcheck::verify(
+		oracles,
+		evalcheck_multilinear_claims,
+		evalcheck_proof,
+		&mut challenger,
+	)?;
 
 	assert_eq!(same_query_claims.len(), 1);
 	let (batch_id, same_query_claim) = same_query_claims
@@ -434,7 +452,7 @@ where
 		&same_query_claim.eval_point,
 		trace_open_proof,
 		&same_query_claim.evals,
-		backend,
+		&backend,
 	)?;
 
 	Ok(())
@@ -447,7 +465,7 @@ fn main() {
 		.as_ref()
 		.expect("failed to init thread pool");
 
-	init_tracing().expect("failed to initialize tracing");
+	let _guard = init_tracing().expect("failed to initialize tracing");
 	let backend = make_portable_backend();
 
 	// Note that values below 14 are rejected by `find_proof_size_optimal_pcs()`.
@@ -455,7 +473,7 @@ fn main() {
 	let log_inv_rate = 1;
 
 	type U = <PackedBinaryField128x1b as WithUnderlier>::Underlier;
-	type FW = field_types::Field;
+	type F = field_types::Field;
 
 	debug!(num_bits = 1 << log_size, num_u32s = 1 << (log_size - 5), "U32 Fibonacci");
 
@@ -468,29 +486,50 @@ fn main() {
 	>(SECURITY_BITS, log_size, 2, log_inv_rate, false)
 	.unwrap();
 
-	let mut oracles = MultilinearOracleSet::new();
-	let oracle = U32FibOracle::new(&mut oracles, log_size);
+	let mut prover_oracles = MultilinearOracleSet::new();
+	let prover_oracle = U32FibOracle::new::<field_types::Field>(&mut prover_oracles, log_size);
+
 	let challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 	let witness = U32FibTrace::<U>::new(log_size).fill_trace();
-	let witness = to_index::<U, FW>(&oracle, &witness);
+	let witness = to_index::<U, F>(&prover_oracle, &witness);
 
 	let domain_factory =
 		IsomorphicEvaluationDomainFactory::<field_types::DomainFieldWithStep>::default();
 
 	info!("Proving");
-	let proof = prove::<_, _, field_types::Field, field_types::DomainField, _, _, _>(
+	let proof = prove::<
+		_,
+		field_types::Field,
+		field_types::FBase,
+		field_types::DomainField,
+		BinaryField128b,
+		_,
+		_,
+		_,
+	>(
 		log_size,
-		&mut oracles,
+		&mut prover_oracles,
 		&pcs,
-		&oracle,
+		&prover_oracle,
 		challenger.clone(),
 		witness,
 		domain_factory,
-		backend.clone(),
+		&backend,
 	)
 	.unwrap();
 
+	let mut verifier_oracles = MultilinearOracleSet::new();
+	let verifier_oracle = U32FibOracle::new::<BinaryField128b>(&mut verifier_oracles, log_size);
+
 	info!("Verifying");
-	verify(log_size, &mut oracles.clone(), &oracle, &pcs, challenger.clone(), proof, backend)
-		.unwrap();
+	verify(
+		log_size,
+		&mut verifier_oracles,
+		&verifier_oracle,
+		&pcs,
+		challenger.clone(),
+		proof.isomorphic(),
+		backend,
+	)
+	.unwrap();
 }

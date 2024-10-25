@@ -1,6 +1,6 @@
 // Copyright 2024 Ulvetanna Inc.
-use crate::polynomial::{CompositionPoly, Error};
 use binius_field::{ExtensionField, PackedField, TowerField};
+use binius_math::CompositionPoly;
 use binius_utils::thread_local_mut::ThreadLocalMut;
 use std::sync::Arc;
 
@@ -31,6 +31,7 @@ pub struct ArithCircuitPoly<F: TowerField, P: PackedField<Scalar: ExtensionField
 	exprs: Arc<[Expr<F>]>,
 	/// This is used internally to avoid allocations every time an evaluation happens
 	evals: ThreadLocalMut<Box<[P]>>,
+	batch_evals: ThreadLocalMut<Box<[Vec<P>]>>,
 	degree: usize,
 	n_vars: usize,
 }
@@ -78,6 +79,7 @@ impl<F: TowerField, P: PackedField<Scalar: ExtensionField<F>>> ArithCircuitPoly<
 			degree,
 			n_vars,
 			evals: Default::default(),
+			batch_evals: Default::default(),
 		}
 	}
 }
@@ -85,9 +87,9 @@ impl<F: TowerField, P: PackedField<Scalar: ExtensionField<F>>> ArithCircuitPoly<
 impl<F: TowerField, P: PackedField<Scalar: ExtensionField<F>>> CompositionPoly<P>
 	for ArithCircuitPoly<F, P>
 {
-	fn evaluate(&self, query: &[P]) -> Result<P, Error> {
+	fn evaluate(&self, query: &[P]) -> Result<P, binius_math::Error> {
 		if query.len() != self.n_vars {
-			return Err(Error::IncorrectQuerySize {
+			return Err(binius_math::Error::IncorrectQuerySize {
 				expected: self.n_vars,
 			});
 		}
@@ -120,6 +122,66 @@ impl<F: TowerField, P: PackedField<Scalar: ExtensionField<F>>> CompositionPoly<P
 	fn binary_tower_level(&self) -> usize {
 		F::TOWER_LEVEL
 	}
+
+	fn sparse_batch_evaluate(
+		&self,
+		batch_query: &[&[P]],
+		evals: &mut [P],
+	) -> Result<(), binius_math::Error> {
+		let row_len = batch_query.first().map_or(0, |row| row.len());
+		if evals.len() != row_len || batch_query.iter().any(|row| row.len() != row_len) {
+			return Err(binius_math::Error::SparseBatchEvaluateSizeMismatch);
+		}
+		self.batch_evals.with_mut(
+			|| vec![vec![P::zero(); row_len]; self.exprs.len()].into_boxed_slice(),
+			|batch_evals| unsafe {
+				for (i, expr) in self.exprs.iter().enumerate() {
+					let batch_eval = batch_evals.get_unchecked_mut(i);
+					batch_eval.resize(row_len, P::zero());
+					match expr {
+						Expr::Const(value) => {
+							let value = P::broadcast((*value).into());
+							batch_eval.iter_mut().for_each(|eval| *eval = value);
+						}
+						Expr::Var(index) => {
+							batch_eval
+								.iter_mut()
+								.zip(batch_query.get_unchecked(*index).iter().copied())
+								.for_each(|(eval, var)| {
+									*eval = var;
+								});
+						}
+						Expr::Add(x, y) => {
+							let [batch_eval, x, y] =
+								batch_evals.get_many_unchecked_mut([i, *x, *y]);
+							batch_eval.iter_mut().zip(x).zip(y).for_each(
+								|((eval, &mut x), &mut y)| {
+									*eval = x + y;
+								},
+							);
+						}
+						Expr::Mul(x, y) => {
+							let [batch_eval, x, y] =
+								batch_evals.get_many_unchecked_mut([i, *x, *y]);
+							batch_eval.iter_mut().zip(x).zip(y).for_each(
+								|((eval, &mut x), &mut y)| {
+									*eval = x * y;
+								},
+							);
+						}
+						Expr::Pow(x, exp) => {
+							let [batch_eval, x] = batch_evals.get_many_unchecked_mut([i, *x]);
+							batch_eval.iter_mut().zip(x).for_each(|(eval, &mut x)| {
+								*eval = pow(x, *exp);
+							});
+						}
+					}
+				}
+				evals.copy_from_slice(batch_evals.get_unchecked(self.exprs.len() - 1));
+			},
+		);
+		Ok(())
+	}
 }
 
 fn pow<P: PackedField>(value: P, exp: u64) -> P {
@@ -136,19 +198,20 @@ fn pow<P: PackedField>(value: P, exp: u64) -> P {
 #[cfg(test)]
 mod tests {
 	use super::{ArithCircuitPoly, Expr};
-	use crate::polynomial::{test_utils::macros::felts, CompositionPoly};
 	use binius_field::{
 		BinaryField128b, BinaryField16b, BinaryField1b, BinaryField8b, ExtensionField,
 		PackedBinaryField128x1b, PackedBinaryField1x128b, PackedBinaryField8x16b, PackedField,
 		TowerField,
 	};
+	use binius_math::CompositionPoly;
+	use binius_utils::felts;
 
 	#[test]
 	fn test_const() {
 		fn assert_valid_const_circuit<F: TowerField, P: PackedField<Scalar: ExtensionField<F>>>(
 			value: F,
 		) {
-			let circuit: ArithCircuitPoly<F, P> = ArithCircuitPoly::new(vec![Expr::Const(value)]);
+			let circuit = ArithCircuitPoly::<F, P>::new(vec![Expr::Const(value)]);
 			assert_eq!(circuit.binary_tower_level(), F::TOWER_LEVEL);
 			assert_eq!(circuit.degree(), 0);
 			assert_eq!(circuit.n_vars(), 0);
@@ -167,7 +230,7 @@ mod tests {
 	fn test_var() {
 		type F = BinaryField8b;
 		type P = PackedBinaryField8x16b;
-		let circuit: ArithCircuitPoly<F, P> = ArithCircuitPoly::new(vec![Expr::Var(0)]);
+		let circuit = ArithCircuitPoly::<F, P>::new(vec![Expr::Var(0)]);
 		assert_eq!(circuit.binary_tower_level(), F::TOWER_LEVEL);
 		assert_eq!(circuit.degree(), 1);
 		assert_eq!(circuit.n_vars(), 1);
@@ -185,8 +248,12 @@ mod tests {
 	fn test_add() {
 		type F = BinaryField8b;
 		type P = PackedBinaryField8x16b;
-		let circuit: ArithCircuitPoly<F, P> =
-			ArithCircuitPoly::new(vec![Expr::Const(F::new(123)), Expr::Var(0), Expr::Add(0, 1)]);
+		// 123 + x0
+		let circuit = ArithCircuitPoly::<F, P>::new(vec![
+			Expr::Const(F::new(123)),
+			Expr::Var(0),
+			Expr::Add(0, 1),
+		]);
 		assert_eq!(circuit.binary_tower_level(), F::TOWER_LEVEL);
 		assert_eq!(circuit.degree(), 1);
 		assert_eq!(circuit.n_vars(), 1);
@@ -204,8 +271,12 @@ mod tests {
 	fn test_mul() {
 		type F = BinaryField8b;
 		type P = PackedBinaryField8x16b;
-		let circuit: ArithCircuitPoly<F, P> =
-			ArithCircuitPoly::new(vec![Expr::Const(F::new(123)), Expr::Var(0), Expr::Mul(0, 1)]);
+		// 123 * x0
+		let circuit = ArithCircuitPoly::<F, P>::new(vec![
+			Expr::Const(F::new(123)),
+			Expr::Var(0),
+			Expr::Mul(0, 1),
+		]);
 		assert_eq!(circuit.binary_tower_level(), F::TOWER_LEVEL);
 		assert_eq!(circuit.degree(), 1);
 		assert_eq!(circuit.n_vars(), 1);
@@ -223,8 +294,8 @@ mod tests {
 	fn test_pow() {
 		type F = BinaryField8b;
 		type P = PackedBinaryField8x16b;
-		let circuit: ArithCircuitPoly<F, P> =
-			ArithCircuitPoly::new(vec![Expr::Var(0), Expr::Pow(0, 13)]);
+		// x0^13
+		let circuit = ArithCircuitPoly::<F, P>::new(vec![Expr::Var(0), Expr::Pow(0, 13)]);
 		assert_eq!(circuit.binary_tower_level(), F::TOWER_LEVEL);
 		assert_eq!(circuit.degree(), 13);
 		assert_eq!(circuit.n_vars(), 1);
@@ -242,7 +313,9 @@ mod tests {
 	fn test_mixed() {
 		type F = BinaryField8b;
 		type P = PackedBinaryField8x16b;
-		let circuit: ArithCircuitPoly<F, P> = ArithCircuitPoly::new(vec![
+
+		// x0^2 * (x1 + 123)
+		let circuit = ArithCircuitPoly::<F, P>::new(vec![
 			Expr::Var(0),
 			Expr::Var(1),
 			Expr::Const(F::new(123)),
@@ -263,5 +336,50 @@ mod tests {
 				.unwrap(),
 			P::from_scalars(felts!(BinaryField16b[0, 30, 59, 36, 151, 140, 170, 176]))
 		);
+	}
+
+	#[test]
+	fn test_mixed_batched() {
+		type F = BinaryField8b;
+		type P = PackedBinaryField8x16b;
+
+		// x0^2 * (x1 + 123)
+		let circuit = ArithCircuitPoly::<F, P>::new(vec![
+			Expr::Var(0),
+			Expr::Var(1),
+			Expr::Const(F::new(123)),
+			Expr::Pow(0, 2),
+			Expr::Add(1, 2),
+			Expr::Mul(3, 4),
+		]);
+
+		let query1 = &[
+			P::from_scalars(felts!(BinaryField16b[0, 0, 0, 0, 0, 0, 0, 0])),
+			P::from_scalars(felts!(BinaryField16b[0, 0, 0, 0, 0, 0, 0, 0])),
+		];
+		let query2 = &[
+			P::from_scalars(felts!(BinaryField16b[1, 1, 1, 1, 1, 1, 1, 1])),
+			P::from_scalars(felts!(BinaryField16b[0, 1, 2, 3, 4, 5, 6, 7])),
+		];
+		let query3 = &[
+			P::from_scalars(felts!(BinaryField16b[0, 1, 2, 3, 4, 5, 6, 7])),
+			P::from_scalars(felts!(BinaryField16b[100, 101, 102, 103, 104, 105, 106, 107])),
+		];
+		let expected1 = P::from_scalars(felts!(BinaryField16b[0, 0, 0, 0, 0, 0, 0, 0]));
+		let expected2 =
+			P::from_scalars(felts!(BinaryField16b[123, 122, 121, 120, 127, 126, 125, 124]));
+		let expected3 = P::from_scalars(felts!(BinaryField16b[0, 30, 59, 36, 151, 140, 170, 176]));
+
+		let mut batch_result = vec![P::zero(); 3];
+		circuit
+			.sparse_batch_evaluate(
+				&[
+					&[query1[0], query2[0], query3[0]],
+					&[query1[1], query2[1], query3[1]],
+				],
+				&mut batch_result,
+			)
+			.unwrap();
+		assert_eq!(batch_result, vec![expected1, expected2, expected3]);
 	}
 }

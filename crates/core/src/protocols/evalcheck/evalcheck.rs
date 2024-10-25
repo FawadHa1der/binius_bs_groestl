@@ -1,24 +1,10 @@
 // Copyright 2023 Ulvetanna Inc.
 
 use super::error::Error;
-use crate::oracle::{
-	BatchId, CommittedBatch, CommittedId, CompositePolyOracle, MultilinearPolyOracle,
-};
+use crate::oracle::{BatchId, CommittedBatch, CommittedId, MultilinearPolyOracle};
 use binius_field::Field;
 use binius_utils::bail;
 use tracing::instrument;
-
-#[derive(Debug, Clone)]
-pub struct EvalcheckClaim<F: Field> {
-	/// Virtual Polynomial Oracle for which the evaluation is claimed
-	pub poly: CompositePolyOracle<F>,
-	/// Evaluation Point
-	pub eval_point: Vec<F>,
-	/// Claimed Evaluation
-	pub eval: F,
-	/// Whether the evaluation point is random
-	pub is_random_point: bool,
-}
 
 #[derive(Debug, Clone)]
 pub struct EvalcheckMultilinearClaim<F: Field> {
@@ -55,6 +41,51 @@ pub enum EvalcheckProof<F: Field> {
 		subproofs: Vec<(F, EvalcheckProof<F>)>,
 	},
 	ZeroPadded(F, Box<EvalcheckProof<F>>),
+}
+
+impl<F: Field> EvalcheckProof<F> {
+	pub fn isomorphic<FI: Field + From<F>>(self) -> EvalcheckProof<FI> {
+		match self {
+			EvalcheckProof::Transparent => EvalcheckProof::Transparent,
+			EvalcheckProof::Committed => EvalcheckProof::Committed,
+			EvalcheckProof::Shifted => EvalcheckProof::Shifted,
+			EvalcheckProof::Packed => EvalcheckProof::Packed,
+			EvalcheckProof::Repeating(proof) => {
+				EvalcheckProof::Repeating(Box::new(proof.isomorphic()))
+			}
+			EvalcheckProof::Interleaved {
+				eval1,
+				eval2,
+				subproof1,
+				subproof2,
+			} => EvalcheckProof::Interleaved {
+				eval1: eval1.into(),
+				eval2: eval2.into(),
+				subproof1: Box::new(subproof1.isomorphic()),
+				subproof2: Box::new(subproof2.isomorphic()),
+			},
+			EvalcheckProof::Merged {
+				eval1,
+				eval2,
+				subproof1,
+				subproof2,
+			} => EvalcheckProof::Merged {
+				eval1: eval1.into(),
+				eval2: eval2.into(),
+				subproof1: Box::new(subproof1.isomorphic()),
+				subproof2: Box::new(subproof2.isomorphic()),
+			},
+			EvalcheckProof::Composite { subproofs } => EvalcheckProof::Composite {
+				subproofs: subproofs
+					.into_iter()
+					.map(|(eval, proof)| (eval.into(), proof.isomorphic()))
+					.collect::<Vec<_>>(),
+			},
+			EvalcheckProof::ZeroPadded(eval, proof) => {
+				EvalcheckProof::ZeroPadded(eval.into(), Box::new(proof.isomorphic()))
+			}
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq)]

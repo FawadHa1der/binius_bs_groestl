@@ -12,7 +12,7 @@ binius_hal = { path = "../crates/hal" }
 binius_hash = { path = "../crates/hash" }
 binius_macros = { path = "../crates/macros" }
 binius_math = { path = "../crates/math" }
-binius_utils = { path = "../crates/utils" }
+binius_utils = { path = "../crates/utils", features = ["tracing"] }
 bytemuck.workspace = true
 bytesize.workspace =  true
 itertools.workspace = true
@@ -38,10 +38,6 @@ path = "groestl.rs"
 [[example]]
 name = "keccakf"
 path = "keccakf.rs"
-
-[[example]]
-name = "keccakf_v2"
-path = "keccakf_v2.rs"
 
 [[example]]
 name = "lasso"
@@ -72,5 +68,4 @@ needless_range_loop = "allow"
 
 [features]
 aes-tower = []
-fpt = []
-tracy = ["binius_utils/tracy"]
+fp-tower = []
