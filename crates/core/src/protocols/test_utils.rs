@@ -1,9 +1,8 @@
-// Copyright 2023 Ulvetanna Inc.
+// Copyright 2023-2024 Irreducible Inc.
 
 use crate::polynomial::Error as PolynomialError;
 use binius_field::{ExtensionField, Field, PackedField};
-use binius_hal::{MLEEmbeddingAdapter, MultilinearExtension};
-use binius_math::CompositionPoly;
+use binius_math::{CompositionPoly, MLEEmbeddingAdapter, MultilinearExtension};
 use rand::Rng;
 use std::ops::Deref;
 
@@ -64,10 +63,15 @@ where
 							packed.set(k, P::Scalar::ZERO);
 						}
 					}
+					if n_vars < P::LOG_WIDTH {
+						for k in (1 << n_vars)..P::WIDTH {
+							packed.set(k, P::Scalar::ZERO);
+						}
+					}
 					packed
 				})
 				.collect();
-			MultilinearExtension::from_values(values)
+			MultilinearExtension::new(n_vars, values)
 				.unwrap()
 				.specialize::<PE>()
 		})

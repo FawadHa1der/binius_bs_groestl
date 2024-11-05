@@ -1,14 +1,11 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use crate::{
 	sumcheck_round_calculator::{calculate_first_round_evals, calculate_later_round_evals},
-	utils::tensor_product,
-	zerocheck::{ZerocheckCpuBackendHelper, ZerocheckRoundInput, ZerocheckRoundParameters},
-	ComputationBackend, Error, MultilinearPoly, MultilinearQueryRef, RoundEvals, SumcheckEvaluator,
-	SumcheckMultilinear,
+	ComputationBackend, Error, RoundEvals, SumcheckEvaluator, SumcheckMultilinear,
 };
 use binius_field::{ExtensionField, Field, PackedExtension, PackedField, RepackedExtension};
-use binius_math::CompositionPoly;
+use binius_math::{eq_ind_partial_eval, CompositionPoly, MultilinearPoly, MultilinearQueryRef};
 use std::fmt::Debug;
 use tracing::instrument;
 
@@ -27,30 +24,12 @@ impl ComputationBackend for CpuBackend {
 		v
 	}
 
-	#[instrument(skip_all)]
+	#[instrument(skip_all, level = "debug")]
 	fn tensor_product_full_query<P: PackedField>(
 		&self,
 		query: &[P::Scalar],
 	) -> Result<Self::Vec<P>, Error> {
-		tensor_product(query)
-	}
-
-	#[instrument(skip_all)]
-	fn zerocheck_compute_round_coeffs<F, PW, FDomain>(
-		&self,
-		params: &ZerocheckRoundParameters,
-		input: &ZerocheckRoundInput<F, PW, FDomain>,
-		handler: &mut dyn ZerocheckCpuBackendHelper<F, PW, FDomain>,
-	) -> Result<Vec<PW::Scalar>, Error>
-	where
-		F: Field,
-		PW: PackedField,
-		PW::Scalar: From<F> + Into<F>,
-		FDomain: Field,
-	{
-		// Zerocheck involves too much complicated logic, and instead of moving that logic here,
-		// callback back to the zerocheck protocols crate.
-		handler.handle_zerocheck_round(params, input)
+		Ok(eq_ind_partial_eval(query))
 	}
 
 	fn sumcheck_compute_first_round_evals<FDomain, FBase, F, PBase, P, M, Evaluator, Composition>(

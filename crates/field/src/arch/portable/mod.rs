@@ -1,4 +1,4 @@
-// Copyright 2023 Ulvetanna Inc.
+// Copyright 2023-2024 Irreducible Inc.
 
 pub(crate) mod packed;
 
@@ -24,6 +24,8 @@ pub mod packed_aes_8;
 pub mod packed_polyval_128;
 pub mod packed_polyval_256;
 pub mod packed_polyval_512;
+
+pub mod byte_sliced;
 
 pub(super) mod packed_scaled;
 

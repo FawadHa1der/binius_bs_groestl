@@ -1,4 +1,4 @@
-// Copyright 2023 Ulvetanna Inc.
+// Copyright 2023-2024 Irreducible Inc.
 #![feature(step_trait)]
 #![feature(get_many_mut)]
 // This is to silence clippy errors around suspicious usage of XOR
@@ -13,6 +13,7 @@ pub mod constraint_system;
 pub mod fiat_shamir;
 pub mod linear_code;
 pub mod merkle_tree;
+pub mod merkle_tree_vcs;
 pub mod oracle;
 pub mod poly_commit;
 pub mod polynomial;
@@ -20,6 +21,7 @@ pub mod protocols;
 #[allow(clippy::module_inception)]
 pub mod reed_solomon;
 pub mod tensor_algebra;
+pub mod transcript;
 pub mod transparent;
 pub mod witness;
 

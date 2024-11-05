@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use super::gpa_sumcheck::error::Error as GPASumcheckError;
 use crate::{
@@ -44,4 +44,6 @@ pub enum Error {
 	WitnessErrror(#[from] WitnessErrror),
 	#[error("HAL error: {0}")]
 	HalError(#[from] binius_hal::Error),
+	#[error("Math error: {0}")]
+	MathError(#[from] binius_math::Error),
 }

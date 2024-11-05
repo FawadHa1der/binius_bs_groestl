@@ -1,17 +1,14 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
-use crate::{
-	zerocheck::{ZerocheckCpuBackendHelper, ZerocheckRoundInput, ZerocheckRoundParameters},
-	Error, MultilinearPoly, MultilinearQueryRef, RoundEvals, SumcheckEvaluator,
-	SumcheckMultilinear,
-};
+use crate::{Error, RoundEvals, SumcheckEvaluator, SumcheckMultilinear};
 use binius_field::{ExtensionField, Field, PackedExtension, PackedField, RepackedExtension};
-use binius_math::CompositionPoly;
+use binius_math::{CompositionPoly, MultilinearPoly, MultilinearQuery, MultilinearQueryRef};
 use rayon::iter::FromParallelIterator;
 use std::{
 	fmt::Debug,
 	ops::{Deref, DerefMut},
 };
+use tracing::instrument;
 
 /// HAL-managed memory containing the result of its operations.
 pub trait HalSlice<P: Debug + Send + Sync>:
@@ -40,21 +37,6 @@ pub trait ComputationBackend: Send + Sync + Debug {
 		&self,
 		query: &[P::Scalar],
 	) -> Result<Self::Vec<P>, Error>;
-
-	/// Computes round coefficients for zerocheck.
-	/// `cpu_handler` is a callback to handle the CpuBackend computation.
-	/// It's a leaky abstraction, but zerocheck is too complex to refactor for a clean abstraction separation just yet.
-	fn zerocheck_compute_round_coeffs<F, PW, FDomain>(
-		&self,
-		params: &ZerocheckRoundParameters,
-		input: &ZerocheckRoundInput<F, PW, FDomain>,
-		cpu_handler: &mut dyn ZerocheckCpuBackendHelper<F, PW, FDomain>,
-	) -> Result<Vec<PW::Scalar>, Error>
-	where
-		F: Field,
-		PW: PackedField + PackedExtension<FDomain>,
-		PW::Scalar: From<F> + Into<F> + ExtensionField<FDomain>,
-		FDomain: Field;
 
 	/// Calculate the accumulated evaluations for the first round of zerocheck.
 	fn sumcheck_compute_first_round_evals<FDomain, FBase, F, PBase, P, M, Evaluator, Composition>(
@@ -111,21 +93,6 @@ where
 		T::tensor_product_full_query(self, query)
 	}
 
-	fn zerocheck_compute_round_coeffs<F, PW, FDomain>(
-		&self,
-		params: &ZerocheckRoundParameters,
-		input: &ZerocheckRoundInput<F, PW, FDomain>,
-		cpu_handler: &mut dyn ZerocheckCpuBackendHelper<F, PW, FDomain>,
-	) -> Result<Vec<PW::Scalar>, Error>
-	where
-		F: Field,
-		PW: PackedField + PackedExtension<FDomain>,
-		PW::Scalar: From<F> + Into<F> + ExtensionField<FDomain>,
-		FDomain: Field,
-	{
-		T::zerocheck_compute_round_coeffs(self, params, input, cpu_handler)
-	}
-
 	fn sumcheck_compute_first_round_evals<FDomain, FBase, F, PBase, P, M, Evaluator, Composition>(
 		&self,
 		n_vars: usize,
@@ -178,3 +145,17 @@ where
 		)
 	}
 }
+
+pub trait ComputationBackendExt: ComputationBackend {
+	/// Constructs a `MultilinearQuery` by performing tensor product expansion on the given `query`.
+	#[instrument(skip_all, level = "debug")]
+	fn multilinear_query<P: PackedField>(
+		&self,
+		query: &[P::Scalar],
+	) -> Result<MultilinearQuery<P, Self::Vec<P>>, Error> {
+		let tensor_product = self.tensor_product_full_query(query)?;
+		Ok(MultilinearQuery::with_expansion(query.len(), tensor_product)?)
+	}
+}
+
+impl<Backend> ComputationBackendExt for Backend where Backend: ComputationBackend {}

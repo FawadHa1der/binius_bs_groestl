@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use super::{
 	channel::{self, Boundary},
@@ -14,7 +14,8 @@ use binius_field::{
 	underlier::UnderlierType,
 	BinaryField1b, TowerField,
 };
-use binius_hal::{MultilinearPoly, MultilinearQuery};
+use binius_hal::ComputationBackendExt;
+use binius_math::MultilinearPoly;
 
 pub fn validate_witness<U, F>(
 	constraint_system: &ConstraintSystem<PackedType<U, F>>,
@@ -68,7 +69,6 @@ where
 
 	let oracle_label = &oracle.label();
 	let n_vars = oracle.n_vars();
-	let tower_level = oracle.binary_tower_level();
 	let poly = witness.get_multilin_poly(oracle.id())?;
 
 	match oracle {
@@ -96,7 +96,7 @@ where
 				let expected = linear_combination
 					.coefficients()
 					.zip(uncombined_polys.iter())
-					.try_fold(F::ZERO, |acc, (coeff, poly)| {
+					.try_fold(linear_combination.offset(), |acc, (coeff, poly)| {
 						Ok::<F, Error>(acc + poly.evaluate_on_hypercube_and_scale(i, coeff)?)
 					})?;
 				check_eval(oracle_label, i, expected, got)?;
@@ -215,7 +215,7 @@ where
 			use crate::oracle::ProjectionVariant::*;
 			let unprojected_poly = witness.get_multilin_poly(projected.inner().id())?;
 			let partial_query =
-				MultilinearQuery::with_full_query(projected.values(), &binius_hal::CpuBackend)?;
+				binius_hal::make_portable_backend().multilinear_query(projected.values())?;
 			let projected_poly = match projected.projection_variant() {
 				FirstVars => unprojected_poly.evaluate_partial_low(partial_query.to_ref())?,
 				LastVars => unprojected_poly.evaluate_partial_high(partial_query.to_ref())?,
@@ -245,13 +245,9 @@ where
 		}
 		Packed { id, packed, .. } => {
 			let inner = packed.inner();
-			let expected = witness.get_underlier_slice(
-				inner.id(),
-				inner.n_vars(),
-				inner.binary_tower_level(),
-			)?;
-			let got = witness.get_underlier_slice(id, n_vars, tower_level)?;
-			if expected != got {
+			let expected = witness.get_multilin_poly(inner.id())?;
+			let got = witness.get_multilin_poly(id)?;
+			if expected.packed_evals() != got.packed_evals() {
 				return Err(Error::PackedUnderlierMismatch {
 					oracle: oracle_label.into(),
 				});

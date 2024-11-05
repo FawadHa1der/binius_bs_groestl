@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use super::{batch_prove::SumcheckProver, prover_state::ProverState};
 use crate::{
@@ -10,8 +10,8 @@ use crate::{
 	},
 };
 use binius_field::{ExtensionField, Field, PackedExtension, PackedField};
-use binius_hal::{ComputationBackend, MultilinearPoly, SumcheckEvaluator};
-use binius_math::{CompositionPoly, EvaluationDomainFactory, InterpolationDomain};
+use binius_hal::{ComputationBackend, SumcheckEvaluator};
+use binius_math::{CompositionPoly, EvaluationDomainFactory, InterpolationDomain, MultilinearPoly};
 use binius_utils::bail;
 use itertools::izip;
 use rayon::prelude::*;
@@ -211,13 +211,13 @@ where
 		&self,
 		_subcube_vars: usize,
 		_subcube_index: usize,
-		sparse_batch_query: &[&[P]],
+		batch_query: &[&[P]],
 	) -> P {
-		let row_len = sparse_batch_query.first().map_or(0, |row| row.len());
+		let row_len = batch_query.first().map_or(0, |row| row.len());
 
 		stackalloc_with_default(row_len, |evals| {
 			self.composition
-				.sparse_batch_evaluate(sparse_batch_query, evals)
+				.batch_evaluate(batch_query, evals)
 				.expect("correct by query construction invariant");
 
 			evals.iter().copied().sum()

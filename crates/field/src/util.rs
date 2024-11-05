@@ -1,30 +1,43 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
-use crate::{packed::get_packed_slice_unchecked, ExtensionField, Field, PackedField};
+use crate::{
+	packed::{get_packed_slice_unchecked, iter_packed_slice},
+	ExtensionField, Field, PackedField,
+};
 use binius_utils::checked_arithmetics::checked_int_div;
 use rayon::prelude::*;
 use std::iter;
 
 /// Computes the inner product of two vectors without checking that the lengths are equal
-pub fn inner_product_unchecked<F, FE>(a: impl Iterator<Item = FE>, b: impl Iterator<Item = F>) -> FE
+pub fn inner_product_unchecked<F, FE>(
+	a: impl IntoIterator<Item = FE>,
+	b: impl IntoIterator<Item = F>,
+) -> FE
 where
 	F: Field,
 	FE: ExtensionField<F>,
 {
-	a.zip(b).map(|(a_i, b_i)| a_i * b_i).sum::<FE>()
+	iter::zip(a, b).map(|(a_i, b_i)| a_i * b_i).sum::<FE>()
 }
 
+/// Calculate inner product for potentially big slices of xs and ys.
+/// The number of elements in xs has to be less or equal to the number of elements in ys.
 pub fn inner_product_par<FX, PX, PY>(xs: &[PX], ys: &[PY]) -> FX
 where
 	PX: PackedField<Scalar = FX>,
 	PY: PackedField,
 	FX: ExtensionField<PY::Scalar>,
 {
-	assert_eq!(
-		PX::WIDTH * xs.len(),
-		PY::WIDTH * ys.len(),
-		"Both arguments must contain the same number of field elements"
+	assert!(
+		PX::WIDTH * xs.len() <= PY::WIDTH * ys.len(),
+		"Y elements has to be at least as wide as X elements"
 	);
+
+	// If number of elements in xs is less than number of elements in ys this will be because due to packing
+	// so we can use single-threaded version of the function.
+	if PX::WIDTH * xs.len() < PY::WIDTH * ys.len() {
+		return inner_product_unchecked(iter_packed_slice(xs), iter_packed_slice(ys));
+	}
 
 	let calc_product_by_ys = |x_offset, ys: &[PY]| {
 		let mut result = FX::ZERO;

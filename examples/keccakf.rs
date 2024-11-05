@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 //! Example of a Binius SNARK that proves execution of Keccak-f[1600] permutations.
 //!
@@ -31,11 +31,11 @@ use binius_core::{
 	witness::MultilinearExtensionIndex,
 };
 use binius_field::{
-	arch::packed_64::PackedBinaryField64x1b,
 	as_packed_field::{PackScalar, PackedType},
 	underlier::{UnderlierType, WithUnderlier},
 	BinaryField, BinaryField128b, BinaryField16b, BinaryField1b, ExtensionField, Field,
-	PackedBinaryField128x1b, PackedField, PackedFieldIndexable, TowerField,
+	PackedBinaryField128x1b, PackedBinaryField1x128b, PackedField, PackedFieldIndexable,
+	RepackedExtension, TowerField,
 };
 use binius_hal::{make_portable_backend, ComputationBackend};
 use binius_hash::GroestlHasher;
@@ -44,7 +44,7 @@ use binius_math::{CompositionPoly, EvaluationDomainFactory, IsomorphicEvaluation
 use binius_utils::{
 	examples::get_log_trace_size, rayon::adjust_thread_pool, tracing::init_tracing,
 };
-use bytemuck::{must_cast_slice, must_cast_slice_mut, Pod};
+use bytemuck::{cast_vec, must_cast_slice_mut, pod_collect_to_vec, Pod};
 use bytesize::ByteSize;
 use itertools::chain;
 use rand::{thread_rng, Rng};
@@ -54,8 +54,9 @@ use tracing::instrument;
 
 #[cfg(feature = "fp-tower")]
 mod field_types {
-	use binius_field::{BinaryField128b, BinaryField8b};
+	use binius_field::{BinaryField128b, BinaryField8b, PackedBinaryField1x128b};
 	pub type FW = BinaryField128b;
+	pub type PW = PackedBinaryField1x128b;
 	pub type FBase = BinaryField8b;
 	pub type FDomain = BinaryField8b;
 	pub type DomainFieldWithStep = BinaryField8b;
@@ -63,8 +64,9 @@ mod field_types {
 
 #[cfg(all(feature = "aes-tower", not(feature = "fp-tower")))]
 mod field_types {
-	use binius_field::{AESTowerField128b, AESTowerField8b};
+	use binius_field::{AESTowerField128b, AESTowerField8b, PackedAESBinaryField1x128b};
 	pub type FW = AESTowerField128b;
+	pub type PW = PackedAESBinaryField1x128b;
 	pub type FBase = AESTowerField8b;
 	pub type FDomain = AESTowerField8b;
 	pub type DomainFieldWithStep = AESTowerField8b;
@@ -72,8 +74,9 @@ mod field_types {
 
 #[cfg(all(not(feature = "fp-tower"), not(feature = "aes-tower")))]
 mod field_types {
-	use binius_field::{BinaryField128b, BinaryField128bPolyval};
+	use binius_field::{BinaryField128b, BinaryField128bPolyval, PackedBinaryPolyval1x128b};
 	pub type FW = BinaryField128bPolyval;
+	pub type PW = PackedBinaryPolyval1x128b;
 	pub type FBase = BinaryField128bPolyval;
 	pub type FDomain = BinaryField128bPolyval;
 	pub type DomainFieldWithStep = BinaryField128b;
@@ -175,14 +178,14 @@ struct FixedOracle {
 }
 
 impl FixedOracle {
-	pub fn new<F: TowerField>(
-		oracles: &mut MultilinearOracleSet<F>,
+	pub fn new<P: PackedField<Scalar: TowerField> + RepackedExtension<PackedBinaryField128x1b>>(
+		oracles: &mut MultilinearOracleSet<P::Scalar>,
 		log_size: usize,
 	) -> Result<Self> {
-		let round_const_values = must_cast_slice::<_, PackedBinaryField64x1b>(&KECCAKF_RC);
-		let round_consts_single = oracles.add_named("round_consts_single").transparent(
-			MultilinearExtensionTransparent::<_, F, _>::from_values(round_const_values)?,
-		)?;
+		let u128_values = pod_collect_to_vec::<_, u128>(&KECCAKF_RC);
+		let round_const_values = cast_vec::<_, PackedBinaryField128x1b>(u128_values);
+		let poly = MultilinearExtensionTransparent::<_, P, _>::from_values(round_const_values)?;
+		let round_consts_single = oracles.add_named("round_consts_single").transparent(poly)?;
 		let round_consts = oracles
 			.add_named("round_consts")
 			.repeating(round_consts_single, log_size - LOG_ROWS_PER_PERMUTATION)?;
@@ -419,7 +422,8 @@ where
 		}
 	}
 
-	let index = MultilinearExtensionIndex::new().update_owned::<BinaryField1b, _>(iter::zip(
+	let mut index = MultilinearExtensionIndex::new();
+	index.set_owned::<BinaryField1b, _>(iter::zip(
 		chain!(
 			[fixed_oracle.round_consts, fixed_oracle.selector],
 			trace_oracle.state_in,
@@ -526,7 +530,7 @@ fn make_constraints<'a, P: PackedField>(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "keccakf::prove")]
 fn prove<U, F, FBase, DomainField, FEPCS, PCS, CH, Backend>(
 	log_size: usize,
 	oracles: &mut MultilinearOracleSet<F>,
@@ -585,7 +589,8 @@ where
 		switchover_fn,
 		zerocheck_challenges.as_slice(),
 		&backend,
-	)?;
+	)?
+	.into_regular_zerocheck()?;
 
 	let (sumcheck_output, zerocheck_proof) =
 		sumcheck::prove::batch_prove(vec![prover], &mut iso_challenger)?;
@@ -647,7 +652,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip_all)]
+#[instrument(skip_all, name = "keccakf::verify")]
 fn verify<P, F, PCS, CH, Backend>(
 	log_size: usize,
 	oracles: &mut MultilinearOracleSet<F>,
@@ -740,7 +745,8 @@ fn main() {
 
 	let backend = make_portable_backend();
 	let mut prove_oracles = MultilinearOracleSet::new();
-	let prove_fixed_oracle = FixedOracle::new(&mut prove_oracles, log_size).unwrap();
+	let prove_fixed_oracle =
+		FixedOracle::new::<field_types::PW>(&mut prove_oracles, log_size).unwrap();
 	let prove_trace_oracle = TraceOracle::new(&mut prove_oracles, log_size);
 
 	let trace_batch = prove_oracles.committed_batch(prove_trace_oracle.batch_id);
@@ -792,7 +798,8 @@ fn main() {
 	.unwrap();
 
 	let mut verifier_oracles = MultilinearOracleSet::new();
-	let verifier_fixed_oracle = FixedOracle::new(&mut verifier_oracles, log_size).unwrap();
+	let verifier_fixed_oracle =
+		FixedOracle::new::<PackedBinaryField1x128b>(&mut verifier_oracles, log_size).unwrap();
 	let verifier_trace_oracle = TraceOracle::new(&mut verifier_oracles, log_size);
 	verify(
 		log_size,

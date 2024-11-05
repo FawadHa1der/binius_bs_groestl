@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use crate::{
 	oracle::{BatchId, CommittedId, CompositePolyOracle, Error as OracleError, OracleId},
@@ -32,6 +32,8 @@ pub enum Error {
 	Sumcheck(#[from] crate::protocols::sumcheck::Error),
 	#[error("HAL error: {0}")]
 	HalError(#[from] binius_hal::Error),
+	#[error("Math error: {0}")]
+	MathError(#[from] binius_math::Error),
 }
 
 #[derive(Debug, thiserror::Error)]

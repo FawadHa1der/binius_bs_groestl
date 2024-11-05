@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 //! This an example SNARK for proving the P permutation of the Grøstl-256 hash function.
 //!
@@ -33,9 +33,12 @@ use binius_field::{
 	PackedBinaryField1x128b, PackedField, PackedFieldIndexable, TowerField,
 	AES_TO_BINARY_LINEAR_TRANSFORMATION,
 };
-use binius_hal::{make_portable_backend, ComputationBackend, MultilinearExtension};
+use binius_hal::{make_portable_backend, ComputationBackend};
 use binius_hash::{Groestl256Core, GroestlHasher};
-use binius_math::{CompositionPoly, EvaluationDomainFactory, IsomorphicEvaluationDomainFactory};
+use binius_math::{
+	CompositionPoly, EvaluationDomainFactory, IsomorphicEvaluationDomainFactory,
+	MultilinearExtension,
+};
 use binius_utils::{
 	examples::get_log_trace_size, rayon::adjust_thread_pool, tracing::init_tracing,
 };
@@ -1005,7 +1008,8 @@ where
 		switchover_fn,
 		zerocheck_challenges.as_slice(),
 		backend,
-	)?;
+	)?
+	.into_regular_zerocheck()?;
 
 	let (sumcheck_output, zerocheck_proof) =
 		sumcheck::prove::batch_prove(vec![prover], &mut iso_challenger)?;

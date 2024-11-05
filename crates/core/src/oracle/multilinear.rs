@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use crate::{
 	oracle::{BatchId, CommittedBatch, CommittedId, CompositePolyOracle, Error},
@@ -342,6 +342,10 @@ impl<F: TowerField> MultilinearOracleSet<F> {
 			batches: Vec::new(),
 			oracles: Vec::new(),
 		}
+	}
+
+	pub fn n_batches(&self) -> usize {
+		self.batches.len()
 	}
 
 	pub fn iter(&self) -> impl Iterator<Item = MultilinearPolyOracle<F>> + '_ {

@@ -1,9 +1,8 @@
-// Copyright 2023 Ulvetanna Inc.
+// Copyright 2023-2024 Irreducible Inc.
 
 use super::error::Error;
 use binius_field::{Field, PackedField};
-use binius_hal::{MLEDirectAdapter, MultilinearPoly, MultilinearQueryRef};
-use binius_math::CompositionPoly;
+use binius_math::{CompositionPoly, MLEDirectAdapter, MultilinearPoly, MultilinearQueryRef};
 use binius_utils::bail;
 use itertools::Itertools;
 use rand::{rngs::StdRng, SeedableRng};

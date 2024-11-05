@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use binius_core::{
 	constraint_system::{
@@ -18,12 +18,11 @@ use binius_field::{
 	TowerField,
 };
 use binius_math::CompositionPoly;
-use bytemuck::Pod;
 
 #[derive(Default)]
 pub struct ConstraintSystemBuilder<U, F>
 where
-	U: UnderlierType + Pod + PackScalar<F>,
+	U: UnderlierType + PackScalar<F>,
 	F: TowerField,
 {
 	oracles: MultilinearOracleSet<F>,
@@ -36,7 +35,7 @@ where
 
 impl<U, F> ConstraintSystemBuilder<U, F>
 where
-	U: UnderlierType + Pod + PackScalar<F>,
+	U: UnderlierType + PackScalar<F>,
 	F: TowerField,
 {
 	pub fn new() -> Self {

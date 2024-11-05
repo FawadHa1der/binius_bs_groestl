@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use super::error::Error;
 use crate::{
@@ -14,8 +14,8 @@ use crate::{
 	},
 };
 use binius_field::{ExtensionField, Field, PackedExtension, PackedField, PackedFieldIndexable};
-use binius_hal::{ComputationBackend, MultilinearPoly, MultilinearQuery, SumcheckEvaluator};
-use binius_math::{CompositionPoly, EvaluationDomainFactory, InterpolationDomain};
+use binius_hal::{ComputationBackend, SumcheckEvaluator};
+use binius_math::{CompositionPoly, EvaluationDomainFactory, InterpolationDomain, MultilinearPoly};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use stackalloc::stackalloc_with_default;
 use std::ops::Range;
@@ -75,14 +75,11 @@ where
 		}
 
 		let partial_eq_ind_evals = if gpa_round_challenges.is_empty() {
-			MultilinearQuery::<P, Backend>::new(0)
-				.map_err(SumcheckError::from)?
-				.into_expansion()
+			backend.tensor_product_full_query(&[])
 		} else {
-			MultilinearQuery::with_full_query(&gpa_round_challenges[1..], backend)
-				.map_err(SumcheckError::from)?
-				.into_expansion()
-		};
+			backend.tensor_product_full_query(&gpa_round_challenges[1..])
+		}
+		.map_err(SumcheckError::from)?;
 
 		Ok(Self {
 			n_vars,
@@ -224,13 +221,13 @@ where
 		&self,
 		subcube_vars: usize,
 		subcube_index: usize,
-		sparse_batch_query: &[&[P]],
+		batch_query: &[&[P]],
 	) -> P {
-		let row_len = sparse_batch_query.first().map_or(0, |row| row.len());
+		let row_len = batch_query.first().map_or(0, |row| row.len());
 
 		stackalloc_with_default(row_len, |evals| {
 			BivariateProduct {}
-				.sparse_batch_evaluate(sparse_batch_query, evals)
+				.batch_evaluate(batch_query, evals)
 				.expect("correct by query construction invariant");
 
 			let subcube_start = subcube_index << subcube_vars.saturating_sub(P::LOG_WIDTH);
@@ -323,13 +320,13 @@ where
 		&self,
 		subcube_vars: usize,
 		subcube_index: usize,
-		sparse_batch_query: &[&[P]],
+		batch_query: &[&[P]],
 	) -> P {
-		let row_len = sparse_batch_query.first().map_or(0, |row| row.len());
+		let row_len = batch_query.first().map_or(0, |row| row.len());
 
 		stackalloc_with_default(row_len, |evals| {
 			BivariateProduct {}
-				.sparse_batch_evaluate(sparse_batch_query, evals)
+				.batch_evaluate(batch_query, evals)
 				.expect("correct by query construction invariant");
 
 			let subcube_start = subcube_index << subcube_vars.saturating_sub(P::LOG_WIDTH);

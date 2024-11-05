@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use binius_core::{
 	challenger::{new_hasher_challenger, IsomorphicChallenger},
@@ -6,21 +6,21 @@ use binius_core::{
 };
 use binius_field::{
 	arch::packed_polyval_128::PackedBinaryPolyval1x128b, BinaryField128b, BinaryField128bPolyval,
-	Field,
+	PackedField,
 };
-use binius_hal::{make_portable_backend, MultilinearExtension};
+use binius_hal::make_portable_backend;
 use binius_hash::GroestlHasher;
-use binius_math::IsomorphicEvaluationDomainFactory;
+use binius_math::{IsomorphicEvaluationDomainFactory, MultilinearExtension};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use rand::{rngs::StdRng, SeedableRng};
 use std::iter::repeat_with;
 
 // Creates T(x), a multilinear with evaluations over the n-dimensional boolean hypercube
-fn create_numerator<FW: Field>(n_vars: usize) -> MultilinearExtension<FW> {
+fn create_numerator<P: PackedField>(n_vars: usize) -> MultilinearExtension<P> {
 	let mut rng = StdRng::seed_from_u64(0);
-	let values = repeat_with(|| Field::random(&mut rng))
+	let values = repeat_with(|| P::random(&mut rng))
 		.take(1 << n_vars)
-		.collect::<Vec<FW>>();
+		.collect::<Vec<P>>();
 
 	MultilinearExtension::from_values(values).unwrap()
 }
@@ -41,7 +41,7 @@ fn bench_polyval(c: &mut Criterion) {
 			let prover_challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
 
 			// Setup witness
-			let numerator = create_numerator::<FW>(n);
+			let numerator = create_numerator::<P>(n);
 
 			let gpa_witness =
 				GrandProductWitness::<P>::new(numerator.specialize_arc_dyn()).unwrap();

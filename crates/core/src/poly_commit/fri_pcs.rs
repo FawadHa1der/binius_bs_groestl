@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use super::ring_switch::{evaluate_ring_switch_eq_ind, reduce_tensor_claim};
 use crate::{
@@ -23,11 +23,12 @@ use binius_field::{
 	packed::iter_packed_slice, BinaryField, ExtensionField, Field, PackedExtension, PackedField,
 	PackedFieldIndexable,
 };
-use binius_hal::{ComputationBackend, MLEDirectAdapter, MultilinearExtension, MultilinearQuery};
-use binius_math::EvaluationDomainFactory;
+use binius_hal::{ComputationBackend, ComputationBackendExt};
+use binius_math::{EvaluationDomainFactory, MLEDirectAdapter, MultilinearExtension};
 use binius_ntt::NTTOptions;
 use binius_utils::{bail, checked_arithmetics::checked_log_2};
 use std::{iter, iter::repeat_with, marker::PhantomData, mem, ops::Deref};
+use tracing::instrument;
 
 /// The small-field FRI-based PCS from [DP24], also known as the FRI-Binius PCS.
 ///
@@ -79,8 +80,7 @@ where
 		+ ExtensionField<F>
 		+ ExtensionField<FDomain>
 		+ ExtensionField<FEncode>,
-	PE: PackedFieldIndexable<Scalar = FExt>
-		+ PackedExtension<FEncode, PackedSubfield: PackedFieldIndexable>,
+	PE: PackedFieldIndexable<Scalar = FExt> + PackedExtension<FEncode>,
 	VCS: VectorCommitScheme<FExt> + Sync,
 	VCS::Committed: Send + Sync,
 {
@@ -100,12 +100,14 @@ where
 			.checked_sub(kappa)
 			.ok_or(Error::IncorrectPolynomialSize { expected: kappa })?;
 
-		if fold_arities.iter().sum::<usize>() > n_packed_vars {
-			bail!(fri::Error::InvalidFoldAritySequence);
-		}
-		for &arity in fold_arities.iter() {
-			if arity == 0 {
-				bail!(fri::Error::FoldArityIsZero { index: 0 });
+		if !fold_arities.is_empty() {
+			if fold_arities.iter().sum::<usize>() >= n_packed_vars {
+				bail!(fri::Error::InvalidFoldAritySequence);
+			}
+			for &arity in fold_arities.iter() {
+				if arity == 0 {
+					bail!(fri::Error::FoldArityIsZero { index: 0 });
+				}
 			}
 		}
 		let final_arity = n_packed_vars - fold_arities.iter().sum::<usize>();
@@ -140,6 +142,44 @@ where
 			domain_factory,
 			_marker: PhantomData,
 		})
+	}
+
+	pub fn with_optimal_arity(
+		n_vars: usize,
+		log_inv_rate: usize,
+		security_bits: usize,
+		vcs_factory: impl Fn(usize) -> VCS,
+		domain_factory: DomainFactory,
+		ntt_options: NTTOptions,
+	) -> Result<Self, Error> {
+		let kappa = checked_log_2(<FExt as ExtensionField<F>>::DEGREE);
+
+		// The number of variables of the packed polynomial.
+		let n_packed_vars = n_vars
+			.checked_sub(kappa)
+			.ok_or(Error::IncorrectPolynomialSize { expected: kappa })?;
+
+		let arity = estimate_optimal_arity(
+			n_packed_vars + log_inv_rate,
+			size_of::<VCS::Commitment>(),
+			size_of::<FExt>(),
+		);
+		assert!(arity > 0);
+
+		let fold_arities = iter::repeat(arity)
+			// The total arities must be strictly less than n_packed_vars, hence the -1
+			.take(n_packed_vars.saturating_sub(1) / arity)
+			.collect::<Vec<_>>();
+
+		Self::new(
+			n_vars,
+			log_inv_rate,
+			&fold_arities,
+			security_bits,
+			vcs_factory,
+			domain_factory,
+			ntt_options,
+		)
 	}
 
 	/// Returns $\kappa$, the base-2 logarithm of the extension degree.
@@ -310,7 +350,7 @@ where
 	PE: PackedFieldIndexable<Scalar = FExt>
 		+ PackedExtension<F, PackedSubfield = P>
 		+ PackedExtension<FDomain>
-		+ PackedExtension<FEncode, PackedSubfield: PackedFieldIndexable>,
+		+ PackedExtension<FEncode>,
 	DomainFactory: EvaluationDomainFactory<FDomain>,
 	VCS: VectorCommitScheme<FExt> + Sync,
 	VCS::Committed: Send + Sync,
@@ -361,6 +401,7 @@ where
 
 	// Clippy allow is due to bug: https://github.com/rust-lang/rust-clippy/pull/12892
 	#[allow(clippy::needless_borrows_for_generic_args)]
+	#[instrument(skip_all, level = "debug")]
 	fn prove_evaluation<Data, Challenger, Backend>(
 		&self,
 		challenger: &mut Challenger,
@@ -394,7 +435,7 @@ where
 
 		let (_, query_from_kappa) = query.split_at(Self::kappa());
 
-		let expanded_query = MultilinearQuery::<PE, _>::with_full_query(query_from_kappa, backend)?;
+		let expanded_query = backend.multilinear_query::<PE>(query_from_kappa)?;
 		let partial_eval = poly.evaluate_partial_high(&expanded_query)?;
 		let sumcheck_eval =
 			TensorAlgebra::<F, _>::new(iter_packed_slice(partial_eval.evals()).collect());
@@ -479,7 +520,7 @@ where
 		challenger.observe_slice(sumcheck_eval.vertical_elems());
 
 		// Check that the claimed sum is consistent with the tensor algebra element received.
-		let expanded_query = MultilinearQuery::<FExt, _>::with_full_query(query_to_kappa, backend)?;
+		let expanded_query = backend.multilinear_query::<FExt>(query_to_kappa)?;
 		let computed_eval =
 			MultilinearExtension::from_values_slice(sumcheck_eval.vertical_elems())?
 				.evaluate(&expanded_query)?;
@@ -566,6 +607,41 @@ where
 	fri_query_proofs: Vec<fri::QueryProof<FExt, VCS::Proof>>,
 }
 
+/// Heuristic for estimating the optimal arity (with respect to proof size) for the FRI-based PCS.
+///
+/// `log_block_length` is the log block length of the packed Reed-Solomon code, i.e., $\ell - \kappa + \mathcal R$.
+pub fn estimate_optimal_arity(
+	log_block_length: usize,
+	digest_size: usize,
+	field_size: usize,
+) -> usize {
+	(1..=log_block_length)
+		.map(|arity| {
+			(
+				// for given arity, return a tuple (arity, estimate of query_proof_size).
+				// this estimate is basd on the following approximation of a single query_proof_size, where $\vartheta$ is the arity:
+				// $\big((n-\vartheta) + (n-2\vartheta) + \ldots\big)\text{digest_size} + \frac{n-\vartheta}{\vartheta}2^{\vartheta}\text{field_size}.$
+				arity,
+				((log_block_length) / 2 * digest_size + (1 << arity) * field_size)
+					* (log_block_length - arity)
+					/ arity,
+			)
+		})
+		// now scan and terminate the iterator when query_proof_size increases.
+		.scan(None, |old: &mut Option<(usize, usize)>, new| {
+			let should_continue = !matches!(*old, Some(ref old) if new.1 > old.1);
+			*old = Some(new);
+			if should_continue {
+				Some(new)
+			} else {
+				None
+			}
+		})
+		.last()
+		.unwrap()
+		.0
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
 	#[error("the polynomial must have {expected} variables")]
@@ -582,6 +658,8 @@ pub enum Error {
 	Verification(#[from] VerificationError),
 	#[error("HAL error: {0}")]
 	HalError(#[from] binius_hal::Error),
+	#[error("Math error: {0}")]
+	MathError(#[from] binius_math::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -652,9 +730,7 @@ mod tests {
 			.take(n_vars)
 			.collect::<Vec<_>>();
 
-		let eval_query =
-			MultilinearQuery::<FE, binius_hal::CpuBackend>::with_full_query(&eval_point, &backend)
-				.unwrap();
+		let eval_query = backend.multilinear_query::<FE>(&eval_point).unwrap();
 		let eval = multilin.evaluate(&eval_query).unwrap();
 
 		let make_merkle_vcs = |log_len| {
@@ -723,5 +799,19 @@ mod tests {
 			BinaryField16b,
 			BinaryField128b,
 		>(12, 2, &[3, 3, 3]);
+	}
+
+	#[test]
+	fn test_estimate_optimal_arity() {
+		let field_size = 128;
+		for log_block_length in 22..35 {
+			let digest_size = 256;
+			assert_eq!(estimate_optimal_arity(log_block_length, digest_size, field_size), 4);
+		}
+
+		for log_block_length in 22..28 {
+			let digest_size = 1024;
+			assert_eq!(estimate_optimal_arity(log_block_length, digest_size, field_size), 6);
+		}
 	}
 }

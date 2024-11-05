@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use anyhow::Result;
 use binius_core::{
@@ -95,7 +95,8 @@ where
 			switchover_fn,
 			zerocheck_challenges.as_slice(),
 			backend,
-		)?;
+		)?
+		.into_regular_zerocheck()?;
 
 	let (sumcheck_output, zerocheck_proof) =
 		sumcheck::prove::batch_prove(vec![prover], &mut iso_challenger)?;
@@ -300,12 +301,12 @@ where
 			*c_i_uint128 = a_i_uint128 & b_i_uint128;
 		});
 
-	MultilinearExtensionIndex::new()
-		.update_owned::<BinaryField1b, _>(iter::zip(
-			[trace_oracle.a_in, trace_oracle.b_in, trace_oracle.c_out],
-			[a_in, b_in, c_out],
-		))
-		.map_err(Into::into)
+	let mut index = MultilinearExtensionIndex::new();
+	index.set_owned(iter::zip(
+		[trace_oracle.a_in, trace_oracle.b_in, trace_oracle.c_out],
+		[a_in, b_in, c_out],
+	))?;
+	Ok(index)
 }
 
 fn make_constraints<P: PackedField, F: TowerField>(

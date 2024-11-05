@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use anyhow::{anyhow, Result};
 use binius_core::{
@@ -20,9 +20,11 @@ use binius_field::{
 	BinaryField, BinaryField128b, BinaryField16b, BinaryField1b, BinaryField32b, BinaryField8b,
 	ExtensionField, Field, PackedBinaryField128x1b, PackedField, PackedFieldIndexable, TowerField,
 };
-use binius_hal::{make_portable_backend, ComputationBackend, MultilinearExtensionBorrowed};
+use binius_hal::{make_portable_backend, ComputationBackend};
 use binius_hash::GroestlHasher;
-use binius_math::{EvaluationDomainFactory, IsomorphicEvaluationDomainFactory};
+use binius_math::{
+	EvaluationDomainFactory, IsomorphicEvaluationDomainFactory, MultilinearExtensionBorrowed,
+};
 use binius_utils::{
 	examples::get_log_trace_size, rayon::adjust_thread_pool, tracing::init_tracing,
 };
@@ -209,17 +211,17 @@ where
 		*lookup_t = BinaryField32b::new(lookup_t_u32);
 	}
 
-	let index = MultilinearExtensionIndex::new()
-		.update_owned::<B1, _>([(trace_oracle.cin, cin), (trace_oracle.cout, cout)])?
-		.update_owned::<B8, _>([
-			(trace_oracle.a, a),
-			(trace_oracle.b, b),
-			(trace_oracle.sum, sum),
-		])?
-		.update_owned::<B32, _>([
-			(trace_oracle.lookup_t, lookup_t),
-			(trace_oracle.lookup_u, lookup_u),
-		])?;
+	let mut index = MultilinearExtensionIndex::new();
+	index.set_owned::<B1, _>([(trace_oracle.cin, cin), (trace_oracle.cout, cout)])?;
+	index.set_owned::<B8, _>([
+		(trace_oracle.a, a),
+		(trace_oracle.b, b),
+		(trace_oracle.sum, sum),
+	])?;
+	index.set_owned::<B32, _>([
+		(trace_oracle.lookup_t, lookup_t),
+		(trace_oracle.lookup_u, lookup_u),
+	])?;
 
 	Ok(TraceWitness {
 		index,

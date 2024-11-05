@@ -1,8 +1,8 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use super::error::{Error, VerificationError};
 use crate::protocols::sumcheck::{BatchSumcheckOutput, CompositeSumClaim, SumcheckClaim};
-use binius_field::{util::eq, Field, PackedField, TowerField};
+use binius_field::{util::eq, Field, PackedField};
 use binius_math::CompositionPoly;
 use binius_utils::{bail, sorting::is_sorted_ascending};
 use getset::CopyGetters;
@@ -87,7 +87,7 @@ pub fn reduce_to_sumchecks<F: Field, Composition: CompositionPoly<F>>(
 /// This takes in the output of the reduced sumcheck protocol and returns the output for the
 /// zerocheck instance. This simply strips off the multilinear evaluation of the eq indicator
 /// polynomial and verifies that the value is correct.
-pub fn verify_sumcheck_outputs<F: TowerField, Composition>(
+pub fn verify_sumcheck_outputs<F: Field, Composition: CompositionPoly<F>>(
 	claims: &[ZerocheckClaim<F, Composition>],
 	zerocheck_challenges: &[F],
 	sumcheck_output: BatchSumcheckOutput<F>,
@@ -140,7 +140,7 @@ pub fn verify_sumcheck_outputs<F: TowerField, Composition>(
 
 #[derive(Debug)]
 pub struct ExtraProduct<Composition> {
-	inner: Composition,
+	pub inner: Composition,
 }
 
 impl<P, Composition> CompositionPoly<P> for ExtraProduct<Composition>
@@ -179,7 +179,7 @@ mod tests {
 		protocols::{
 			sumcheck::{
 				batch_verify,
-				prove::{batch_prove, zerocheck, RegularSumcheckProver, ZerocheckProver},
+				prove::{batch_prove, zerocheck, RegularSumcheckProver, UnivariateZerocheck},
 			},
 			test_utils::{generate_zero_product_multilinears, TestProductComposition},
 		},
@@ -188,13 +188,13 @@ mod tests {
 	};
 	use binius_field::{
 		BinaryField128b, BinaryField8b, ExtensionField, PackedBinaryField1x128b,
-		PackedBinaryField4x32b, PackedExtension, PackedFieldIndexable,
+		PackedBinaryField4x32b, PackedExtension, PackedFieldIndexable, RepackedExtension,
 	};
-	use binius_hal::{
-		make_portable_backend, ComputationBackend, MultilinearPoly, MultilinearQuery,
-	};
+	use binius_hal::{make_portable_backend, ComputationBackend, ComputationBackendExt};
 	use binius_hash::GroestlHasher;
-	use binius_math::{EvaluationDomainFactory, IsomorphicEvaluationDomainFactory};
+	use binius_math::{
+		EvaluationDomainFactory, IsomorphicEvaluationDomainFactory, MultilinearPoly,
+	};
 	use rand::{prelude::StdRng, SeedableRng};
 	use std::{iter, sync::Arc};
 
@@ -216,7 +216,7 @@ mod tests {
 	where
 		F: Field + ExtensionField<FDomain>,
 		FDomain: Field,
-		P: PackedFieldIndexable<Scalar = F> + PackedExtension<FDomain>,
+		P: PackedFieldIndexable<Scalar = F> + PackedExtension<FDomain> + RepackedExtension<P>,
 		Composition: CompositionPoly<P>,
 		M: MultilinearPoly<P> + Send + Sync + 'static,
 		Backend: ComputationBackend,
@@ -289,7 +289,7 @@ mod tests {
 		) = batch_prove(vec![reference_prover], &mut challenger1).unwrap();
 
 		let composition = TestProductComposition::new(n_multilinears);
-		let optimized_prover = ZerocheckProver::<FDomain, PBase, P, _, _, _, _>::new(
+		let optimized_prover = UnivariateZerocheck::<FDomain, PBase, P, _, _, _, _>::new(
 			multilins,
 			[(composition.clone(), composition)],
 			&challenges,
@@ -297,6 +297,8 @@ mod tests {
 			|_| switchover_rd,
 			&backend,
 		)
+		.unwrap()
+		.into_regular_zerocheck()
 		.unwrap();
 
 		let mut challenger2 = challenger.clone();
@@ -337,7 +339,7 @@ mod tests {
 		let backend = make_portable_backend();
 
 		let composition = TestProductComposition::new(n_multilinears);
-		let prover = ZerocheckProver::<FDomain, PBase, P, _, _, _, _>::new(
+		let prover = UnivariateZerocheck::<FDomain, PBase, P, _, _, _, _>::new(
 			multilins.clone(),
 			[(composition.clone(), composition)],
 			&challenges,
@@ -345,6 +347,8 @@ mod tests {
 			|_| switchover_rd,
 			&backend,
 		)
+		.unwrap()
+		.into_regular_zerocheck()
 		.unwrap();
 
 		let mut prover_challenger = challenger.clone();
@@ -393,8 +397,7 @@ mod tests {
 		assert_eq!(verifier_multilinear_evals[0].len(), n_multilinears);
 
 		// Verify the reduced multilinear evaluations are correct
-		let multilin_query =
-			MultilinearQuery::with_full_query(&verifier_eval_point, &backend).unwrap();
+		let multilin_query = backend.multilinear_query(&verifier_eval_point).unwrap();
 		for (multilinear, &expected) in iter::zip(multilins, verifier_multilinear_evals[0].iter()) {
 			assert_eq!(multilinear.evaluate(multilin_query.to_ref()).unwrap(), expected);
 		}

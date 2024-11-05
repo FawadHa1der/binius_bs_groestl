@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use super::{
 	common::CompositeSumClaim,
@@ -7,24 +7,32 @@ use super::{
 	BatchSumcheckOutput, SumcheckClaim,
 };
 use crate::{
-	challenger::{new_hasher_challenger, CanSample},
+	challenger::{new_hasher_challenger, CanSample, IsomorphicChallenger},
 	composition::index_composition,
 	polynomial::{IdentityCompositionPoly, MultilinearComposite},
 	protocols::test_utils::TestProductComposition,
 };
 use binius_field::{
-	BinaryField128b, BinaryField32b, BinaryField8b, ExtensionField, Field, PackedField,
+	arch::{OptimalUnderlier128b, OptimalUnderlier256b},
+	as_packed_field::{PackScalar, PackedType},
+	packed::set_packed_slice,
+	underlier::UnderlierType,
+	BinaryField128b, BinaryField32b, BinaryField8b, ExtensionField, Field, PackedBinaryField1x128b,
+	PackedBinaryField4x32b, PackedField,
 };
-use binius_hal::{
-	make_portable_backend, MLEEmbeddingAdapter, MultilinearExtension, MultilinearPoly,
-	MultilinearQuery,
-};
+use binius_hal::{make_portable_backend, ComputationBackendExt};
 use binius_hash::GroestlHasher;
-use binius_math::{CompositionPoly, IsomorphicEvaluationDomainFactory};
+use binius_math::{
+	CompositionPoly, IsomorphicEvaluationDomainFactory, MLEEmbeddingAdapter, MultilinearExtension,
+	MultilinearPoly,
+};
 use p3_util::log2_ceil_usize;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::{current_num_threads, prelude::*};
-use std::{iter, iter::repeat_with, sync::Arc};
+use std::{
+	iter::{self, repeat_with, Step},
+	sync::Arc,
+};
 
 #[derive(Debug, Clone)]
 struct SquareComposition;
@@ -59,10 +67,16 @@ where
 	PE::Scalar: ExtensionField<P::Scalar>,
 {
 	repeat_with(|| {
-		let values = repeat_with(|| P::random(&mut rng))
-			.take(1 << (n_vars - P::LOG_WIDTH))
+		let mut values = repeat_with(|| P::random(&mut rng))
+			.take(1 << (n_vars.saturating_sub(P::LOG_WIDTH)))
 			.collect::<Vec<_>>();
-		MultilinearExtension::from_values(values)
+		if n_vars < P::WIDTH {
+			for i in n_vars..P::WIDTH {
+				set_packed_slice(&mut values, i, P::Scalar::ZERO);
+			}
+		}
+
+		MultilinearExtension::new(n_vars, values)
 			.unwrap()
 			.specialize()
 	})
@@ -70,10 +84,12 @@ where
 	.collect()
 }
 
-fn compute_composite_sum<F, P, M, Composition>(multilinears: &[M], composition: Composition) -> F
+fn compute_composite_sum<P, M, Composition>(
+	multilinears: &[M],
+	composition: Composition,
+) -> P::Scalar
 where
-	F: Field,
-	P: PackedField<Scalar = F>,
+	P: PackedField,
 	M: MultilinearPoly<P> + Send + Sync,
 	Composition: CompositionPoly<P>,
 {
@@ -93,13 +109,25 @@ where
 		.sum()
 }
 
-fn test_prove_verify_product_helper(n_vars: usize, n_multilinears: usize, switchover_rd: usize) {
-	type F = BinaryField32b;
-	type FDomain = BinaryField8b;
-	type FE = BinaryField128b;
+fn test_prove_verify_product_helper<U, F, FDomain, FExt>(
+	n_vars: usize,
+	n_multilinears: usize,
+	switchover_rd: usize,
+) where
+	U: UnderlierType + PackScalar<F> + PackScalar<FDomain> + PackScalar<FExt>,
+	F: Field,
+	FDomain: Field + Step,
+	FExt: Field + ExtensionField<F> + ExtensionField<FDomain>,
+	BinaryField128b: From<FExt> + Into<FExt>,
+{
+	type FChallenge = BinaryField128b;
 	let mut rng = StdRng::seed_from_u64(0);
 
-	let multilins = generate_random_multilinears::<F, FE>(&mut rng, n_vars, n_multilinears);
+	let multilins = generate_random_multilinears::<PackedType<U, F>, PackedType<U, FExt>>(
+		&mut rng,
+		n_vars,
+		n_multilinears,
+	);
 	let composition = TestProductComposition::new(n_multilinears);
 	let sum = compute_composite_sum(&multilins, &composition);
 
@@ -127,7 +155,10 @@ fn test_prove_verify_product_helper(n_vars: usize, n_multilinears: usize, switch
 	)
 	.unwrap();
 
-	let challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
+	let challenger = IsomorphicChallenger::<FChallenge, _, _>::new(new_hasher_challenger::<
+		_,
+		GroestlHasher<_>,
+	>());
 
 	let mut prover_challenger = challenger.clone();
 	let (prover_reduced_claims, proof) =
@@ -138,8 +169,8 @@ fn test_prove_verify_product_helper(n_vars: usize, n_multilinears: usize, switch
 
 	// Check that challengers are in the same state
 	assert_eq!(
-		CanSample::<FE>::sample(&mut prover_challenger),
-		CanSample::<FE>::sample(&mut verifier_challenger)
+		CanSample::<FExt>::sample(&mut prover_challenger),
+		CanSample::<FExt>::sample(&mut verifier_challenger)
 	);
 
 	assert_eq!(verifier_reduced_claims, prover_reduced_claims);
@@ -155,7 +186,7 @@ fn test_prove_verify_product_helper(n_vars: usize, n_multilinears: usize, switch
 	assert_eq!(multilinear_evals[0].len(), n_multilinears);
 
 	// Verify the reduced multilinear evaluations are correct
-	let multilin_query = MultilinearQuery::with_full_query(eval_point, &backend).unwrap();
+	let multilin_query = backend.multilinear_query(eval_point).unwrap();
 	for (multilinear, &expected) in iter::zip(multilins, multilinear_evals[0].iter()) {
 		assert_eq!(multilinear.evaluate(multilin_query.to_ref()).unwrap(), expected);
 	}
@@ -166,7 +197,12 @@ fn test_sumcheck_prove_verify_interaction_basic() {
 	for n_vars in 2..8 {
 		for n_multilinears in 1..4 {
 			for switchover_rd in 0..=n_vars / 2 {
-				test_prove_verify_product_helper(n_vars, n_multilinears, switchover_rd);
+				test_prove_verify_product_helper::<
+					OptimalUnderlier128b,
+					BinaryField32b,
+					BinaryField8b,
+					BinaryField128b,
+				>(n_vars, n_multilinears, switchover_rd);
 			}
 		}
 	}
@@ -182,15 +218,41 @@ fn test_prove_verify_interaction_pigeonhole_cores() {
 	let n_vars = log2_ceil_usize(n_threads) + 1;
 	for n_multilinears in 1..4 {
 		for switchover_rd in 0..=n_vars / 2 {
-			test_prove_verify_product_helper(n_vars, n_multilinears, switchover_rd);
+			test_prove_verify_product_helper::<
+				OptimalUnderlier128b,
+				BinaryField32b,
+				BinaryField8b,
+				BinaryField128b,
+			>(n_vars, n_multilinears, switchover_rd);
 		}
 	}
 }
 
+#[test]
+fn test_sumcheck_prove_verify_with_nontrivial_packing() {
+	let n_vars = 8;
+	let n_multilinears = 3;
+	let switchover_rd = 3;
+
+	// Using a 256-bit underlier with a 128-bit extension field means the packed field will have a
+	// non-trivial packing width of 2.
+	test_prove_verify_product_helper::<
+		OptimalUnderlier256b,
+		BinaryField32b,
+		BinaryField8b,
+		BinaryField128b,
+	>(n_vars, n_multilinears, switchover_rd);
+}
+
 fn prove_verify_batch(n_vars: &[usize]) {
-	type F = BinaryField32b;
+	type P = PackedBinaryField4x32b;
 	type FDomain = BinaryField8b;
 	type FE = BinaryField128b;
+	type PE = PackedBinaryField1x128b;
+
+	trait UniversalComposition: CompositionPoly<FE> + CompositionPoly<PE> {}
+
+	impl<T: CompositionPoly<FE> + CompositionPoly<PE>> UniversalComposition for T {}
 
 	let mut rng = StdRng::seed_from_u64(0);
 
@@ -199,14 +261,12 @@ fn prove_verify_batch(n_vars: &[usize]) {
 	let (claims, provers) = n_vars
 		.iter()
 		.map(|n_vars| {
-			let multilins = generate_random_multilinears::<F, FE>(&mut rng, *n_vars, 3);
+			let multilins = generate_random_multilinears::<P, PE>(&mut rng, *n_vars, 3);
 			let identity_composition =
-				Arc::new(index_composition(&[0, 1, 2], [0], IdentityCompositionPoly).unwrap())
-					as Arc<dyn CompositionPoly<FE>>;
+				Arc::new(index_composition(&[0, 1, 2], [0], IdentityCompositionPoly).unwrap());
 
 			let square_composition =
-				Arc::new(index_composition(&[0, 1, 2], [1], SquareComposition).unwrap())
-					as Arc<dyn CompositionPoly<FE>>;
+				Arc::new(index_composition(&[0, 1, 2], [1], SquareComposition).unwrap());
 
 			let product_composition = Arc::new(TestProductComposition::new(3));
 
@@ -219,7 +279,7 @@ fn prove_verify_batch(n_vars: &[usize]) {
 				3,
 				vec![
 					CompositeSumClaim {
-						composition: identity_composition,
+						composition: identity_composition as Arc<dyn UniversalComposition>,
 						sum: identity_sum,
 					},
 					CompositeSumClaim {

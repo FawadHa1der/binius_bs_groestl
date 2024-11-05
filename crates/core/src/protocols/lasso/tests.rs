@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 use crate::{
 	oracle::MultilinearOracleSet,
@@ -9,7 +9,7 @@ use binius_field::{
 	as_packed_field::PackedType, underlier::WithUnderlier, BinaryField128b, BinaryField16b,
 	BinaryField64b, Field, PackedBinaryField128x1b, PackedFieldIndexable, TowerField,
 };
-use binius_hal::MultilinearExtension;
+use binius_math::MultilinearExtension;
 
 #[test]
 fn test_prove_verify_interaction() {

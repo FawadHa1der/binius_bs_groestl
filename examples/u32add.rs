@@ -1,4 +1,4 @@
-// Copyright 2024 Ulvetanna Inc.
+// Copyright 2024 Irreducible Inc.
 
 #![feature(step_trait)]
 
@@ -100,7 +100,8 @@ where
 			}
 		});
 
-	let index = MultilinearExtensionIndex::new().update_owned::<BinaryField1b, _>(iter::zip(
+	let mut index = MultilinearExtensionIndex::new();
+	index.set_owned::<BinaryField1b, _>(iter::zip(
 		[trace.x_in, trace.y_in, trace.z_out, trace.c_out, trace.c_in],
 		[x_in, y_in, z_out, c_out, c_in],
 	))?;
@@ -210,7 +211,8 @@ where
 		switchover_fn,
 		zerocheck_challenges.as_slice(),
 		&backend,
-	)?;
+	)?
+	.into_regular_zerocheck()?;
 
 	let (sumcheck_output, zerocheck_proof) =
 		sumcheck::prove::batch_prove(vec![prover], &mut iso_challenger)?;

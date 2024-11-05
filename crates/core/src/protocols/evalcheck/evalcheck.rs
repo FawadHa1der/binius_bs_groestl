@@ -1,4 +1,4 @@
-// Copyright 2023 Ulvetanna Inc.
+// Copyright 2023-2024 Irreducible Inc.
 
 use super::error::Error;
 use crate::oracle::{BatchId, CommittedBatch, CommittedId, MultilinearPolyOracle};
@@ -18,7 +18,7 @@ pub struct EvalcheckMultilinearClaim<F: Field> {
 	pub is_random_point: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum EvalcheckProof<F: Field> {
 	Transparent,
 	Committed,
