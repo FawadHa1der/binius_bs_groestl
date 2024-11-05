@@ -192,8 +192,8 @@ criterion_group!(
 	hash,
 	bench_groestl_compression,
 	bench_groestl,
-	bench_groestl_rustcrypto,
-	bench_vision32
+	// bench_groestl_rustcrypto,
+	// bench_vision32
 );
 //criterion_group!(hash, bench_groestl_bitsliced, bench_groestl_long_data);
 
