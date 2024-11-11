@@ -2,23 +2,22 @@
 
 use anyhow::Result;
 use binius_circuits::builder::ConstraintSystemBuilder;
-use binius_core::{constraint_system, fiat_shamir::HasherChallenger, tower::CanonicalTowerFamily};
-use binius_field::{arch::OptimalUnderlier128b, BinaryField128b, BinaryField8b};
+use binius_core::{constraint_system, fiat_shamir::HasherChallenger, tower::AESTowerFamily};
+use binius_field::{arch::OptimalUnderlier128b, AESTowerField128b, AESTowerField8b, BinaryField8b};
 use binius_hal::make_portable_backend;
-use binius_hash::{GroestlDigestCompression, GroestlHasher};
-use binius_math::DefaultEvaluationDomainFactory;
+use binius_hash::{Groestl256, GroestlDigestCompression};
+use binius_math::IsomorphicEvaluationDomainFactory;
 use binius_utils::{
 	checked_arithmetics::log2_ceil_usize, rayon::adjust_thread_pool, tracing::init_tracing,
 };
 use clap::{value_parser, Parser};
-use groestl_crypto::Groestl256;
 
-const LOG_ROWS_PER_PERMUTATION: usize = 11;
+const LOG_ROWS_PER_PERMUTATION: usize = 0;
 
 #[derive(Debug, Parser)]
 struct Args {
 	/// The number of permutations to verify.
-	#[arg(short, long, default_value_t = 8, value_parser = value_parser!(u32).range(1 << 3..))]
+	#[arg(short, long, default_value_t = 128, value_parser = value_parser!(u32).range(1 << 7..))]
 	n_permutations: u32,
 	/// The negative binary logarithm of the Reed–Solomon code rate.
 	#[arg(long, default_value_t = 1, value_parser = value_parser!(u32).range(1..))]
@@ -37,12 +36,12 @@ fn main() -> Result<()> {
 
 	let _guard = init_tracing().expect("failed to initialize tracing");
 
-	println!("Verifying {} Keccak-f permutations", args.n_permutations);
+	println!("Verifying {} Grøstl-256 P permutations", args.n_permutations);
 
 	let log_n_permutations = log2_ceil_usize(args.n_permutations as usize);
 
-	let mut builder = ConstraintSystemBuilder::<U, BinaryField128b>::new_with_witness();
-	let _state_out = binius_circuits::keccakf::keccakf(
+	let mut builder = ConstraintSystemBuilder::<U, AESTowerField128b>::new_with_witness();
+	let _state_out = binius_circuits::groestl::groestl_p_permutation(
 		&mut builder,
 		log_n_permutations + LOG_ROWS_PER_PERMUTATION,
 	);
@@ -52,17 +51,17 @@ fn main() -> Result<()> {
 		.expect("builder created with witness");
 	let constraint_system = builder.build()?;
 
-	let domain_factory = DefaultEvaluationDomainFactory::default();
+	let domain_factory = IsomorphicEvaluationDomainFactory::<BinaryField8b>::default();
 	let backend = make_portable_backend();
 
 	let proof = constraint_system::prove::<
 		U,
-		CanonicalTowerFamily,
+		AESTowerFamily,
 		_,
 		_,
-		GroestlHasher<BinaryField128b>,
-		GroestlDigestCompression<BinaryField8b>,
-		HasherChallenger<Groestl256>,
+		Groestl256<AESTowerField128b, _>,
+		GroestlDigestCompression<AESTowerField8b>,
+		HasherChallenger<groestl_crypto::Groestl256>,
 		_,
 	>(
 		&constraint_system,
@@ -73,13 +72,15 @@ fn main() -> Result<()> {
 		&backend,
 	)?;
 
-	constraint_system::verify::<U, CanonicalTowerFamily, _, _, _, _, HasherChallenger<Groestl256>>(
-		&constraint_system,
-		args.log_inv_rate as usize,
-		SECURITY_BITS,
-		&domain_factory,
-		proof,
-	)?;
+	constraint_system::verify::<
+		U,
+		AESTowerFamily,
+		_,
+		_,
+		_,
+		_,
+		HasherChallenger<groestl_crypto::Groestl256>,
+	>(&constraint_system, args.log_inv_rate as usize, SECURITY_BITS, &domain_factory, proof)?;
 
 	Ok(())
 }

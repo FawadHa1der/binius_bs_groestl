@@ -1,12 +1,12 @@
 // Copyright 2024 Irreducible Inc.
 
-use super::ring_switch::{evaluate_ring_switch_eq_ind, reduce_tensor_claim};
+use super::ring_switch::reduce_tensor_claim;
 use crate::{
 	challenger::{CanObserve, CanSample, CanSampleBits},
 	composition::BivariateProduct,
 	merkle_tree::VectorCommitScheme,
-	poly_commit::{ring_switch::ring_switch_eq_ind_partial_eval, PolyCommitScheme},
-	polynomial::Error as PolynomialError,
+	poly_commit::PolyCommitScheme,
+	polynomial::{Error as PolynomialError, MultivariatePoly},
 	protocols::{
 		fri::{self, FRIFolder, FRIParams, FRIVerifier, FoldRoundOutput},
 		sumcheck::{
@@ -18,16 +18,17 @@ use crate::{
 	},
 	reed_solomon::reed_solomon::ReedSolomonCode,
 	tensor_algebra::TensorAlgebra,
+	transparent::ring_switch::RingSwitchEqInd,
 };
 use binius_field::{
 	packed::iter_packed_slice, BinaryField, ExtensionField, Field, PackedExtension, PackedField,
-	PackedFieldIndexable,
+	PackedFieldIndexable, TowerField,
 };
 use binius_hal::{ComputationBackend, ComputationBackendExt};
 use binius_math::{EvaluationDomainFactory, MLEDirectAdapter, MultilinearExtension};
 use binius_ntt::NTTOptions;
 use binius_utils::{bail, checked_arithmetics::checked_log_2};
-use std::{iter, iter::repeat_with, marker::PhantomData, mem, ops::Deref};
+use std::{iter, marker::PhantomData, mem, ops::Deref};
 use tracing::instrument;
 
 /// The small-field FRI-based PCS from [DP24], also known as the FRI-Binius PCS.
@@ -194,7 +195,7 @@ where
 		committed: &VCS::Committed,
 		mut sumcheck_prover: Prover,
 		mut challenger: Challenger,
-	) -> Result<Proof<F, FExt, VCS>, Error>
+	) -> Result<Proof<FExt, VCS>, Error>
 	where
 		Prover: SumcheckProver<FExt>,
 		Challenger:
@@ -227,21 +228,13 @@ where
 
 		let _ = sumcheck_prover.finish()?;
 
-		let (terminate_codeword, query_prover) = fri_prover.finalize()?;
-
-		let fri_query_proofs = repeat_with(|| {
-			let index = challenger.sample_bits(self.fri_params.rs_code().log_len());
-			query_prover.prove_query(index)
-		})
-		.take(self.fri_params.n_test_queries())
-		.collect::<Result<Vec<_>, _>>()?;
+		let fri_proof = fri_prover.finish_proof(challenger)?;
 
 		Ok(Proof {
-			sumcheck_eval,
+			sumcheck_eval: sumcheck_eval.vertical_elems().to_vec(),
 			sumcheck_rounds: rounds,
 			fri_commitments,
-			fri_terminate_codeword: terminate_codeword,
-			fri_query_proofs,
+			fri_proof,
 		})
 	}
 
@@ -252,9 +245,8 @@ where
 		codeword_commitment: &VCS::Commitment,
 		sumcheck_round_proofs: Vec<RoundProof<FExt>>,
 		fri_commitments: Vec<VCS::Commitment>,
-		fri_terminate_codeword: fri::TerminateCodeword<FExt>,
-		fri_query_proofs: Vec<fri::QueryProof<FExt, VCS::Proof>>,
-		ring_switch_evaluator: impl FnOnce(&[FExt]) -> FExt,
+		fri_proof: fri::FRIProof<FExt, VCS::Proof>,
+		ring_switch_evaluator: impl FnOnce(&[FExt]) -> Result<FExt, PolynomialError>,
 		mut challenger: Challenger,
 	) -> Result<(), Error>
 	where
@@ -307,28 +299,14 @@ where
 
 			sum = interpolate_round_proof(round_proof, sum, challenge);
 		}
-		let verifier = FRIVerifier::new(
-			&self.fri_params,
-			codeword_commitment,
-			&fri_commitments,
-			&challenges,
-			fri_terminate_codeword,
-		)?;
+		let verifier =
+			FRIVerifier::new(&self.fri_params, codeword_commitment, &fri_commitments, &challenges)?;
 
-		let ring_switch_eval = ring_switch_evaluator(&challenges);
-		let final_fri_value = verifier.verify_last_oracle()?;
+		let ring_switch_eval = ring_switch_evaluator(&challenges)?;
+		let final_fri_value = verifier.verify(fri_proof, challenger)?;
 		if final_fri_value * ring_switch_eval != sum {
 			return Err(VerificationError::IncorrectSumcheckEvaluation.into());
 		}
-
-		if fri_query_proofs.len() != self.fri_params.n_test_queries() {
-			return Err(VerificationError::IncorrectNumberOfFRIQueries.into());
-		}
-		for query_proof in fri_query_proofs {
-			let index = challenger.sample_bits(self.fri_params.rs_code().log_len());
-			verifier.verify_query(index, query_proof)?;
-		}
-
 		Ok(())
 	}
 }
@@ -336,10 +314,10 @@ where
 impl<F, FDomain, FEncode, FExt, P, PE, DomainFactory, VCS> PolyCommitScheme<P, FExt>
 	for FRIPCS<F, FDomain, FEncode, PE, DomainFactory, VCS>
 where
-	F: Field,
+	F: TowerField,
 	FDomain: Field,
 	FEncode: BinaryField,
-	FExt: BinaryField
+	FExt: TowerField
 		+ PackedField<Scalar = FExt>
 		+ ExtensionField<F>
 		+ ExtensionField<FDomain>
@@ -359,7 +337,7 @@ where
 	// Committed data is a tuple with the underlying codeword and the VCS committed data (ie.
 	// Merkle internal node hashes).
 	type Committed = (Vec<PE>, VCS::Committed);
-	type Proof = Proof<F, FExt, VCS>;
+	type Proof = Proof<FExt, VCS>;
 	type Error = Error;
 
 	fn n_vars(&self) -> usize {
@@ -451,12 +429,12 @@ where
 			&tensor_mixing_challenges,
 			backend,
 		);
-		let val = ring_switch_eq_ind_partial_eval::<F, _, _, _>(
-			query_from_kappa,
-			&tensor_mixing_challenges,
-			backend,
+		let rs_eq = RingSwitchEqInd::<F, _, PE>::new(
+			query_from_kappa.to_vec(),
+			tensor_mixing_challenges.to_vec(),
 		)?;
-		let transparent = MultilinearExtension::from_values_generic(val)?;
+		let transparent = rs_eq.multilinear_extension(backend)?;
+
 		let sumcheck_prover = RegularSumcheckProver::new(
 			[packed_poly.to_ref(), transparent.to_ref()]
 				.map(MLEDirectAdapter::from)
@@ -508,8 +486,7 @@ where
 			sumcheck_eval,
 			sumcheck_rounds,
 			fri_commitments,
-			fri_terminate_codeword,
-			fri_query_proofs,
+			fri_proof,
 		} = proof;
 
 		let n_rounds = self.n_vars() - Self::kappa();
@@ -517,7 +494,15 @@ where
 
 		let (query_to_kappa, query_from_kappa) = query.split_at(Self::kappa());
 
-		challenger.observe_slice(sumcheck_eval.vertical_elems());
+		if sumcheck_eval.len() != 1 << Self::kappa() {
+			return Err(VerificationError::IncorrectEvaluationShape {
+				expected: 1 << Self::kappa(),
+				actual: sumcheck_eval.len(),
+			}
+			.into());
+		}
+		challenger.observe_slice(&sumcheck_eval);
+		let sumcheck_eval = <TensorAlgebra<F, FExt>>::new(sumcheck_eval);
 
 		// Check that the claimed sum is consistent with the tensor algebra element received.
 		let expanded_query = backend.multilinear_query::<FExt>(query_to_kappa)?;
@@ -539,15 +524,13 @@ where
 			commitment,
 			sumcheck_rounds,
 			fri_commitments,
-			fri_terminate_codeword,
-			fri_query_proofs,
+			fri_proof,
 			|challenges| {
-				evaluate_ring_switch_eq_ind::<F, _, _>(
-					query_from_kappa,
-					challenges,
-					&tensor_mixing_challenges,
-					backend,
-				)
+				let rs_eq = RingSwitchEqInd::<F, _, PE>::new(
+					query_from_kappa.to_vec(),
+					tensor_mixing_challenges.to_vec(),
+				)?;
+				rs_eq.evaluate(challenges)
 			},
 			challenger,
 		)
@@ -594,17 +577,16 @@ where
 
 /// A [`FRIPCS`] proof.
 #[derive(Debug, Clone)]
-pub struct Proof<F, FExt, VCS>
+pub struct Proof<F, VCS>
 where
 	F: Field,
-	FExt: ExtensionField<F>,
-	VCS: VectorCommitScheme<FExt>,
+	VCS: VectorCommitScheme<F>,
 {
-	sumcheck_eval: TensorAlgebra<F, FExt>,
-	sumcheck_rounds: Vec<RoundProof<FExt>>,
+	/// The vertical elements of the tensor algebra sum.
+	sumcheck_eval: Vec<F>,
+	sumcheck_rounds: Vec<RoundProof<F>>,
 	fri_commitments: Vec<VCS::Commitment>,
-	fri_terminate_codeword: fri::TerminateCodeword<FExt>,
-	fri_query_proofs: Vec<fri::QueryProof<FExt, VCS::Proof>>,
+	fri_proof: fri::FRIProof<F, VCS::Proof>,
 }
 
 /// Heuristic for estimating the optimal arity (with respect to proof size) for the FRI-based PCS.
@@ -638,8 +620,8 @@ pub fn estimate_optimal_arity(
 			}
 		})
 		.last()
-		.unwrap()
-		.0
+		.map(|(arity, _)| arity)
+		.unwrap_or(1)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -666,6 +648,11 @@ pub enum Error {
 pub enum VerificationError {
 	#[error("sumcheck verification error: {0}")]
 	Sumcheck(#[from] sumcheck::VerificationError),
+	#[error(
+		"tensor algebra evaluation shape is incorrect; \
+		expected {expected} field elements, got {actual}"
+	)]
+	IncorrectEvaluationShape { expected: usize, actual: usize },
 	#[error("evaluation value is inconsistent with the tensor evaluation")]
 	IncorrectEvaluation,
 	#[error("sumcheck final evaluation is incorrect")]
@@ -679,7 +666,11 @@ pub enum VerificationError {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{challenger::new_hasher_challenger, merkle_tree::MerkleTreeVCS};
+	use crate::{
+		fiat_shamir::HasherChallenger,
+		merkle_tree::MerkleTreeVCS,
+		transcript::{AdviceWriter, TranscriptWriter},
+	};
 	use binius_field::{
 		arch::packed_polyval_128::PackedBinaryPolyval1x128b,
 		as_packed_field::{PackScalar, PackedType},
@@ -689,6 +680,8 @@ mod tests {
 	use binius_hal::make_portable_backend;
 	use binius_hash::{GroestlDigestCompression, GroestlHasher};
 	use binius_math::IsomorphicEvaluationDomainFactory;
+	use groestl_crypto::Groestl256;
+	use iter::repeat_with;
 	use rand::{prelude::StdRng, SeedableRng};
 
 	fn test_commit_prove_verify_success<U, F, FA, FE>(
@@ -702,9 +695,9 @@ mod tests {
 			+ PackScalar<FE>
 			+ PackScalar<BinaryField8b>
 			+ Divisible<u8>,
-		F: Field,
+		F: TowerField,
 		FA: BinaryField,
-		FE: BinaryField
+		FE: TowerField
 			+ ExtensionField<F>
 			+ ExtensionField<FA>
 			+ ExtensionField<BinaryField8b>
@@ -755,13 +748,14 @@ mod tests {
 
 		let (commitment, committed) = pcs.commit(&[multilin.to_ref()]).unwrap();
 
-		let mut challenger = new_hasher_challenger::<_, GroestlHasher<_>>();
-		challenger.observe(commitment.clone());
-
-		let mut prover_challenger = challenger.clone();
+		let mut prover_proof = crate::transcript::Proof {
+			transcript: TranscriptWriter::<HasherChallenger<Groestl256>>::default(),
+			advice: AdviceWriter::default(),
+		};
+		prover_proof.transcript.observe(commitment.clone());
 		let proof = pcs
 			.prove_evaluation(
-				&mut prover_challenger,
+				&mut prover_proof.transcript,
 				&committed,
 				&[multilin],
 				&eval_point,
@@ -769,9 +763,10 @@ mod tests {
 			)
 			.unwrap();
 
-		let mut verifier_challenger = challenger.clone();
+		let mut verifier_proof = prover_proof.into_verifier();
+		verifier_proof.transcript.observe(commitment.clone());
 		pcs.verify_evaluation(
-			&mut verifier_challenger,
+			&mut verifier_proof.transcript,
 			&commitment,
 			&eval_point,
 			proof,

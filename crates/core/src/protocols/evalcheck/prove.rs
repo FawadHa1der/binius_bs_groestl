@@ -128,7 +128,6 @@ where
 			poly: multilinear,
 			eval_point,
 			eval,
-			is_random_point,
 		} = evalcheck_claim;
 
 		use MultilinearPolyOracle::*;
@@ -141,7 +140,6 @@ where
 					id,
 					eval_point,
 					eval,
-					is_random_point,
 				};
 
 				self.batch_committed_eval_claims.insert(subclaim);
@@ -155,45 +153,10 @@ where
 					poly: *inner,
 					eval_point: inner_eval_point,
 					eval,
-					is_random_point,
 				};
 
 				let subproof = self.prove_multilinear(subclaim)?;
 				EvalcheckProof::Repeating(Box::new(subproof))
-			}
-
-			Merged { poly0, poly1, .. } => {
-				let n_vars = poly0.n_vars();
-				assert_eq!(poly0.n_vars(), poly1.n_vars());
-				let inner_eval_point = &eval_point[..n_vars];
-
-				let (eval1, subproof1) =
-					self.eval_and_proof(*poly0, inner_eval_point, is_random_point)?;
-				let (eval2, subproof2) =
-					self.eval_and_proof(*poly1, inner_eval_point, is_random_point)?;
-
-				EvalcheckProof::Merged {
-					eval1,
-					eval2,
-					subproof1: Box::new(subproof1),
-					subproof2: Box::new(subproof2),
-				}
-			}
-			Interleaved { poly0, poly1, .. } => {
-				assert_eq!(poly0.n_vars(), poly1.n_vars());
-				let inner_eval_point = &eval_point[1..];
-
-				let (eval1, subproof1) =
-					self.eval_and_proof(*poly0, inner_eval_point, is_random_point)?;
-				let (eval2, subproof2) =
-					self.eval_and_proof(*poly1, inner_eval_point, is_random_point)?;
-
-				EvalcheckProof::Interleaved {
-					eval1,
-					eval2,
-					subproof1: Box::new(subproof1),
-					subproof2: Box::new(subproof2),
-				}
 			}
 
 			Shifted { shifted, .. } => {
@@ -244,7 +207,6 @@ where
 					poly: new_poly,
 					eval_point: new_eval_point,
 					eval,
-					is_random_point,
 				};
 
 				self.prove_multilinear(subclaim)?
@@ -256,7 +218,7 @@ where
 				let subproofs = linear_combination
 					.polys()
 					.cloned()
-					.map(|suboracle| self.eval_and_proof(suboracle, &eval_point, is_random_point))
+					.map(|suboracle| self.eval_and_proof(suboracle, &eval_point))
 					.collect::<Result<_, Error>>()?;
 
 				EvalcheckProof::Composite { subproofs }
@@ -266,8 +228,7 @@ where
 				let inner_n_vars = inner.n_vars();
 
 				let inner_eval_point = &eval_point[..inner_n_vars];
-				let (eval, subproof) =
-					self.eval_and_proof(*inner, inner_eval_point, is_random_point)?;
+				let (eval, subproof) = self.eval_and_proof(*inner, inner_eval_point)?;
 
 				EvalcheckProof::ZeroPadded(eval, Box::new(subproof))
 			}
@@ -280,7 +241,6 @@ where
 		&mut self,
 		poly: MultilinearPolyOracle<F>,
 		eval_point: &[F],
-		is_random_point: bool,
 	) -> Result<(F, EvalcheckProof<F>), Error> {
 		let eval_query = self.memoized_queries.full_query(eval_point, self.backend)?;
 		let witness_poly = self
@@ -292,7 +252,6 @@ where
 			poly,
 			eval_point: eval_point.to_vec(),
 			eval,
-			is_random_point,
 		};
 		let subproof = self.prove_multilinear(subclaim)?;
 		Ok((eval, subproof))

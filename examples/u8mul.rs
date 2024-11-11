@@ -13,13 +13,11 @@ use binius_utils::{
 use clap::{value_parser, Parser};
 use groestl_crypto::Groestl256;
 
-const LOG_ROWS_PER_PERMUTATION: usize = 11;
-
 #[derive(Debug, Parser)]
 struct Args {
 	/// The number of permutations to verify.
-	#[arg(short, long, default_value_t = 8, value_parser = value_parser!(u32).range(1 << 3..))]
-	n_permutations: u32,
+	#[arg(short, long, default_value_t = 1024, value_parser = value_parser!(u32).range(1 << 10..))]
+	n_multiplications: u32,
 	/// The negative binary logarithm of the Reed–Solomon code rate.
 	#[arg(long, default_value_t = 1, value_parser = value_parser!(u32).range(1..))]
 	log_inv_rate: u32,
@@ -37,15 +35,23 @@ fn main() -> Result<()> {
 
 	let _guard = init_tracing().expect("failed to initialize tracing");
 
-	println!("Verifying {} Keccak-f permutations", args.n_permutations);
+	println!("Verifying {} u8 multiplications", args.n_multiplications);
 
-	let log_n_permutations = log2_ceil_usize(args.n_permutations as usize);
+	let log_n_multiplications = log2_ceil_usize(args.n_multiplications as usize);
 
 	let mut builder = ConstraintSystemBuilder::<U, BinaryField128b>::new_with_witness();
-	let _state_out = binius_circuits::keccakf::keccakf(
+	let in_a = binius_circuits::unconstrained::unconstrained::<_, _, BinaryField8b>(
 		&mut builder,
-		log_n_permutations + LOG_ROWS_PER_PERMUTATION,
-	);
+		"in_a",
+		log_n_multiplications,
+	)?;
+	let in_b = binius_circuits::unconstrained::unconstrained::<_, _, BinaryField8b>(
+		&mut builder,
+		"in_b",
+		log_n_multiplications,
+	)?;
+	let _product =
+		binius_circuits::lasso::u8mul(&mut builder, "out_c", in_a, in_b, log_n_multiplications)?;
 
 	let witness = builder
 		.take_witness()

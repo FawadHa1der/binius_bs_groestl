@@ -32,6 +32,11 @@ pub enum Error {
 		composition_index: usize,
 		vertex_index: usize,
 	},
+	#[error("nonzerocheck naive witness validation failed: oracle {oracle}, hypercube index {hypercube_index}")]
+	NonzerocheckNaiveValidationFailure {
+		oracle: String,
+		hypercube_index: usize,
+	},
 	#[error("constraint set containts multilinears of different heights")]
 	ConstraintSetNumberOfVariablesMismatch,
 	#[error("batching sumchecks and zerochecks is not supported yet")]
@@ -76,6 +81,8 @@ pub enum Error {
 	MathError(#[from] binius_math::Error),
 	#[error("HAL error: {0}")]
 	HalError(#[from] binius_hal::Error),
+	#[error("Transcript error: {0}")]
+	TranscriptError(#[from] crate::transcript::Error),
 }
 
 #[derive(Debug, thiserror::Error)]

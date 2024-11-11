@@ -2,21 +2,21 @@
 
 mod error;
 
-use crate::fiat_shamir::HasherChallenger;
+use crate::{fiat_shamir::Challenger, merkle_tree::MerkleCap};
 use binius_field::{deserialize_canonical, serialize_canonical, PackedField, TowerField};
 use bytes::{buf::UninitSlice, Buf, BufMut, Bytes, BytesMut};
-use digest::{core_api::BlockSizeUser, Digest, FixedOutputReset};
-use error::Error;
-use p3_challenger::{CanObserve, CanSample};
+pub use error::Error;
+use p3_challenger::{CanObserve, CanSample, CanSampleBits};
 use std::slice;
+use tracing::warn;
 
 /// Writable(Prover) transcript over some Challenger that `CanWrite` and `CanSample<F: TowerField>`
 ///
 /// A Transcript is an abstraction over Fiat-Shamir so the prover and verifier can send and receive
 /// data, everything that gets written to or read from the transcript will be observed
 #[derive(Debug, Default)]
-pub struct TranscriptWriter<H: Digest + BlockSizeUser> {
-	combined: FiatShamirBuf<BytesMut, H>,
+pub struct TranscriptWriter<Challenger> {
+	combined: FiatShamirBuf<BytesMut, Challenger>,
 }
 
 /// Writable(Prover) advice that `CanWrite`
@@ -32,8 +32,8 @@ pub struct AdviceWriter {
 /// You must manually call the destructor with `finalize()` to check anything that's written is
 /// fully read out
 #[derive(Debug)]
-pub struct TranscriptReader<H: Digest + BlockSizeUser> {
-	combined: FiatShamirBuf<Bytes, H>,
+pub struct TranscriptReader<Challenger> {
+	combined: FiatShamirBuf<Bytes, Challenger>,
 }
 
 /// Readable(Verifier) advice that `CanRead`
@@ -52,14 +52,12 @@ pub struct Proof<Transcript, Advice> {
 }
 
 #[derive(Debug, Default)]
-struct FiatShamirBuf<Inner: Default, H: Digest + BlockSizeUser> {
+struct FiatShamirBuf<Inner, Challenger> {
 	buffer: Inner,
-	challenger: HasherChallenger<H>,
+	challenger: Challenger,
 }
 
-impl<Inner: Default + Buf, H: Digest + BlockSizeUser + FixedOutputReset + Default> Buf
-	for FiatShamirBuf<Inner, H>
-{
+impl<Inner: Buf, Challenger_: Challenger> Buf for FiatShamirBuf<Inner, Challenger_> {
 	fn remaining(&self) -> usize {
 		self.buffer.remaining()
 	}
@@ -79,9 +77,7 @@ impl<Inner: Default + Buf, H: Digest + BlockSizeUser + FixedOutputReset + Defaul
 	}
 }
 
-unsafe impl<Inner: Default + BufMut, H: Digest + BlockSizeUser + FixedOutputReset + Default> BufMut
-	for FiatShamirBuf<Inner, H>
-{
+unsafe impl<Inner: BufMut, Challenger_: Challenger> BufMut for FiatShamirBuf<Inner, Challenger_> {
 	fn remaining_mut(&self) -> usize {
 		self.buffer.remaining_mut()
 	}
@@ -105,10 +101,7 @@ unsafe impl<Inner: Default + BufMut, H: Digest + BlockSizeUser + FixedOutputRese
 	}
 }
 
-impl<H> TranscriptWriter<H>
-where
-	H: Default + Digest + BlockSizeUser,
-{
+impl<Challenger: Default> TranscriptWriter<Challenger> {
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -117,7 +110,7 @@ where
 		self.combined.buffer.to_vec()
 	}
 
-	pub fn into_reader(self) -> TranscriptReader<H> {
+	pub fn into_reader(self) -> TranscriptReader<Challenger> {
 		TranscriptReader::new(self.finalize())
 	}
 }
@@ -136,14 +129,20 @@ impl AdviceWriter {
 	}
 }
 
-impl<H> TranscriptReader<H>
-where
-	H: Digest + BlockSizeUser,
-{
+impl<Challenger: Default> Proof<TranscriptWriter<Challenger>, AdviceWriter> {
+	pub fn into_verifier(self) -> Proof<TranscriptReader<Challenger>, AdviceReader> {
+		Proof {
+			transcript: self.transcript.into_reader(),
+			advice: self.advice.into_reader(),
+		}
+	}
+}
+
+impl<Challenger: Default> TranscriptReader<Challenger> {
 	pub fn new(vec: Vec<u8>) -> Self {
 		Self {
 			combined: FiatShamirBuf {
-				challenger: HasherChallenger::default(),
+				challenger: Challenger::default(),
 				buffer: Bytes::from(vec),
 			},
 		}
@@ -156,6 +155,26 @@ where
 			});
 		}
 		Ok(())
+	}
+}
+
+// Useful warnings to see if we are neglecting to read any advice or transcript entirely
+impl<Challenger> Drop for TranscriptReader<Challenger> {
+	fn drop(&mut self) {
+		if self.combined.buffer.has_remaining() {
+			warn!(
+				"Transcript reader is not fully read out: {:?} bytes left",
+				self.combined.buffer.remaining()
+			)
+		}
+	}
+}
+
+impl Drop for AdviceReader {
+	fn drop(&mut self) {
+		if self.buffer.has_remaining() {
+			warn!("Advice reader is not fully read out: {:?} bytes left", self.buffer.remaining())
+		}
 	}
 }
 
@@ -177,6 +196,7 @@ impl AdviceReader {
 }
 
 /// Trait that is used to read bytes and field elements from transcript/advice
+#[auto_impl::auto_impl(&mut)]
 pub trait CanRead {
 	fn read_bytes(&mut self, buf: &mut [u8]) -> Result<(), Error>;
 
@@ -189,7 +209,7 @@ pub trait CanRead {
 	fn read_scalar_slice_into<F: TowerField>(&mut self, buf: &mut [F]) -> Result<(), Error>;
 
 	fn read_scalar_slice<F: TowerField>(&mut self, len: usize) -> Result<Vec<F>, Error> {
-		let mut elems = Vec::with_capacity(len);
+		let mut elems = vec![F::default(); len];
 		self.read_scalar_slice_into(&mut elems)?;
 		Ok(elems)
 	}
@@ -208,10 +228,7 @@ pub trait CanRead {
 	}
 }
 
-impl<H> CanRead for TranscriptReader<H>
-where
-	H: Digest + BlockSizeUser + FixedOutputReset + Default,
-{
+impl<Challenger_: Challenger> CanRead for TranscriptReader<Challenger_> {
 	fn read_bytes(&mut self, buf: &mut [u8]) -> Result<(), Error> {
 		if self.combined.buffer.remaining() < buf.len() {
 			return Err(Error::NotEnoughBytes);
@@ -246,6 +263,7 @@ impl CanRead for AdviceReader {
 }
 
 /// Trait that is used to write bytes and field elements to transcript/advice
+#[auto_impl::auto_impl(&mut)]
 pub trait CanWrite {
 	fn write_bytes(&mut self, data: &[u8]);
 
@@ -262,11 +280,7 @@ pub trait CanWrite {
 	}
 }
 
-// impl CanWrite for {Advice/Transcript}Writer {
-impl<H> CanWrite for TranscriptWriter<H>
-where
-	H: Digest + BlockSizeUser + FixedOutputReset + Default,
-{
+impl<Challenger_: Challenger> CanWrite for TranscriptWriter<Challenger_> {
 	fn write_bytes(&mut self, data: &[u8]) {
 		self.combined.put_slice(data);
 	}
@@ -290,10 +304,10 @@ impl CanWrite for AdviceWriter {
 	}
 }
 
-impl<H, F> CanSample<F> for TranscriptReader<H>
+impl<F, Challenger_> CanSample<F> for TranscriptReader<Challenger_>
 where
 	F: TowerField,
-	H: Digest + BlockSizeUser + FixedOutputReset + Default,
+	Challenger_: Challenger,
 {
 	fn sample(&mut self) -> F {
 		deserialize_canonical(self.combined.challenger.sampler())
@@ -301,37 +315,99 @@ where
 	}
 }
 
-impl<H, F> CanSample<F> for TranscriptWriter<H>
+impl<F, Challenger_> CanSample<F> for TranscriptWriter<Challenger_>
 where
 	F: TowerField,
-	H: Digest + BlockSizeUser + FixedOutputReset + Default,
+	Challenger_: Challenger,
 {
 	fn sample(&mut self) -> F {
 		deserialize_canonical(self.combined.challenger.sampler())
 			.expect("challenger has infinite buffer")
+	}
+}
+
+fn sample_bits_reader<Reader: Buf>(mut reader: Reader, bits: usize) -> usize {
+	let bits = bits.min(usize::BITS as usize);
+
+	let bytes_to_sample = bits.div_ceil(8);
+
+	let mut bytes = [0u8; std::mem::size_of::<usize>()];
+
+	reader.copy_to_slice(&mut bytes[..bytes_to_sample]);
+
+	let unmasked = usize::from_le_bytes(bytes);
+	let mask = 1usize.checked_shl(bits as u32);
+	let mask = match mask {
+		Some(x) => x - 1,
+		None => usize::MAX,
+	};
+	mask & unmasked
+}
+
+impl<Challenger_> CanSampleBits<usize> for TranscriptReader<Challenger_>
+where
+	Challenger_: Challenger,
+{
+	fn sample_bits(&mut self, bits: usize) -> usize {
+		sample_bits_reader(self.combined.challenger.sampler(), bits)
+	}
+}
+
+impl<Challenger_> CanSampleBits<usize> for TranscriptWriter<Challenger_>
+where
+	Challenger_: Challenger,
+{
+	fn sample_bits(&mut self, bits: usize) -> usize {
+		sample_bits_reader(self.combined.challenger.sampler(), bits)
 	}
 }
 
 // This is temporary until we can move the entire proof into read write interface
-impl<H, F> CanObserve<F> for TranscriptReader<H>
+impl<P, Challenger_> CanObserve<MerkleCap<P>> for TranscriptReader<Challenger_>
 where
-	F: TowerField,
-	H: Digest + BlockSizeUser + FixedOutputReset + Default,
+	Challenger_: Challenger,
+	P: Clone,
+	Self: CanObserve<P>,
 {
-	fn observe(&mut self, value: F) {
-		serialize_canonical(value, self.combined.challenger.observer())
-			.expect("challenger has infinite buffer")
+	fn observe(&mut self, value: MerkleCap<P>) {
+		self.observe_slice(&value.0);
 	}
 }
 
-impl<H, F> CanObserve<F> for TranscriptWriter<H>
+impl<P, Challenger_> CanObserve<P> for TranscriptReader<Challenger_>
 where
-	F: TowerField,
-	H: Digest + BlockSizeUser + FixedOutputReset + Default,
+	P: PackedField<Scalar: TowerField>,
+	Challenger_: Challenger,
 {
-	fn observe(&mut self, value: F) {
-		serialize_canonical(value, self.combined.challenger.observer())
-			.expect("challenger has infinite buffer")
+	fn observe(&mut self, value: P) {
+		for scalar in value.iter() {
+			serialize_canonical(scalar, self.combined.challenger.observer())
+				.expect("challenger has infinite buffer")
+		}
+	}
+}
+
+impl<P, Challenger_> CanObserve<MerkleCap<P>> for TranscriptWriter<Challenger_>
+where
+	P: Clone,
+	Self: CanObserve<P>,
+	Challenger_: Challenger,
+{
+	fn observe(&mut self, value: MerkleCap<P>) {
+		self.observe_slice(&value.0);
+	}
+}
+
+impl<P, Challenger_> CanObserve<P> for TranscriptWriter<Challenger_>
+where
+	P: PackedField<Scalar: TowerField>,
+	Challenger_: Challenger,
+{
+	fn observe(&mut self, value: P) {
+		for scalar in value.iter() {
+			serialize_canonical(scalar, self.combined.challenger.observer())
+				.expect("challenger has infinite buffer")
+		}
 	}
 }
 
@@ -348,7 +424,7 @@ mod tests {
 
 	#[test]
 	fn test_transcripting() {
-		let mut prover_transcript = TranscriptWriter::<Groestl256>::new();
+		let mut prover_transcript = TranscriptWriter::<HasherChallenger<Groestl256>>::new();
 
 		prover_transcript.write_scalar(BinaryField8b::new(0x96));
 		prover_transcript.write_scalar(BinaryField32b::new(0xDEADBEEF));
@@ -447,7 +523,7 @@ mod tests {
 
 	#[test]
 	fn test_challenger() {
-		let mut transcript = TranscriptWriter::<Groestl256>::new();
+		let mut transcript = TranscriptWriter::<HasherChallenger<Groestl256>>::new();
 		let mut challenger = HasherChallenger::<Groestl256>::default();
 
 		const NUM_SAMPLING: usize = 32;
