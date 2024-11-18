@@ -5,7 +5,7 @@ use binius_field::{
 };
 use binius_hash::{
 	FixedLenHasherDigest, Groestl256, GroestlDigest, GroestlDigestCompression, HashDigest,
-	HasherDigest, Vision32b, VisionHasher,
+	HasherDigest, Vision32b, VisionHasher,  GroestlHasher, Hasher
 };
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use groestl_crypto::{Digest, Groestl256 as GenericGroestl256};
@@ -16,7 +16,7 @@ use rand::prelude::*;
 use rayon::prelude::*;
 use rayon::{collections::linked_list, prelude::*};
 use std::{iter::repeat_with, marker::PhantomData, mem};
-use binius_hash::{GroestlDigest, GroestlDigestCompression, GroestlHasher, Hasher};
+
 use binius_field::PackedBinaryField16x8b;
 
 use std::array;
@@ -107,36 +107,36 @@ fn packed_to_bytes(packed: &[PackedPrimitiveType]) -> &[PackedBinaryField32x8b] 
 }
 
 
-fn bench_groestl_long_data(c: &mut Criterion) {
-    let mut group = c.benchmark_group("groestl");
-    let n_hashes = 64;
-    let input_items_length = 1024;
+// fn bench_groestl_long_data(c: &mut Criterion) {
+//     let mut group = c.benchmark_group("groestl");
+//     let n_hashes = 64;
+//     let input_items_length = 1024;
 
-    // let default_input_value = PackedPrimitiveType {
-    //     value: M128 { high: 0, low: 0 },
-    // };
+//     // let default_input_value = PackedPrimitiveType {
+//     //     value: M128 { high: 0, low: 0 },
+//     // };
 
-    let mut rng = thread_rng();
-    let mut testinput = vec![random_packed_primitive(&mut rng); input_items_length];
+//     let mut rng = thread_rng();
+//     let mut testinput = vec![random_packed_primitive(&mut rng); input_items_length];
 
-    group.throughput(Throughput::Bytes((input_items_length * std::mem::size_of::<PackedPrimitiveType>()) as u64));
-    group.bench_function("Groestl256-nonbitsliced", |bench| {
-        bench.iter(|| {
-            testinput
-                .chunks_exact(input_items_length / n_hashes) 
-                .enumerate()
-                .map(|(index, chunk)| {
-                    let chunk_bytes = packed_to_bytes(chunk);
-                    // println!("chunk_bytes size: {}", chunk_bytes.len());
-                    //  println!("Chunk index: {}", index);
-                    HasherDigest::<_, Groestl256<_, _>>::hash(chunk_bytes)
-                })
-                .collect::<Vec<_>>(); // Collect the results into a Vec
-        });
-    });
+//     group.throughput(Throughput::Bytes((input_items_length * std::mem::size_of::<PackedPrimitiveType>()) as u64));
+//     group.bench_function("Groestl256-nonbitsliced", |bench| {
+//         bench.iter(|| {
+//             testinput
+//                 .chunks_exact(input_items_length / n_hashes) 
+//                 .enumerate()
+//                 .map(|(index, chunk)| {
+//                     let chunk_bytes = packed_to_bytes(chunk);
+//                     // println!("chunk_bytes size: {}", chunk_bytes.len());
+//                     //  println!("Chunk index: {}", index);
+//                     HasherDigest::<_, Groestl256<_, _>>::hash(chunk_bytes)
+//                 })
+//                 .collect::<Vec<_>>(); // Collect the results into a Vec
+//         });
+//     });
 
-    group.finish();
-}
+//     group.finish();
+// }
 
 // Function to generate a random PackedPrimitiveType
 fn random_packed_primitive(rng: &mut impl Rng) -> PackedPrimitiveType {
@@ -188,12 +188,40 @@ fn bench_groestl_bitsliced(c: &mut Criterion) {
 	group.finish()
 }
 
+fn bench_vision32(c: &mut Criterion) {
+	let mut group = c.benchmark_group("vision");
+
+	let mut rng = thread_rng();
+
+	const N: usize = 1 << 14;
+	let data_bin = (0..N)
+		.map(|_| BinaryField32b::random(&mut rng))
+		.collect::<Vec<_>>();
+	let data_aes = (0..N)
+		.map(|_| AESTowerField32b::random(&mut rng))
+		.collect::<Vec<_>>();
+
+	group.throughput(Throughput::Bytes((N * 4) as u64));
+	group.bench_function("Vision over BinaryField32b", |bench| {
+		bench.iter(|| FixedLenHasherDigest::<_, Vision32b<_>>::hash(data_bin.as_slice()))
+	});
+	group.bench_function("Vision over AESTowerField32b", |bench| {
+		bench.iter(|| {
+			FixedLenHasherDigest::<_, VisionHasher<AESTowerField32b, _>>::hash(data_aes.as_slice())
+		})
+	});
+
+	group.finish()
+}
+
+
+
 criterion_group!(
 	hash,
-	bench_groestl_compression,
-	bench_groestl,
+	// bench_groestl_compression,
+	// bench_groestl,
 	// bench_groestl_rustcrypto,
-	// bench_vision32
+	bench_vision32
 );
 //criterion_group!(hash, bench_groestl_bitsliced, bench_groestl_long_data);
 
